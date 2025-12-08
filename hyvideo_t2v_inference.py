@@ -14,7 +14,12 @@ from diffusers.utils import load_image, export_to_video
 from dataloader import load_prompt_or_image
 from svg.timer import print_operator_log_data
 from svg.utils.seed import seed_everything
-from svg.models.hyvideo.inference import replace_hyvideo_flashattention, replace_hyvideo_attention
+from svg.models.hyvideo.inference import (
+    replace_hyvideo_flashattention,
+    replace_hyvideo_attention,
+    print_ctca_statistics,
+    reset_ctca,
+)
 from svg.models.hyvideo.utils import get_prompt_length
 
 from svg.logger import logger
@@ -39,7 +44,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0, help="Random seed for generation")
     parser.add_argument("--skip_existing", action="store_true", help="Skip generating existing output files")
 
-    parser.add_argument("--pattern", type=str, default="dense", choices=["SVG", "dense", "SAP"])
+    parser.add_argument("--pattern", type=str, default="dense", choices=["SVG", "dense", "SAP", "SAP_CTCA"])
     parser.add_argument("--first_layers_fp", type=float, default=0.025, help="Only works for best config. Leave the 0, 1, 2, 40, 41 layers in FP")
     parser.add_argument("--first_times_fp", type=float, default=0.075, help="Only works for best config. Leave the first 10% timestep in FP")
 
@@ -48,7 +53,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample_mse_max_row", type=int, default=10000, help="The maximum number of rows in attention mask. Prevent OOM.")
     parser.add_argument("--sparsity", type=float, default=0.25, help="The sparsity of the striped attention pattern. Accepts one or two float values.")
 
-    # SVG2 specific
+    # SVG2 (SAP) specific
     parser.add_argument("--num_q_centroids", "--qc", type=int, default=50, help="Number of query centroids for SAP.")
     parser.add_argument("--num_k_centroids", "--kc", type=int, default=200, help="Number of key centroids for SAP.")
     parser.add_argument("--top_p_kmeans", type=float, default=0.9, help="Top-p threshold for block selection in SAP.")
@@ -56,6 +61,14 @@ if __name__ == "__main__":
     parser.add_argument("--kmeans_iter_init", type=int, default=0, help="Number of KMeans iterations for initialization in SAP.")
     parser.add_argument("--kmeans_iter_step", type=int, default=0, help="Number of KMeans iterations for other diffusion steps in SAP.")
     parser.add_argument("--zero_step_kmeans_init", action="store_true", help="Initialize the centroids for the first step in SAP, not after warmup.")
+
+    # CTCA (Cross-Timestep Cluster Amortization) specific - only for SAP_CTCA pattern
+    parser.add_argument("--ctca_quality_threshold", type=float, default=0.80, help="Quality threshold for triggering re-clustering (0-1). Lower = more aggressive reuse.")
+    parser.add_argument("--ctca_adaptive", action="store_true", default=True, help="Use adaptive quality-based re-clustering.")
+    parser.add_argument("--ctca_no_adaptive", action="store_false", dest="ctca_adaptive", help="Disable adaptive re-clustering, use fixed interval.")
+    parser.add_argument("--ctca_min_interval", type=int, default=2, help="Minimum timesteps between re-clustering.")
+    parser.add_argument("--ctca_max_interval", type=int, default=10, help="Maximum timesteps to reuse clusters before forced refresh.")
+    parser.add_argument("--ctca_verbose", action="store_true", help="Enable verbose CTCA logging.")
 
     args = parser.parse_args()
 
@@ -157,6 +170,34 @@ if __name__ == "__main__":
             kmeans_iter_step=args.kmeans_iter_step,
             zero_step_kmeans_init=args.zero_step_kmeans_init,
         )
+    elif args.pattern == "SAP_CTCA":
+        # SAP with Cross-Timestep Cluster Amortization
+        # This variant reduces K-means overhead by reusing cluster assignments
+        replace_hyvideo_attention(
+            pipe,
+            args.height,
+            args.width,
+            args.num_frames,
+            prompt_length,
+            first_layers_fp=args.first_layers_fp,
+            first_times_fp=args.first_times_fp,
+            pattern=args.pattern,
+            # SAP specific
+            num_q_centroids=args.num_q_centroids,
+            num_k_centroids=args.num_k_centroids,
+            top_p_kmeans=args.top_p_kmeans,
+            min_kc_ratio=args.min_kc_ratio,
+            logging_file=args.logging_file,
+            kmeans_iter_init=args.kmeans_iter_init,
+            kmeans_iter_step=args.kmeans_iter_step,
+            zero_step_kmeans_init=args.zero_step_kmeans_init,
+            # CTCA specific
+            ctca_quality_threshold=args.ctca_quality_threshold,
+            ctca_adaptive=args.ctca_adaptive,
+            ctca_min_interval=args.ctca_min_interval,
+            ctca_max_interval=args.ctca_max_interval,
+            ctca_verbose=args.ctca_verbose,
+        )
     else:
         assert args.pattern == "dense", f"Invalid pattern: {args.pattern}"
         
@@ -185,3 +226,9 @@ if __name__ == "__main__":
         os.makedirs(output_dir, exist_ok=True)
 
     export_to_video(output, args.output_file, fps=24)
+
+    # Print CTCA statistics if using SAP_CTCA pattern
+    if args.pattern == "SAP_CTCA":
+        print_ctca_statistics()
+
+    logger.info(f"Video saved to {args.output_file}")
