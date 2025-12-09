@@ -842,11 +842,17 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
             cls.ctca_manager.reset()
             return
 
+        # Synchronize CTCA config with SAP kmeans iteration settings
+        full_iters = cls.kmeans_iter_init if cls.kmeans_iter_init > 0 else 50
+        update_iters = cls.kmeans_iter_step if cls.kmeans_iter_step > 0 else 1
+
         config = CTCAConfig(
             quality_threshold=cls.ctca_quality_threshold,
             adaptive_recluster=cls.ctca_adaptive,
             min_recluster_interval=cls.ctca_min_interval,
             max_recluster_interval=cls.ctca_max_interval,
+            full_kmeans_iters=full_iters,
+            update_only_iters=update_iters,
             verbose=cls.ctca_verbose,
         )
 
@@ -859,7 +865,8 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         logger.info(f"{Color.green}CTCA initialized: "
                     f"Q clusters={cls.num_q_centroids}, K clusters={cls.num_k_centroids}, "
                     f"quality_threshold={cls.ctca_quality_threshold}, "
-                    f"adaptive={cls.ctca_adaptive}{Color.reset}")
+                    f"adaptive={cls.ctca_adaptive}, "
+                    f"full_iters={full_iters}, update_iters={update_iters}{Color.reset}")
 
     @classmethod
     def reset_ctca(cls):
