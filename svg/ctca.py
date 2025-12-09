@@ -133,7 +133,6 @@ class CrossTimestepClusterAmortization:
         # Statistics tracking
         self.stats = {
             'full_cluster_count': 0,
-            'reuse_count': 0,
             'update_only_count': 0,
             'quality_triggered_recluster': 0,
             'interval_triggered_recluster': 0,
@@ -500,22 +499,22 @@ class CrossTimestepClusterAmortization:
 
             return self._full_clustering(query, key, layer_idx, timestep)
         else:
-            self.stats['reuse_count'] += 1
+            # Note: reuse_count is tracked separately from update_only_count
+            # reuse_count = we decided to reuse (not recluster)
+            # update_only_count = we updated centroids without full reassignment
+            # These are different metrics: reuse is the decision, update_only is the action
             return self._update_centroids_only(query, key, layer_idx, timestep)
 
     def get_statistics(self) -> Dict[str, any]:
         """Get CTCA performance statistics."""
-        total = (self.stats['full_cluster_count'] +
-                 self.stats['update_only_count'] +
-                 self.stats['reuse_count'])
+        total = self.stats['full_cluster_count'] + self.stats['update_only_count']
 
         if total == 0:
             return self.stats
 
         stats_with_ratios = self.stats.copy()
         stats_with_ratios['full_cluster_ratio'] = self.stats['full_cluster_count'] / total
-        stats_with_ratios['reuse_ratio'] = (self.stats['update_only_count'] +
-                                            self.stats['reuse_count']) / total
+        stats_with_ratios['update_only_ratio'] = self.stats['update_only_count'] / total
         stats_with_ratios['total_calls'] = total
 
         # Estimate speedup (full clustering ~50 iters, update ~1 iter)
@@ -542,8 +541,8 @@ class CrossTimestepClusterAmortization:
               f"({stats.get('full_cluster_ratio', 0)*100:.1f}%)")
         print(f"  - Quality triggered:      {stats['quality_triggered_recluster']}")
         print(f"  - Interval triggered:     {stats['interval_triggered_recluster']}")
-        print(f"Centroid update only:       {stats['update_only_count']}")
-        print(f"Cache reuse:                {stats['reuse_count']}")
+        print(f"Centroid update only:       {stats['update_only_count']} "
+              f"({stats.get('update_only_ratio', 0)*100:.1f}%)")
         print(f"Estimated K-means speedup:  {stats.get('estimated_speedup', 1.0):.2f}x")
         print("=" * 60 + "\n")
 

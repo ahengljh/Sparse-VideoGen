@@ -1046,7 +1046,6 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
                     "avg_density": avg_density,
                     "density": densities.tolist(),
                     "ctca_full_cluster_count": ctca_stats.get('full_cluster_count', 0),
-                    "ctca_reuse_count": ctca_stats.get('reuse_count', 0),
                     "ctca_update_only_count": ctca_stats.get('update_only_count', 0),
                 }
 
