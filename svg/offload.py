@@ -1,0 +1,571 @@
+"""
+Dynamic Layer Offloading for Video Diffusion Models
+
+This module provides intelligent CPU-GPU memory management for running large
+video diffusion models (like HunyuanVideo) on consumer GPUs with limited VRAM.
+
+Key features:
+1. Layer-wise offloading: Only one transformer layer on GPU at a time
+2. Async prefetching: Use CUDA streams to hide CPU-GPU transfer latency
+3. Pinned memory: Faster transfers with page-locked CPU memory
+4. Smart scheduling: Prefetch next layer while computing current layer
+
+This enables running HunyuanVideo (~13GB) on 24GB GPUs like RTX 4090.
+"""
+
+import gc
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Callable, Any
+from contextlib import contextmanager
+import threading
+
+import torch
+import torch.nn as nn
+
+from .logger import logger
+from .timer import time_logging_decorator
+
+
+@dataclass
+class OffloadConfig:
+    """Configuration for dynamic layer offloading."""
+
+    # Device settings
+    compute_device: str = "cuda"
+    offload_device: str = "cpu"
+
+    # Memory settings
+    use_pinned_memory: bool = True  # Use page-locked memory for faster transfers
+
+    # Prefetching settings
+    enable_prefetch: bool = True    # Async prefetch next layer
+    prefetch_count: int = 1         # Number of layers to prefetch ahead
+
+    # Components to keep on GPU (don't offload)
+    keep_on_gpu: List[str] = None   # e.g., ["text_encoder", "vae"]
+
+    # Memory management
+    empty_cache_frequency: int = 5  # Call empty_cache every N layers
+
+    # Debugging
+    verbose: bool = False
+
+
+class LayerOffloadManager:
+    """
+    Manages dynamic CPU-GPU offloading for transformer layers.
+
+    This class handles:
+    1. Moving layers between CPU and GPU on-demand
+    2. Async prefetching of upcoming layers
+    3. Memory-efficient state management
+
+    Usage:
+        manager = LayerOffloadManager(model, config)
+        manager.prepare_for_inference()
+
+        for layer_idx in range(num_layers):
+            manager.ensure_layer_on_gpu(layer_idx)
+            output = layer(input)
+            manager.layer_forward_complete(layer_idx)
+    """
+
+    def __init__(
+        self,
+        transformer: nn.Module,
+        config: OffloadConfig,
+        double_blocks_attr: str = "transformer_blocks",
+        single_blocks_attr: str = "single_transformer_blocks",
+    ):
+        """
+        Initialize the offload manager.
+
+        Args:
+            transformer: The transformer module to manage
+            config: Offloading configuration
+            double_blocks_attr: Attribute name for double stream blocks
+            single_blocks_attr: Attribute name for single stream blocks
+        """
+        self.transformer = transformer
+        self.config = config
+        self.double_blocks_attr = double_blocks_attr
+        self.single_blocks_attr = single_blocks_attr
+
+        # Get layer lists
+        self.double_blocks = getattr(transformer, double_blocks_attr, [])
+        self.single_blocks = getattr(transformer, single_blocks_attr, [])
+        self.all_blocks = list(self.double_blocks) + list(self.single_blocks)
+        self.num_layers = len(self.all_blocks)
+
+        # Track layer locations
+        self._layer_on_gpu: Dict[int, bool] = {}
+        self._layer_pinned: Dict[int, bool] = {}
+
+        # CUDA streams for async operations
+        self._prefetch_stream: Optional[torch.cuda.Stream] = None
+        self._compute_stream: Optional[torch.cuda.Stream] = None
+
+        # Prefetch state
+        self._prefetch_in_progress: Dict[int, bool] = {}
+        self._prefetch_events: Dict[int, torch.cuda.Event] = {}
+
+        # Statistics
+        self.stats = {
+            'gpu_loads': 0,
+            'gpu_offloads': 0,
+            'prefetch_hits': 0,
+            'prefetch_misses': 0,
+            'cache_clears': 0,
+        }
+
+        self._initialized = False
+
+    def prepare_for_inference(self):
+        """
+        Prepare the model for offloaded inference.
+
+        This moves all transformer layers to CPU and sets up CUDA streams.
+        Call this before starting inference.
+        """
+        if self._initialized:
+            return
+
+        logger.info(f"Preparing {self.num_layers} layers for offloaded inference...")
+
+        # Create CUDA streams
+        if self.config.enable_prefetch:
+            self._prefetch_stream = torch.cuda.Stream()
+            self._compute_stream = torch.cuda.Stream()
+
+        # Move all layers to CPU
+        for idx, layer in enumerate(self.all_blocks):
+            self._move_layer_to_cpu(idx, use_pinned=self.config.use_pinned_memory)
+            self._layer_on_gpu[idx] = False
+
+        # Clear CUDA cache
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        self._initialized = True
+
+        if self.config.verbose:
+            logger.info(f"Offload manager initialized. All {self.num_layers} layers on CPU.")
+
+    def _move_layer_to_cpu(self, layer_idx: int, use_pinned: bool = False):
+        """Move a layer to CPU, optionally with pinned memory."""
+        layer = self.all_blocks[layer_idx]
+
+        if use_pinned:
+            # Move to CPU with pinned memory for faster future transfers
+            for param in layer.parameters():
+                if param.device.type != 'cpu':
+                    cpu_tensor = param.data.cpu()
+                    if cpu_tensor.is_pinned():
+                        param.data = cpu_tensor
+                    else:
+                        # Create pinned tensor
+                        pinned_tensor = torch.empty_like(cpu_tensor, pin_memory=True)
+                        pinned_tensor.copy_(cpu_tensor)
+                        param.data = pinned_tensor
+
+            for buffer_name, buffer in layer.named_buffers():
+                if buffer is not None and buffer.device.type != 'cpu':
+                    cpu_tensor = buffer.cpu()
+                    if not cpu_tensor.is_pinned():
+                        pinned_tensor = torch.empty_like(cpu_tensor, pin_memory=True)
+                        pinned_tensor.copy_(cpu_tensor)
+                        setattr(layer, buffer_name.split('.')[-1], pinned_tensor)
+
+            self._layer_pinned[layer_idx] = True
+        else:
+            layer.to('cpu')
+            self._layer_pinned[layer_idx] = False
+
+        self._layer_on_gpu[layer_idx] = False
+
+    def _move_layer_to_gpu(self, layer_idx: int, non_blocking: bool = False):
+        """Move a layer to GPU."""
+        layer = self.all_blocks[layer_idx]
+        layer.to(self.config.compute_device, non_blocking=non_blocking)
+        self._layer_on_gpu[layer_idx] = True
+        self.stats['gpu_loads'] += 1
+
+    def _offload_layer_from_gpu(self, layer_idx: int):
+        """Offload a layer from GPU back to CPU."""
+        if not self._layer_on_gpu.get(layer_idx, False):
+            return
+
+        self._move_layer_to_cpu(layer_idx, use_pinned=self.config.use_pinned_memory)
+        self.stats['gpu_offloads'] += 1
+
+    @time_logging_decorator("Level 4 - Layer prefetch")
+    def _start_prefetch(self, layer_idx: int):
+        """Start async prefetch of a layer."""
+        if not self.config.enable_prefetch:
+            return
+
+        if layer_idx >= self.num_layers:
+            return
+
+        if self._layer_on_gpu.get(layer_idx, False):
+            return  # Already on GPU
+
+        if self._prefetch_in_progress.get(layer_idx, False):
+            return  # Already prefetching
+
+        self._prefetch_in_progress[layer_idx] = True
+
+        # Create event to track completion
+        event = torch.cuda.Event()
+        self._prefetch_events[layer_idx] = event
+
+        # Async transfer on prefetch stream
+        with torch.cuda.stream(self._prefetch_stream):
+            self._move_layer_to_gpu(layer_idx, non_blocking=True)
+            event.record()
+
+        if self.config.verbose:
+            logger.debug(f"Started prefetch for layer {layer_idx}")
+
+    def _wait_for_prefetch(self, layer_idx: int):
+        """Wait for prefetch of a layer to complete."""
+        if layer_idx in self._prefetch_events:
+            self._prefetch_events[layer_idx].synchronize()
+            del self._prefetch_events[layer_idx]
+            self._prefetch_in_progress[layer_idx] = False
+            self.stats['prefetch_hits'] += 1
+        else:
+            self.stats['prefetch_misses'] += 1
+
+    @time_logging_decorator("Level 3 - Ensure layer on GPU")
+    def ensure_layer_on_gpu(self, layer_idx: int):
+        """
+        Ensure a layer is on GPU, loading it if necessary.
+
+        This should be called before using a layer for computation.
+        """
+        if not self._initialized:
+            self.prepare_for_inference()
+
+        # Check if already on GPU
+        if self._layer_on_gpu.get(layer_idx, False):
+            # Wait for any in-progress prefetch
+            if self._prefetch_in_progress.get(layer_idx, False):
+                self._wait_for_prefetch(layer_idx)
+            return
+
+        # Check if prefetch is in progress
+        if self._prefetch_in_progress.get(layer_idx, False):
+            self._wait_for_prefetch(layer_idx)
+        else:
+            # Synchronous load (prefetch miss)
+            self._move_layer_to_gpu(layer_idx, non_blocking=False)
+            self.stats['prefetch_misses'] += 1
+
+        # Start prefetching next layers
+        for i in range(1, self.config.prefetch_count + 1):
+            next_idx = layer_idx + i
+            if next_idx < self.num_layers:
+                self._start_prefetch(next_idx)
+
+    @time_logging_decorator("Level 3 - Layer forward complete")
+    def layer_forward_complete(self, layer_idx: int):
+        """
+        Called after a layer's forward pass is complete.
+
+        This offloads the layer back to CPU to free GPU memory.
+        """
+        # Offload current layer
+        self._offload_layer_from_gpu(layer_idx)
+
+        # Periodically clear CUDA cache
+        if (layer_idx + 1) % self.config.empty_cache_frequency == 0:
+            torch.cuda.empty_cache()
+            self.stats['cache_clears'] += 1
+
+    def get_statistics(self) -> Dict[str, Any]:
+        """Get offloading statistics."""
+        total_ops = self.stats['gpu_loads'] + self.stats['prefetch_hits']
+        if total_ops > 0:
+            prefetch_ratio = self.stats['prefetch_hits'] / total_ops
+        else:
+            prefetch_ratio = 0.0
+
+        return {
+            **self.stats,
+            'prefetch_hit_ratio': prefetch_ratio,
+            'num_layers': self.num_layers,
+        }
+
+    def print_statistics(self):
+        """Print offloading statistics."""
+        stats = self.get_statistics()
+        print("\n" + "=" * 60)
+        print("Dynamic Layer Offloading Statistics")
+        print("=" * 60)
+        print(f"Total layers:           {stats['num_layers']}")
+        print(f"GPU loads:              {stats['gpu_loads']}")
+        print(f"GPU offloads:           {stats['gpu_offloads']}")
+        print(f"Prefetch hits:          {stats['prefetch_hits']}")
+        print(f"Prefetch misses:        {stats['prefetch_misses']}")
+        print(f"Prefetch hit ratio:     {stats['prefetch_hit_ratio']*100:.1f}%")
+        print(f"Cache clears:           {stats['cache_clears']}")
+        print("=" * 60 + "\n")
+
+    def reset(self):
+        """Reset state for a new inference run."""
+        self._prefetch_in_progress.clear()
+        self._prefetch_events.clear()
+        # Reset stats
+        self.stats = {k: 0 for k in self.stats}
+
+
+class OffloadedModuleWrapper(nn.Module):
+    """
+    Wrapper that intercepts forward calls to manage offloading.
+
+    This wraps a transformer block and ensures it's on GPU during forward,
+    then offloads it after completion.
+    """
+
+    def __init__(
+        self,
+        module: nn.Module,
+        layer_idx: int,
+        offload_manager: LayerOffloadManager,
+    ):
+        super().__init__()
+        self._module = module
+        self._layer_idx = layer_idx
+        self._offload_manager = offload_manager
+
+    def forward(self, *args, **kwargs):
+        # Ensure layer is on GPU
+        self._offload_manager.ensure_layer_on_gpu(self._layer_idx)
+
+        # Forward pass
+        output = self._module(*args, **kwargs)
+
+        # Offload layer
+        self._offload_manager.layer_forward_complete(self._layer_idx)
+
+        return output
+
+    def __getattr__(self, name):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self._module, name)
+
+
+def setup_offloading_for_pipeline(
+    pipe,
+    config: Optional[OffloadConfig] = None,
+    keep_vae_on_gpu: bool = True,
+    keep_text_encoder_on_gpu: bool = False,
+) -> LayerOffloadManager:
+    """
+    Set up dynamic offloading for a HunyuanVideo pipeline.
+
+    This function:
+    1. Keeps the transformer on CPU initially
+    2. Wraps transformer blocks with offloading logic
+    3. Optionally keeps VAE and text encoder on GPU
+
+    Args:
+        pipe: HunyuanVideoPipeline instance
+        config: Offloading configuration
+        keep_vae_on_gpu: Whether to keep VAE on GPU (needed for decode)
+        keep_text_encoder_on_gpu: Whether to keep text encoder on GPU
+
+    Returns:
+        LayerOffloadManager instance for statistics and control
+    """
+    if config is None:
+        config = OffloadConfig()
+
+    logger.info("Setting up dynamic layer offloading for HunyuanVideo...")
+
+    # Create offload manager for transformer
+    offload_manager = LayerOffloadManager(
+        pipe.transformer,
+        config,
+        double_blocks_attr="transformer_blocks",
+        single_blocks_attr="single_transformer_blocks",
+    )
+
+    # Move components to appropriate devices
+    # Transformer stays on CPU, we'll load layers on-demand
+    pipe.transformer.to('cpu')
+
+    # VAE - keep on GPU for decoding (it's small ~300MB)
+    if keep_vae_on_gpu:
+        pipe.vae.to(config.compute_device)
+        logger.info("VAE kept on GPU")
+    else:
+        pipe.vae.to('cpu')
+        logger.info("VAE on CPU")
+
+    # Text encoder
+    if keep_text_encoder_on_gpu:
+        if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
+            pipe.text_encoder.to(config.compute_device)
+            logger.info("Text encoder kept on GPU")
+    else:
+        if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
+            pipe.text_encoder.to('cpu')
+            logger.info("Text encoder on CPU")
+
+    # Prepare offload manager
+    offload_manager.prepare_for_inference()
+
+    # Clear CUDA cache after setup
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Log memory status
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"GPU memory after setup: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
+    return offload_manager
+
+
+def create_offloaded_forward_hook(
+    offload_manager: LayerOffloadManager,
+    layer_idx: int,
+) -> Callable:
+    """
+    Create a forward pre-hook that ensures the layer is on GPU.
+
+    This is an alternative to wrapping modules - uses hooks instead.
+    """
+    def hook(module, args):
+        offload_manager.ensure_layer_on_gpu(layer_idx)
+        return args
+
+    return hook
+
+
+def create_offloaded_forward_post_hook(
+    offload_manager: LayerOffloadManager,
+    layer_idx: int,
+) -> Callable:
+    """
+    Create a forward hook that offloads the layer after computation.
+    """
+    def hook(module, args, output):
+        offload_manager.layer_forward_complete(layer_idx)
+        return output
+
+    return hook
+
+
+def install_offload_hooks(
+    pipe,
+    offload_manager: LayerOffloadManager,
+) -> List[torch.utils.hooks.RemovableHandle]:
+    """
+    Install forward hooks for automatic offloading.
+
+    This is less invasive than wrapping modules.
+
+    Returns:
+        List of hook handles (for removal if needed)
+    """
+    handles = []
+
+    # Install hooks on double stream blocks
+    for idx, block in enumerate(pipe.transformer.transformer_blocks):
+        pre_hook = create_offloaded_forward_hook(offload_manager, idx)
+        post_hook = create_offloaded_forward_post_hook(offload_manager, idx)
+
+        handles.append(block.register_forward_pre_hook(pre_hook))
+        handles.append(block.register_forward_hook(post_hook))
+
+    # Install hooks on single stream blocks
+    num_double = len(pipe.transformer.transformer_blocks)
+    for idx, block in enumerate(pipe.transformer.single_transformer_blocks):
+        layer_idx = num_double + idx
+        pre_hook = create_offloaded_forward_hook(offload_manager, layer_idx)
+        post_hook = create_offloaded_forward_post_hook(offload_manager, layer_idx)
+
+        handles.append(block.register_forward_pre_hook(pre_hook))
+        handles.append(block.register_forward_hook(post_hook))
+
+    logger.info(f"Installed {len(handles)} offload hooks")
+
+    return handles
+
+
+@contextmanager
+def offloaded_inference(
+    pipe,
+    config: Optional[OffloadConfig] = None,
+):
+    """
+    Context manager for running inference with offloading.
+
+    Usage:
+        with offloaded_inference(pipe) as manager:
+            output = pipe(prompt=..., ...)
+            manager.print_statistics()
+    """
+    if config is None:
+        config = OffloadConfig()
+
+    # Setup offloading
+    manager = setup_offloading_for_pipeline(pipe, config)
+
+    # Install hooks
+    handles = install_offload_hooks(pipe, manager)
+
+    try:
+        yield manager
+    finally:
+        # Remove hooks
+        for handle in handles:
+            handle.remove()
+
+        # Print statistics
+        if config.verbose:
+            manager.print_statistics()
+
+
+# Convenience function
+def enable_offloading(
+    pipe,
+    use_pinned_memory: bool = True,
+    enable_prefetch: bool = True,
+    verbose: bool = False,
+) -> Tuple[LayerOffloadManager, List]:
+    """
+    Enable dynamic offloading for a pipeline.
+
+    This is the main entry point for using offloading.
+
+    Args:
+        pipe: HunyuanVideoPipeline
+        use_pinned_memory: Use pinned CPU memory for faster transfers
+        enable_prefetch: Enable async prefetching
+        verbose: Print debug information
+
+    Returns:
+        Tuple of (LayerOffloadManager, list of hook handles)
+
+    Usage:
+        manager, handles = enable_offloading(pipe)
+        output = pipe(prompt=..., ...)
+        manager.print_statistics()
+    """
+    config = OffloadConfig(
+        use_pinned_memory=use_pinned_memory,
+        enable_prefetch=enable_prefetch,
+        verbose=verbose,
+    )
+
+    manager = setup_offloading_for_pipeline(pipe, config)
+    handles = install_offload_hooks(pipe, manager)
+
+    return manager, handles

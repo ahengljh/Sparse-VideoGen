@@ -21,6 +21,7 @@ from svg.models.hyvideo.inference import (
     reset_ctca,
 )
 from svg.models.hyvideo.utils import get_prompt_length
+from svg.offload import enable_offloading, OffloadConfig
 
 from svg.logger import logger
 
@@ -70,6 +71,14 @@ if __name__ == "__main__":
     parser.add_argument("--ctca_max_interval", type=int, default=10, help="Maximum timesteps to reuse clusters before forced refresh.")
     parser.add_argument("--ctca_verbose", action="store_true", help="Enable verbose CTCA logging.")
 
+    # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
+    parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
+    parser.add_argument("--offload_pinned_memory", action="store_true", default=True, help="Use pinned CPU memory for faster transfers.")
+    parser.add_argument("--offload_no_pinned_memory", action="store_false", dest="offload_pinned_memory", help="Disable pinned memory.")
+    parser.add_argument("--offload_prefetch", action="store_true", default=True, help="Enable async prefetching of next layer.")
+    parser.add_argument("--offload_no_prefetch", action="store_false", dest="offload_prefetch", help="Disable async prefetching.")
+    parser.add_argument("--offload_verbose", action="store_true", help="Enable verbose offloading logging.")
+
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -92,8 +101,26 @@ if __name__ == "__main__":
     scheduler = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
     pipe = HunyuanVideoPipeline.from_pretrained(args.model_id, transformer=transformer, scheduler=scheduler, revision='refs/pr/18', torch_dtype=torch.bfloat16)
     pipe.vae.enable_tiling()
-    pipe.to("cuda")
-    
+
+    #########################################################
+    # Setup device placement (with optional offloading)
+    #########################################################
+    offload_manager = None
+    offload_hooks = None
+
+    if args.enable_offload:
+        logger.info("Enabling dynamic layer offloading for low-memory GPU...")
+        offload_manager, offload_hooks = enable_offloading(
+            pipe,
+            use_pinned_memory=args.offload_pinned_memory,
+            enable_prefetch=args.offload_prefetch,
+            verbose=args.offload_verbose,
+        )
+        # Note: enable_offloading already handles device placement
+    else:
+        # Standard mode: load everything to GPU
+        pipe.to("cuda")
+
     config = pipe.transformer.config
 
     #########################################################
@@ -230,5 +257,9 @@ if __name__ == "__main__":
     # Print CTCA statistics if using SAP_CTCA pattern
     if args.pattern == "SAP_CTCA":
         print_ctca_statistics()
+
+    # Print offloading statistics if enabled
+    if offload_manager is not None:
+        offload_manager.print_statistics()
 
     logger.info(f"Video saved to {args.output_file}")
