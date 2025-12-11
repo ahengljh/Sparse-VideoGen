@@ -1,13 +1,34 @@
 import json
 from typing import Optional, Tuple
 
-import flashinfer
 import torch
 import torch.nn.functional as F
 from diffusers.models.attention import Attention
 from diffusers.models.embeddings import apply_rotary_emb
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from torch.nn.attention.flex_attention import flex_attention
+
+# Check if FlashInfer is available and supports this GPU
+FLASHINFER_AVAILABLE = False
+try:
+    import flashinfer
+    # Check if GPU architecture is supported (sm75+)
+    if torch.cuda.is_available():
+        device = torch.cuda.current_device()
+        capability = torch.cuda.get_device_capability(device)
+        sm_version = capability[0] * 10 + capability[1]
+        if sm_version >= 75:
+            FLASHINFER_AVAILABLE = True
+            from ...logger import logger as _logger
+            _logger.info(f"FlashInfer enabled (GPU sm{sm_version})")
+        else:
+            from ...logger import logger as _logger
+            _logger.warning(f"FlashInfer disabled: GPU sm{sm_version} < sm75, falling back to flash_attn")
+except ImportError:
+    pass
+except Exception as e:
+    from ...logger import logger as _logger
+    _logger.warning(f"FlashInfer disabled: {e}, falling back to flash_attn")
 
 from ...kernels.triton.permute import apply_inverse_permutation_triton, permute_tensor_by_labels_triton
 from ...kmeans_utils import (
@@ -445,7 +466,12 @@ class Hunyuan_SVGAttn_Processor2_0:
     def flashinfer_attention(self, query, key, value, cu_max_seqlens):
         """
         VarlenFlashInfer Attention. Input is (B, H, L, D).
+        Falls back to flash_attn when FlashInfer is not available.
         """
+        if not FLASHINFER_AVAILABLE:
+            # Fall back to flash_attn
+            return self.flash_attention(query, key, value, cu_max_seqlens)
+
         cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = cu_max_seqlens
         out = flashinfer_varlen_func(query, key, value, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
         return out
