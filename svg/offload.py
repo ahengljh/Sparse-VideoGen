@@ -535,11 +535,10 @@ class TextEncoderOffloadManager:
         self,
         prompt: str,
         prompt_2: Optional[str] = None,
-        negative_prompt: Optional[str] = None,
-        negative_prompt_2: Optional[str] = None,
         num_videos_per_prompt: int = 1,
         device: Optional[str] = None,
         dtype: Optional[torch.dtype] = None,
+        max_sequence_length: int = 256,
     ) -> Dict[str, torch.Tensor]:
         """
         Pre-encode prompt while text encoders are on GPU.
@@ -556,15 +555,14 @@ class TextEncoderOffloadManager:
         self.ensure_on_gpu()
 
         # Use pipeline's encode_prompt method
+        # Note: HunyuanVideoPipeline.encode_prompt doesn't support negative_prompt directly
         prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.pipe.encode_prompt(
             prompt=prompt,
             prompt_2=prompt_2,
             device=device,
             dtype=dtype,
             num_videos_per_prompt=num_videos_per_prompt,
-            do_classifier_free_guidance=negative_prompt is not None or True,  # Usually True
-            negative_prompt=negative_prompt,
-            negative_prompt_2=negative_prompt_2,
+            max_sequence_length=max_sequence_length,
         )
 
         # Offload text encoders to CPU
@@ -580,9 +578,10 @@ class TextEncoderOffloadManager:
 def pre_encode_and_offload(
     pipe,
     prompt: str,
-    negative_prompt: Optional[str] = None,
+    prompt_2: Optional[str] = None,
     device: str = "cuda",
     dtype: torch.dtype = torch.bfloat16,
+    max_sequence_length: int = 256,
 ) -> Dict[str, torch.Tensor]:
     """
     Convenience function: Pre-encode prompt then offload text encoders.
@@ -592,9 +591,10 @@ def pre_encode_and_offload(
     Args:
         pipe: HunyuanVideoPipeline
         prompt: The text prompt
-        negative_prompt: Optional negative prompt
+        prompt_2: Optional secondary prompt for second encoder
         device: Target device for embeddings
         dtype: Data type for embeddings
+        max_sequence_length: Maximum token sequence length
 
     Returns:
         Dict with prompt_embeds, pooled_prompt_embeds, prompt_attention_mask
@@ -612,9 +612,10 @@ def pre_encode_and_offload(
     manager = TextEncoderOffloadManager(pipe, compute_device=device, verbose=True)
     return manager.pre_encode_prompt(
         prompt=prompt,
-        negative_prompt=negative_prompt,
+        prompt_2=prompt_2,
         device=device,
         dtype=dtype,
+        max_sequence_length=max_sequence_length,
     )
 
 

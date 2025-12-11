@@ -165,10 +165,10 @@ if __name__ == "__main__":
     if args.enable_offload:
         logger.info("Pre-encoding prompt (text encoders temporarily on GPU)...")
         # Pre-encode prompt - this moves text encoders to GPU, encodes, then offloads to CPU
+        # Note: HunyuanVideoPipeline.encode_prompt doesn't support negative_prompt
         pre_encoded_embeds = pre_encode_and_offload(
             pipe,
             prompt=args.prompt,
-            negative_prompt=args.negative_prompt,
             device="cuda",
             dtype=torch.bfloat16,
         )
