@@ -471,7 +471,7 @@ def setup_offloading_for_pipeline(
     pipe,
     config: Optional[OffloadConfig] = None,
     keep_vae_on_gpu: bool = True,
-    keep_text_encoder_on_gpu: bool = False,
+    keep_text_encoder_on_gpu: bool = True,  # Changed to True - needed for prompt encoding
 ) -> LayerOffloadManager:
     """
     Set up dynamic offloading for a HunyuanVideo pipeline.
@@ -485,7 +485,7 @@ def setup_offloading_for_pipeline(
         pipe: HunyuanVideoPipeline instance
         config: Offloading configuration
         keep_vae_on_gpu: Whether to keep VAE on GPU (needed for decode)
-        keep_text_encoder_on_gpu: Whether to keep text encoder on GPU
+        keep_text_encoder_on_gpu: Whether to keep text encoder on GPU (needed for encoding)
 
     Returns:
         LayerOffloadManager instance for statistics and control
@@ -515,15 +515,19 @@ def setup_offloading_for_pipeline(
         pipe.vae.to('cpu')
         logger.info("VAE on CPU")
 
-    # Text encoder
-    if keep_text_encoder_on_gpu:
-        if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
-            pipe.text_encoder.to(config.compute_device)
-            logger.info("Text encoder kept on GPU")
-    else:
-        if hasattr(pipe, 'text_encoder') and pipe.text_encoder is not None:
-            pipe.text_encoder.to('cpu')
-            logger.info("Text encoder on CPU")
+    # Text encoders - HunyuanVideo may have multiple (text_encoder, text_encoder_2)
+    # These are needed for prompt encoding before the denoising loop
+    text_encoder_names = ['text_encoder', 'text_encoder_2', 'text_encoder_3']
+    for enc_name in text_encoder_names:
+        if hasattr(pipe, enc_name):
+            encoder = getattr(pipe, enc_name)
+            if encoder is not None:
+                if keep_text_encoder_on_gpu:
+                    encoder.to(config.compute_device)
+                    logger.info(f"{enc_name} kept on GPU")
+                else:
+                    encoder.to('cpu')
+                    logger.info(f"{enc_name} on CPU")
 
     # Prepare offload manager
     offload_manager.prepare_for_inference()
