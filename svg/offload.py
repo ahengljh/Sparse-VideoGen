@@ -683,79 +683,46 @@ def setup_offloading_for_pipeline(
         single_blocks_attr="single_transformer_blocks",
     )
 
-    # STRATEGY: Properly move modules by updating their internal _parameters dict.
-    # Simply setting param.data doesn't always work - we need to replace the Parameter
-    # object in the module's _parameters dictionary.
+    # STRATEGY: Simple and reliable approach
+    # 1. Move ENTIRE transformer to GPU (text encoders already on CPU, so we have room)
+    # 2. Move ONLY the block lists back to CPU
+    # This guarantees all embedders/norms stay on GPU
 
-    def move_module_to_device_recursive(module: nn.Module, device: str, skip_children: set = None):
-        """
-        Recursively move a module to device, properly updating _parameters and _buffers.
-        Skip any children whose names are in skip_children.
-        """
-        if skip_children is None:
-            skip_children = set()
-
-        # First, recursively process children (but skip specified ones)
-        for child_name, child in module.named_children():
-            if child_name in skip_children:
-                continue
-            move_module_to_device_recursive(child, device, skip_children=None)
-
-        # Move this module's own parameters (not children's)
-        for param_name, param in list(module._parameters.items()):
-            if param is not None and param.device.type != device.split(':')[0]:
-                # Create new parameter on target device
-                new_param = nn.Parameter(param.data.to(device), requires_grad=param.requires_grad)
-                module._parameters[param_name] = new_param
-
-        # Move this module's own buffers (not children's)
-        for buffer_name, buffer in list(module._buffers.items()):
-            if buffer is not None and buffer.device.type != device.split(':')[0]:
-                module._buffers[buffer_name] = buffer.to(device)
-
-    # Move everything to GPU EXCEPT transformer_blocks and single_transformer_blocks
-    # These blocks will be loaded on-demand by the offload manager
     logger.info("Moving transformer components to appropriate devices...")
 
-    # Move non-block children to GPU
-    skip_blocks = {'transformer_blocks', 'single_transformer_blocks'}
-    for child_name, child in transformer.named_children():
-        if child_name in skip_blocks:
-            # Keep blocks on CPU
-            child.to('cpu')
-            num_blocks = len(list(child.children())) if hasattr(child, '__len__') else len(list(child))
-            logger.info(f"  {child_name}: {num_blocks} blocks → CPU (will be loaded on-demand)")
-        else:
-            # Move to GPU using our recursive function
-            move_module_to_device_recursive(child, config.compute_device)
-            param_bytes = sum(p.numel() * p.element_size() for p in child.parameters())
-            logger.info(f"  {child_name}: {param_bytes/1024**2:.1f}MB → GPU")
+    # Step 1: Move entire transformer to GPU
+    # At this point, text encoders should already be on CPU (from pre_encode_and_offload)
+    # so we have ~14GB free on a 24GB GPU - enough for the 13GB transformer briefly
+    logger.info("  Loading entire transformer to GPU temporarily...")
+    transformer.to(config.compute_device)
+    torch.cuda.empty_cache()
 
-    # Also move any parameters/buffers directly on the transformer (not in children)
-    for param_name, param in list(transformer._parameters.items()):
-        if param is not None and param.device.type != 'cuda':
-            transformer._parameters[param_name] = nn.Parameter(
-                param.data.to(config.compute_device), requires_grad=param.requires_grad
-            )
-            logger.info(f"  {param_name} (direct param): → GPU")
+    # Step 2: Move ONLY the block ModuleLists back to CPU
+    # These will be loaded on-demand by the offload manager
+    num_double = len(transformer.transformer_blocks)
+    num_single = len(transformer.single_transformer_blocks)
 
-    for buffer_name, buffer in list(transformer._buffers.items()):
-        if buffer is not None and buffer.device.type != 'cuda':
-            transformer._buffers[buffer_name] = buffer.to(config.compute_device)
-            logger.info(f"  {buffer_name} (direct buffer): → GPU")
+    logger.info(f"  Moving transformer_blocks ({num_double} blocks) back to CPU...")
+    transformer.transformer_blocks.to('cpu')
 
-    # Verify: Check that all non-block params are on GPU
-    misplaced = []
-    for name, param in transformer.named_parameters():
-        is_block = 'transformer_blocks.' in name or 'single_transformer_blocks.' in name
-        if not is_block and param.device.type != 'cuda':
-            misplaced.append(f"{name} on {param.device}")
-    if misplaced:
-        logger.error(f"WARNING: {len(misplaced)} non-block params still on CPU!")
-        for m in misplaced[:5]:
-            logger.error(f"  {m}")
-    else:
-        logger.info("Verified: All embedders/norms/projections are on GPU")
+    logger.info(f"  Moving single_transformer_blocks ({num_single} blocks) back to CPU...")
+    transformer.single_transformer_blocks.to('cpu')
+
+    # Clear GPU cache after moving blocks to CPU
+    torch.cuda.empty_cache()
+    gc.collect()
+
+    # Verify the setup
+    gpu_components = []
+    for name, child in transformer.named_children():
+        first_param = next(child.parameters(), None)
+        if first_param is not None:
+            device = first_param.device
+            if device.type == 'cuda':
+                size_mb = sum(p.numel() * p.element_size() for p in child.parameters()) / 1024**2
+                gpu_components.append(f"{name}: {size_mb:.1f}MB")
+
+    logger.info(f"  Components on GPU: {', '.join(gpu_components)}")
 
     # Count total on GPU vs CPU
     gpu_params = 0
