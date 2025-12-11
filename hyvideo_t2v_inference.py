@@ -294,6 +294,19 @@ if __name__ == "__main__":
                     all_on_gpu = all(p.device.type == 'cuda' for p in comp.parameters())
                     logger.info(f"  {comp_name}: all_on_gpu={all_on_gpu}")
 
+        # DIRECT CHECK: The exact parameter causing the error
+        tte = transformer.time_text_embed
+        te = tte.timestep_embedder
+        l1 = te.linear_1
+        logger.info(f"  DIRECT CHECK: timestep_embedder.linear_1.weight.device = {l1.weight.device}")
+        logger.info(f"  DIRECT CHECK: timestep_embedder.linear_1.bias.device = {l1.bias.device}")
+
+        # Force move if still on CPU
+        if l1.weight.device.type != 'cuda':
+            logger.warning("  FORCING linear_1 to CUDA!")
+            l1.to('cuda')
+            logger.info(f"  After force: linear_1.weight.device = {l1.weight.device}")
+
         output = pipe(
             prompt_embeds=pre_encoded_embeds['prompt_embeds'].cuda(),
             pooled_prompt_embeds=pre_encoded_embeds['pooled_prompt_embeds'].cuda(),
