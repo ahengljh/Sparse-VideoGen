@@ -269,21 +269,30 @@ if __name__ == "__main__":
         # Move embeddings back to GPU for inference
         logger.info("Using pre-computed prompt embeddings (moving to GPU)...")
 
-        # CRITICAL: Explicitly ensure transformer embedders are on GPU
-        # This must happen right before inference on the exact transformer instance
+        # CRITICAL: Explicitly ensure ALL transformer embedder parameters are on GPU
+        # Check and move EVERY parameter, not just the module
         transformer = pipe.transformer
         embedder_components = ['time_text_embed', 'x_embedder', 'context_embedder', 'norm_out', 'proj_out']
         if hasattr(transformer, 'rope'):
             embedder_components.append('rope')
+
         for comp_name in embedder_components:
             if hasattr(transformer, comp_name):
                 comp = getattr(transformer, comp_name)
                 if comp is not None:
-                    comp.to('cuda')
-                    # Verify
-                    first_param = next(comp.parameters(), None)
-                    if first_param is not None:
-                        logger.info(f"  {comp_name} → {first_param.device}")
+                    # Check ALL parameters and force-move any on CPU
+                    cpu_params = []
+                    for pname, param in comp.named_parameters():
+                        if param.device.type != 'cuda':
+                            cpu_params.append(pname)
+
+                    if cpu_params:
+                        logger.warning(f"  {comp_name} has {len(cpu_params)} params on CPU, moving...")
+                        comp.to('cuda')
+
+                    # Verify ALL params are now on GPU
+                    all_on_gpu = all(p.device.type == 'cuda' for p in comp.parameters())
+                    logger.info(f"  {comp_name}: all_on_gpu={all_on_gpu}")
 
         output = pipe(
             prompt_embeds=pre_encoded_embeds['prompt_embeds'].cuda(),
