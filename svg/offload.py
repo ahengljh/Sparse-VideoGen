@@ -803,11 +803,14 @@ def setup_offloading_for_pipeline(
             if hasattr(module, name):
                 comp = getattr(module, name)
                 if comp is not None:
-                    # Check ALL params - if ANY on CPU, move entire component
-                    has_cpu_param = any(p.device.type == 'cpu' for p in comp.parameters())
-                    if has_cpu_param:
-                        logger.warning(f"Hook: {name} has CPU params, moving to GPU")
-                        comp.to(config.compute_device)
+                    # Move EVERY submodule individually - .to() on parent might not propagate
+                    for subname, submodule in comp.named_modules():
+                        # Check if this submodule has any CPU params
+                        for pname, param in submodule.named_parameters(recurse=False):
+                            if param.device.type != 'cuda':
+                                logger.warning(f"Hook: {name}.{subname}.{pname} on CPU, moving...")
+                                submodule.to(config.compute_device)
+                                break  # Move whole submodule, then check next
         return args
 
     transformer.register_forward_pre_hook(ensure_embedders_on_gpu)
