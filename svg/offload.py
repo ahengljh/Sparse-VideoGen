@@ -798,35 +798,22 @@ def setup_offloading_for_pipeline(
         embedder_names.append('rope')
 
     def ensure_embedders_on_gpu(module, args):
-        """Pre-hook to ensure embedders are on GPU before forward."""
-        logger.info(">>> Embedder hook triggered!")
+        """Pre-hook to ensure embedders are on GPU before forward.
 
-        # DIRECT CHECK: The exact parameter causing the error
-        if hasattr(module, 'time_text_embed'):
-            tte = module.time_text_embed
-            if hasattr(tte, 'timestep_embedder'):
-                te = tte.timestep_embedder
-                if hasattr(te, 'linear_1'):
-                    l1 = te.linear_1
-                    logger.info(f"DIRECT CHECK: linear_1.weight.device = {l1.weight.device}")
-                    if l1.weight.device.type != 'cuda':
-                        logger.warning("FORCING linear_1 to CUDA!")
-                        l1.to('cuda')
-                        logger.info(f"AFTER FORCE: linear_1.weight.device = {l1.weight.device}")
-
+        Note: Input tensor device normalization is now handled in custom_models.py.
+        This hook serves as a safety net for embedder weights.
+        """
+        # Safety check: ensure embedder modules are on GPU
         for name in embedder_names:
             if hasattr(module, name):
                 comp = getattr(module, name)
                 if comp is not None:
-                    # Move EVERY submodule individually - .to() on parent might not propagate
-                    for subname, submodule in comp.named_modules():
-                        # Check if this submodule has any CPU params
-                        for pname, param in submodule.named_parameters(recurse=False):
-                            if param.device.type != 'cuda':
-                                logger.warning(f"Hook: {name}.{subname}.{pname} on {param.device}, forcing to cuda")
-                                submodule.to('cuda')
-                                break  # Move whole submodule, then check next
-        logger.info(">>> Embedder hook completed")
+                    # Check if any parameters are on CPU and move them
+                    first_param = next(comp.parameters(), None)
+                    if first_param is not None and first_param.device.type != 'cuda':
+                        comp.to('cuda')
+                        if config.verbose:
+                            logger.info(f"Hook: Moved {name} to GPU")
         return args
 
     transformer.register_forward_pre_hook(ensure_embedders_on_gpu)

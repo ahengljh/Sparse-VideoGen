@@ -162,6 +162,20 @@ class HunyuanVideoTransformer3DModel_Sparse(HunyuanVideoTransformer3DModel):
         post_patch_width = width // p
         first_frame_num_tokens = 1 * post_patch_height * post_patch_width
 
+        # Ensure all input tensors are on the same device as hidden_states
+        # This is critical for offloading mode where scheduler timesteps may be on CPU
+        device = hidden_states.device
+        if timestep.device != device:
+            timestep = timestep.to(device)
+        if pooled_projections is not None and pooled_projections.device != device:
+            pooled_projections = pooled_projections.to(device)
+        if guidance is not None and guidance.device != device:
+            guidance = guidance.to(device)
+        if encoder_hidden_states.device != device:
+            encoder_hidden_states = encoder_hidden_states.to(device)
+        if encoder_attention_mask.device != device:
+            encoder_attention_mask = encoder_attention_mask.to(device)
+
         # 1. RoPE
         image_rotary_emb = self.rope(hidden_states)
 
