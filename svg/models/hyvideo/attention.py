@@ -466,15 +466,25 @@ class Hunyuan_SVGAttn_Processor2_0:
     def flashinfer_attention(self, query, key, value, cu_max_seqlens):
         """
         VarlenFlashInfer Attention. Input is (B, H, L, D).
-        Falls back to flash_attn when FlashInfer is not available.
+        Falls back to flash_attn when FlashInfer is not available or fails at runtime.
         """
+        global FLASHINFER_AVAILABLE
+
         if not FLASHINFER_AVAILABLE:
             # Fall back to flash_attn
             return self.flash_attention(query, key, value, cu_max_seqlens)
 
-        cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = cu_max_seqlens
-        out = flashinfer_varlen_func(query, key, value, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
-        return out
+        try:
+            cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = cu_max_seqlens
+            out = flashinfer_varlen_func(query, key, value, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
+            return out
+        except RuntimeError as e:
+            # FlashInfer's internal JIT check may fail even if we passed the sm75+ check
+            if "sm75" in str(e) or "cuda" in str(e).lower():
+                logger.warning(f"FlashInfer JIT compilation failed: {e}. Falling back to flash_attn permanently.")
+                FLASHINFER_AVAILABLE = False
+                return self.flash_attention(query, key, value, cu_max_seqlens)
+            raise
 
     @time_logging_decorator("Level 3 - Dense Flash Attention")
     def flash_attention(self, query, key, value, cu_max_seqlens):
@@ -762,8 +772,12 @@ class Hunyuan_SAPAttn_Processor2_0(Hunyuan_SVGAttn_Processor2_0):
         if timestep[0] > self.first_times_fp:
             full_attention_flag = True
 
+        # Force dense attention if FlashInfer is not available (sparse path requires FlashInfer)
+        if not FLASHINFER_AVAILABLE:
+            full_attention_flag = True
+
         if full_attention_flag:
-            if self.zero_step_kmeans_init:
+            if self.zero_step_kmeans_init and FLASHINFER_AVAILABLE:
                 video_length = self.num_frame * self.frame_size
                 query_video = query[:, :, :video_length, :].contiguous()
                 key_video = key[:, :, :video_length, :].contiguous()
@@ -1016,9 +1030,13 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         if timestep[0] > self.first_times_fp:
             full_attention_flag = True
 
+        # Force dense attention if FlashInfer is not available (sparse path requires FlashInfer)
+        if not FLASHINFER_AVAILABLE:
+            full_attention_flag = True
+
         if full_attention_flag:
             # During warmup, still initialize CTCA clusters for later use
-            if self.zero_step_kmeans_init:
+            if self.zero_step_kmeans_init and FLASHINFER_AVAILABLE:
                 video_length = self.num_frame * self.frame_size
                 query_video = query[:, :, :video_length, :].contiguous()
                 key_video = key[:, :, :video_length, :].contiguous()
