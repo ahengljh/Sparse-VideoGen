@@ -177,11 +177,9 @@ class HunyuanVideoTransformer3DModel_Sparse(HunyuanVideoTransformer3DModel):
         # If device is still CPU, force CUDA (this shouldn't happen if setup is correct)
         if device.type == 'cpu':
             device = torch.device('cuda:0')
-            logger.warning(f"Forcing device to cuda:0 (hidden_states was on CPU)")
+            logger.warning(f"Forcing device to cuda:0 (embedders were on CPU)")
 
-        logger.info(f"Forward: target_device={device}, hidden_states.device={hidden_states.device}, timestep.device={timestep.device}")
-
-        # Move ALL inputs to the compute device
+        # Move ALL inputs to the compute device (silent - happens every step)
         hidden_states = hidden_states.to(device)
         timestep = timestep.to(device)
         if pooled_projections is not None:
@@ -190,8 +188,6 @@ class HunyuanVideoTransformer3DModel_Sparse(HunyuanVideoTransformer3DModel):
             guidance = guidance.to(device)
         encoder_hidden_states = encoder_hidden_states.to(device)
         encoder_attention_mask = encoder_attention_mask.to(device)
-
-        logger.info(f"After move: hidden_states.device={hidden_states.device}, timestep.device={timestep.device}")
 
         # Ensure all embedder modules are on the compute device
         # (They should already be, but this is a safety check)
