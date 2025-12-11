@@ -673,54 +673,56 @@ def setup_offloading_for_pipeline(
 
     logger.info("Setting up dynamic layer offloading for HunyuanVideo...")
 
+    transformer = pipe.transformer
+
     # Create offload manager for transformer
     offload_manager = LayerOffloadManager(
-        pipe.transformer,
+        transformer,
         config,
         double_blocks_attr="transformer_blocks",
         single_blocks_attr="single_transformer_blocks",
     )
 
-    # IMPORTANT: Don't move the entire transformer to GPU - that would cause OOM!
-    # The transformer has components that need to stay on GPU:
-    # - time_text_embed: processes timestep + pooled_projections
-    # - x_embedder: processes input latents
-    # - context_embedder: processes prompt_embeds
-    # - norm_out, proj_out: final output processing
+    # STRATEGY: Move everything to GPU first, then selectively move blocks to CPU.
+    # This ensures all embedders, norms, projections are on GPU.
+    # But we can't do transformer.to('cuda') directly due to OOM.
     #
-    # Only these small components should be on GPU, while the large blocks stay on CPU.
+    # SOLUTION: Iterate through direct children and move each appropriately.
+    # - transformer_blocks and single_transformer_blocks → CPU (offloaded)
+    # - Everything else (embedders, norms, etc.) → GPU
 
-    # First, ensure transformer is on CPU
-    pipe.transformer.to('cpu')
+    # Names of the block lists that should be offloaded to CPU
+    block_list_names = {'transformer_blocks', 'single_transformer_blocks'}
 
-    # Then, move ONLY the embedder/norm/proj components to GPU (these are small)
-    # These are the components that process inputs BEFORE and AFTER the block loop
-    components_to_keep_on_gpu = [
-        'time_text_embed',   # Processes timestep + pooled_projections
-        'x_embedder',        # Processes input latents
-        'context_embedder',  # Processes prompt_embeds
-        'norm_out',          # Final normalization
-        'proj_out',          # Final projection
-    ]
+    # Move each direct child module to the appropriate device
+    for name, child in transformer.named_children():
+        if name in block_list_names:
+            # These are the large block lists - keep on CPU
+            child.to('cpu')
+            logger.info(f"  {name}: {len(list(child))} blocks → CPU (will be loaded on-demand)")
+        else:
+            # Everything else (embedders, norms, projections) - move to GPU
+            child.to(config.compute_device)
+            # Count params in this child
+            param_bytes = sum(p.numel() * p.element_size() for p in child.parameters())
+            logger.info(f"  {name}: {param_bytes/1024**2:.1f}MB → GPU")
 
-    for comp_name in components_to_keep_on_gpu:
-        if hasattr(pipe.transformer, comp_name):
-            comp = getattr(pipe.transformer, comp_name)
-            if comp is not None:
-                comp.to(config.compute_device)
-                if config.verbose:
-                    logger.debug(f"Moved {comp_name} to GPU")
+    # Also need to handle any parameters directly on the transformer (not in children)
+    # These are typically things like positional embeddings
+    for name, param in transformer.named_parameters(recurse=False):
+        param.data = param.data.to(config.compute_device)
+        logger.info(f"  {name} (param): {param.numel() * param.element_size()/1024**2:.1f}MB → GPU")
 
-    # Count what's on GPU vs CPU
+    # Count total on GPU vs CPU
     gpu_params = 0
     cpu_params = 0
-    for name, param in pipe.transformer.named_parameters():
+    for param in transformer.parameters():
         if param.device.type == 'cuda':
             gpu_params += param.numel() * param.element_size()
         else:
             cpu_params += param.numel() * param.element_size()
 
-    logger.info(f"Transformer: {gpu_params/1024**3:.2f}GB on GPU (embedders), {cpu_params/1024**3:.2f}GB on CPU (blocks)")
+    logger.info(f"Transformer total: {gpu_params/1024**3:.2f}GB on GPU, {cpu_params/1024**3:.2f}GB on CPU")
 
     # VAE - keep on GPU for decoding (it's small ~300MB)
     if keep_vae_on_gpu:
