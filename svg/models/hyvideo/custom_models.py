@@ -165,16 +165,31 @@ class HunyuanVideoTransformer3DModel_Sparse(HunyuanVideoTransformer3DModel):
         # Ensure all input tensors are on the same device as hidden_states
         # This is critical for offloading mode where scheduler timesteps may be on CPU
         device = hidden_states.device
-        if timestep.device != device:
-            timestep = timestep.to(device)
-        if pooled_projections is not None and pooled_projections.device != device:
+        logger.info(f"Forward: hidden_states.device={device}, timestep.device={timestep.device}")
+
+        # Always move to ensure correct device (to() is no-op if already on device)
+        timestep = timestep.to(device)
+        if pooled_projections is not None:
             pooled_projections = pooled_projections.to(device)
-        if guidance is not None and guidance.device != device:
+        if guidance is not None:
             guidance = guidance.to(device)
-        if encoder_hidden_states.device != device:
-            encoder_hidden_states = encoder_hidden_states.to(device)
-        if encoder_attention_mask.device != device:
-            encoder_attention_mask = encoder_attention_mask.to(device)
+        encoder_hidden_states = encoder_hidden_states.to(device)
+        encoder_attention_mask = encoder_attention_mask.to(device)
+
+        logger.info(f"After move: timestep.device={timestep.device}, pooled_projections.device={pooled_projections.device if pooled_projections is not None else None}")
+
+        # Also ensure time_text_embed module is on correct device
+        # Check ALL submodules, not just first parameter
+        if hasattr(self, 'time_text_embed'):
+            for name, submodule in self.time_text_embed.named_modules():
+                for pname, param in submodule.named_parameters(recurse=False):
+                    if param.device != device:
+                        logger.warning(f"time_text_embed.{name}.{pname} on {param.device}, moving entire module to {device}")
+                        self.time_text_embed.to(device)
+                        break
+                else:
+                    continue
+                break
 
         # 1. RoPE
         image_rotary_emb = self.rope(hidden_states)
