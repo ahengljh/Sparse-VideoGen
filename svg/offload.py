@@ -803,9 +803,10 @@ def setup_offloading_for_pipeline(
             if hasattr(module, name):
                 comp = getattr(module, name)
                 if comp is not None:
-                    # Check first param - if on CPU, move entire component
-                    first_param = next(comp.parameters(), None)
-                    if first_param is not None and first_param.device.type != 'cuda':
+                    # Check ALL params - if ANY on CPU, move entire component
+                    has_cpu_param = any(p.device.type == 'cpu' for p in comp.parameters())
+                    if has_cpu_param:
+                        logger.warning(f"Hook: {name} has CPU params, moving to GPU")
                         comp.to(config.compute_device)
         return args
 
