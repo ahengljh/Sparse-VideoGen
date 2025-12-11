@@ -162,12 +162,27 @@ class HunyuanVideoTransformer3DModel_Sparse(HunyuanVideoTransformer3DModel):
         post_patch_width = width // p
         first_frame_num_tokens = 1 * post_patch_height * post_patch_width
 
-        # Ensure all input tensors are on the same device as hidden_states
-        # This is critical for offloading mode where scheduler timesteps may be on CPU
-        device = hidden_states.device
-        logger.info(f"Forward: hidden_states.device={device}, timestep.device={timestep.device}")
+        # Ensure all input tensors are on the correct compute device (CUDA)
+        # The pipeline may pass CPU tensors, but we need everything on GPU for computation
+        # Get target device from embedder weights (which should be on CUDA)
+        if hasattr(self, 'time_text_embed'):
+            first_param = next(self.time_text_embed.parameters(), None)
+            if first_param is not None:
+                device = first_param.device
+            else:
+                device = hidden_states.device
+        else:
+            device = hidden_states.device
 
-        # Always move to ensure correct device (to() is no-op if already on device)
+        # If device is still CPU, force CUDA (this shouldn't happen if setup is correct)
+        if device.type == 'cpu':
+            device = torch.device('cuda:0')
+            logger.warning(f"Forcing device to cuda:0 (hidden_states was on CPU)")
+
+        logger.info(f"Forward: target_device={device}, hidden_states.device={hidden_states.device}, timestep.device={timestep.device}")
+
+        # Move ALL inputs to the compute device
+        hidden_states = hidden_states.to(device)
         timestep = timestep.to(device)
         if pooled_projections is not None:
             pooled_projections = pooled_projections.to(device)
@@ -176,20 +191,18 @@ class HunyuanVideoTransformer3DModel_Sparse(HunyuanVideoTransformer3DModel):
         encoder_hidden_states = encoder_hidden_states.to(device)
         encoder_attention_mask = encoder_attention_mask.to(device)
 
-        logger.info(f"After move: timestep.device={timestep.device}, pooled_projections.device={pooled_projections.device if pooled_projections is not None else None}")
+        logger.info(f"After move: hidden_states.device={hidden_states.device}, timestep.device={timestep.device}")
 
-        # Also ensure time_text_embed module is on correct device
-        # Check ALL submodules, not just first parameter
-        if hasattr(self, 'time_text_embed'):
-            for name, submodule in self.time_text_embed.named_modules():
-                for pname, param in submodule.named_parameters(recurse=False):
-                    if param.device != device:
-                        logger.warning(f"time_text_embed.{name}.{pname} on {param.device}, moving entire module to {device}")
-                        self.time_text_embed.to(device)
-                        break
-                else:
-                    continue
-                break
+        # Ensure all embedder modules are on the compute device
+        # (They should already be, but this is a safety check)
+        for module_name in ['time_text_embed', 'x_embedder', 'context_embedder', 'rope', 'norm_out', 'proj_out']:
+            if hasattr(self, module_name):
+                module = getattr(self, module_name)
+                if module is not None:
+                    first_param = next(module.parameters(), None)
+                    if first_param is not None and first_param.device != device:
+                        logger.warning(f"{module_name} on {first_param.device}, moving to {device}")
+                        module.to(device)
 
         # 1. RoPE
         image_rotary_emb = self.rope(hidden_states)
