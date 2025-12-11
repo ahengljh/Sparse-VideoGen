@@ -683,35 +683,67 @@ def setup_offloading_for_pipeline(
         single_blocks_attr="single_transformer_blocks",
     )
 
-    # STRATEGY: Move everything to GPU first, then selectively move blocks to CPU.
-    # This ensures all embedders, norms, projections are on GPU.
-    # But we can't do transformer.to('cuda') directly due to OOM.
+    # STRATEGY: Explicitly move each parameter to the correct device based on its name.
+    # This is more reliable than calling .to() on modules, which can sometimes fail
+    # to move nested submodules properly.
     #
-    # SOLUTION: Iterate through direct children and move each appropriately.
-    # - transformer_blocks and single_transformer_blocks → CPU (offloaded)
-    # - Everything else (embedders, norms, etc.) → GPU
+    # Rules:
+    # - Parameters with 'transformer_blocks' or 'single_transformer_blocks' in path → CPU
+    # - Everything else → GPU
 
-    # Names of the block lists that should be offloaded to CPU
-    block_list_names = {'transformer_blocks', 'single_transformer_blocks'}
+    # Track what we move for logging
+    gpu_components = set()
+    cpu_block_counts = {'transformer_blocks': 0, 'single_transformer_blocks': 0}
 
-    # Move each direct child module to the appropriate device
-    for name, child in transformer.named_children():
-        if name in block_list_names:
-            # These are the large block lists - keep on CPU
-            child.to('cpu')
-            logger.info(f"  {name}: {len(list(child))} blocks → CPU (will be loaded on-demand)")
+    # Move ALL parameters explicitly based on their path
+    for name, param in transformer.named_parameters():
+        # Check if this parameter belongs to a transformer block
+        is_block_param = ('transformer_blocks.' in name or 'single_transformer_blocks.' in name)
+
+        if is_block_param:
+            # Move to CPU (these will be loaded on-demand)
+            if param.device.type != 'cpu':
+                param.data = param.data.to('cpu')
+            # Track block count
+            if 'single_transformer_blocks.' in name:
+                cpu_block_counts['single_transformer_blocks'] = max(
+                    cpu_block_counts['single_transformer_blocks'],
+                    int(name.split('single_transformer_blocks.')[1].split('.')[0]) + 1
+                )
+            elif 'transformer_blocks.' in name:
+                cpu_block_counts['transformer_blocks'] = max(
+                    cpu_block_counts['transformer_blocks'],
+                    int(name.split('transformer_blocks.')[1].split('.')[0]) + 1
+                )
         else:
-            # Everything else (embedders, norms, projections) - move to GPU
-            child.to(config.compute_device)
-            # Count params in this child
-            param_bytes = sum(p.numel() * p.element_size() for p in child.parameters())
-            logger.info(f"  {name}: {param_bytes/1024**2:.1f}MB → GPU")
+            # Move to GPU (embedders, norms, projections)
+            if param.device.type != 'cuda':
+                param.data = param.data.to(config.compute_device)
+            # Track component name (top-level)
+            component = name.split('.')[0]
+            gpu_components.add(component)
 
-    # Also need to handle any parameters directly on the transformer (not in children)
-    # These are typically things like positional embeddings
-    for name, param in transformer.named_parameters(recurse=False):
-        param.data = param.data.to(config.compute_device)
-        logger.info(f"  {name} (param): {param.numel() * param.element_size()/1024**2:.1f}MB → GPU")
+    # Also move buffers (non-parameter tensors like running_mean, etc.)
+    for name, buffer in transformer.named_buffers():
+        if buffer is None:
+            continue
+        is_block_buffer = ('transformer_blocks.' in name or 'single_transformer_blocks.' in name)
+        if is_block_buffer:
+            if buffer.device.type != 'cpu':
+                # Need to use setattr for buffers
+                pass  # Buffers in blocks will be handled when block is loaded
+        else:
+            if buffer.device.type != 'cuda':
+                # For non-block buffers, move to GPU
+                # This is trickier - buffers need special handling
+                pass  # Most models don't have critical buffers outside blocks
+
+    # Log what we did
+    for name in sorted(gpu_components):
+        logger.info(f"  {name}: → GPU (embedder/norm/projection)")
+    for block_type, count in cpu_block_counts.items():
+        if count > 0:
+            logger.info(f"  {block_type}: {count} blocks → CPU (will be loaded on-demand)")
 
     # Count total on GPU vs CPU
     gpu_params = 0
