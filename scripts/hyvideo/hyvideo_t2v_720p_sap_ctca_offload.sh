@@ -35,6 +35,26 @@ ctca_max_interval=10             # Maximum timesteps to reuse clusters
 first_times_fp=0.1               # Dense attention for first 10% timesteps
 first_layers_fp=0.03             # Dense attention for first 3% layers
 
+# Offloading configuration (sliding window approach)
+# Memory breakdown for HunyuanVideo:
+#   - Total transformer: ~13GB (60 layers @ ~217MB each)
+#   - VAE: ~300MB (kept on GPU for decoding)
+#   - Activations: ~2-4GB (depends on resolution/frames)
+#   - CUDA overhead: ~500MB
+#
+# For 24GB GPU (4090/3090), we have ~20GB usable with headroom:
+#   20GB - 4GB (activations) - 0.3GB (VAE) - 0.5GB (overhead) = ~15GB for layers
+#   15GB / 0.217GB per layer = ~69 layers (but we only have 60)
+#   So with this setup, we could keep all 60 layers, but we use sliding window
+#   for safety margin and to leave room for attention caching.
+#
+# Recommended settings:
+#   - 24GB GPU (4090/3090): 6-10 layers (safe), up to 15 (aggressive)
+#   - 40GB+ GPU (A100/A6000): 15-30 layers
+#   - Use max_memory_gb for auto-tuning
+offload_num_layers=8             # Keep 8 layers on GPU (~1.7GB)
+# offload_max_memory_gb=20       # Alternative: auto-tune based on memory budget
+
 # Output configuration
 output_dir="outputs/hyvideo_sap_ctca_offload"
 logging_dir="logs/hyvideo_sap_ctca_offload"
@@ -70,6 +90,7 @@ python hyvideo_t2v_inference.py \
     --ctca_max_interval $ctca_max_interval \
     --ctca_adaptive \
     --enable_offload \
+    --offload_num_layers $offload_num_layers \
     --offload_pinned_memory \
     --offload_prefetch \
     --seed 42

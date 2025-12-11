@@ -37,15 +37,23 @@ class OffloadConfig:
     # Memory settings
     use_pinned_memory: bool = True  # Use page-locked memory for faster transfers
 
+    # Layer batching - how many layers to keep on GPU simultaneously
+    # Higher = faster but more memory, Lower = slower but less memory
+    # Recommended: 4-8 for 24GB GPU, 10-15 for 40GB GPU
+    num_layers_on_gpu: int = 6
+
     # Prefetching settings
     enable_prefetch: bool = True    # Async prefetch next layer
-    prefetch_count: int = 1         # Number of layers to prefetch ahead
+    prefetch_count: int = 2         # Number of layers to prefetch ahead
 
     # Components to keep on GPU (don't offload)
     keep_on_gpu: List[str] = None   # e.g., ["text_encoder", "vae"]
 
     # Memory management
-    empty_cache_frequency: int = 5  # Call empty_cache every N layers
+    empty_cache_frequency: int = 10  # Call empty_cache every N layers
+
+    # Memory budget (optional) - if set, auto-tune num_layers_on_gpu
+    max_memory_gb: float = None     # e.g., 20.0 for 24GB GPU with headroom
 
     # Debugging
     verbose: bool = False
@@ -55,10 +63,14 @@ class LayerOffloadManager:
     """
     Manages dynamic CPU-GPU offloading for transformer layers.
 
-    This class handles:
-    1. Moving layers between CPU and GPU on-demand
+    This class implements a sliding window approach where multiple layers
+    are kept on GPU simultaneously for better throughput, while still
+    fitting within memory constraints.
+
+    Key features:
+    1. Sliding window of N layers on GPU (configurable)
     2. Async prefetching of upcoming layers
-    3. Memory-efficient state management
+    3. Automatic memory management
 
     Usage:
         manager = LayerOffloadManager(model, config)
@@ -97,9 +109,17 @@ class LayerOffloadManager:
         self.all_blocks = list(self.double_blocks) + list(self.single_blocks)
         self.num_layers = len(self.all_blocks)
 
+        # Calculate per-layer memory
+        self._layer_memory_mb = self._estimate_layer_memory()
+
+        # Auto-tune num_layers_on_gpu if max_memory_gb is specified
+        if config.max_memory_gb is not None:
+            self._auto_tune_layers_on_gpu()
+
         # Track layer locations
         self._layer_on_gpu: Dict[int, bool] = {}
         self._layer_pinned: Dict[int, bool] = {}
+        self._layers_on_gpu_set: set = set()  # Track which layers are currently on GPU
 
         # CUDA streams for async operations
         self._prefetch_stream: Optional[torch.cuda.Stream] = None
@@ -109,6 +129,9 @@ class LayerOffloadManager:
         self._prefetch_in_progress: Dict[int, bool] = {}
         self._prefetch_events: Dict[int, torch.cuda.Event] = {}
 
+        # Current window position
+        self._current_window_start: int = 0
+
         # Statistics
         self.stats = {
             'gpu_loads': 0,
@@ -116,9 +139,46 @@ class LayerOffloadManager:
             'prefetch_hits': 0,
             'prefetch_misses': 0,
             'cache_clears': 0,
+            'window_slides': 0,
         }
 
         self._initialized = False
+
+    def _estimate_layer_memory(self) -> float:
+        """Estimate memory per layer in MB."""
+        if len(self.all_blocks) == 0:
+            return 0.0
+
+        # Sample first layer
+        layer = self.all_blocks[0]
+        total_params = sum(p.numel() * p.element_size() for p in layer.parameters())
+        total_buffers = sum(b.numel() * b.element_size() for b in layer.buffers() if b is not None)
+
+        return (total_params + total_buffers) / (1024 * 1024)
+
+    def _auto_tune_layers_on_gpu(self):
+        """Auto-tune the number of layers to keep on GPU based on memory budget."""
+        if self.config.max_memory_gb is None:
+            return
+
+        # Reserve memory for:
+        # - VAE: ~300MB
+        # - Activations: ~3GB (conservative estimate for 720p video)
+        # - CUDA overhead: ~500MB
+        reserved_gb = 4.0
+
+        available_gb = self.config.max_memory_gb - reserved_gb
+        available_mb = available_gb * 1024
+
+        # Calculate how many layers fit
+        if self._layer_memory_mb > 0:
+            max_layers = int(available_mb / self._layer_memory_mb)
+            # Clamp to reasonable range
+            self.config.num_layers_on_gpu = max(1, min(max_layers, self.num_layers))
+
+            logger.info(f"Auto-tuned layers on GPU: {self.config.num_layers_on_gpu} "
+                       f"(~{self._layer_memory_mb:.1f}MB/layer, "
+                       f"{available_gb:.1f}GB available)")
 
     def prepare_for_inference(self):
         """
@@ -237,10 +297,45 @@ class LayerOffloadManager:
         else:
             self.stats['prefetch_misses'] += 1
 
+    def _evict_oldest_layers(self, keep_layer_idx: int):
+        """
+        Evict oldest layers to make room in the GPU sliding window.
+
+        This implements a sliding window strategy: keep the most recent N layers
+        on GPU, where N = num_layers_on_gpu.
+
+        Args:
+            keep_layer_idx: The layer we're about to use (must stay on GPU)
+        """
+        # Calculate the window bounds
+        # Window should cover [keep_layer_idx - num_layers_on_gpu + 1, keep_layer_idx]
+        window_end = keep_layer_idx
+        window_start = max(0, keep_layer_idx - self.config.num_layers_on_gpu + 1)
+
+        # Find layers outside the window
+        layers_to_evict = []
+        for idx in list(self._layers_on_gpu_set):
+            if idx < window_start:
+                layers_to_evict.append(idx)
+
+        # Evict layers outside the window
+        for idx in layers_to_evict:
+            self._offload_layer_from_gpu(idx)
+            self._layers_on_gpu_set.discard(idx)
+            self.stats['window_slides'] += 1
+
+            if self.config.verbose:
+                logger.debug(f"Evicted layer {idx} (window: [{window_start}, {window_end}])")
+
     @time_logging_decorator("Level 3 - Ensure layer on GPU")
     def ensure_layer_on_gpu(self, layer_idx: int):
         """
         Ensure a layer is on GPU, loading it if necessary.
+
+        This implements a sliding window approach:
+        - Keep up to N layers on GPU simultaneously
+        - Evict oldest layers when window moves forward
+        - Prefetch upcoming layers
 
         This should be called before using a layer for computation.
         """
@@ -252,6 +347,8 @@ class LayerOffloadManager:
             # Wait for any in-progress prefetch
             if self._prefetch_in_progress.get(layer_idx, False):
                 self._wait_for_prefetch(layer_idx)
+            # Add to tracking set
+            self._layers_on_gpu_set.add(layer_idx)
             return
 
         # Check if prefetch is in progress
@@ -261,6 +358,12 @@ class LayerOffloadManager:
             # Synchronous load (prefetch miss)
             self._move_layer_to_gpu(layer_idx, non_blocking=False)
             self.stats['prefetch_misses'] += 1
+
+        # Track this layer as being on GPU
+        self._layers_on_gpu_set.add(layer_idx)
+
+        # Evict old layers that fall outside the sliding window
+        self._evict_oldest_layers(layer_idx)
 
         # Start prefetching next layers
         for i in range(1, self.config.prefetch_count + 1):
@@ -273,10 +376,13 @@ class LayerOffloadManager:
         """
         Called after a layer's forward pass is complete.
 
-        This offloads the layer back to CPU to free GPU memory.
+        With sliding window approach, we don't immediately offload.
+        Layers are evicted when the window slides forward in ensure_layer_on_gpu().
+
+        We only periodically clear CUDA cache for memory efficiency.
         """
-        # Offload current layer
-        self._offload_layer_from_gpu(layer_idx)
+        # Note: With sliding window, we keep layers on GPU until they fall
+        # outside the window. Eviction is handled by _evict_oldest_layers().
 
         # Periodically clear CUDA cache
         if (layer_idx + 1) % self.config.empty_cache_frequency == 0:
@@ -304,8 +410,11 @@ class LayerOffloadManager:
         print("Dynamic Layer Offloading Statistics")
         print("=" * 60)
         print(f"Total layers:           {stats['num_layers']}")
+        print(f"Layers kept on GPU:     {self.config.num_layers_on_gpu}")
+        print(f"Layer memory:           ~{self._layer_memory_mb:.1f}MB each")
         print(f"GPU loads:              {stats['gpu_loads']}")
         print(f"GPU offloads:           {stats['gpu_offloads']}")
+        print(f"Window slides:          {stats['window_slides']}")
         print(f"Prefetch hits:          {stats['prefetch_hits']}")
         print(f"Prefetch misses:        {stats['prefetch_misses']}")
         print(f"Prefetch hit ratio:     {stats['prefetch_hit_ratio']*100:.1f}%")
@@ -538,6 +647,8 @@ def enable_offloading(
     pipe,
     use_pinned_memory: bool = True,
     enable_prefetch: bool = True,
+    num_layers_on_gpu: int = 6,
+    max_memory_gb: Optional[float] = None,
     verbose: bool = False,
 ) -> Tuple[LayerOffloadManager, List]:
     """
@@ -549,19 +660,26 @@ def enable_offloading(
         pipe: HunyuanVideoPipeline
         use_pinned_memory: Use pinned CPU memory for faster transfers
         enable_prefetch: Enable async prefetching
+        num_layers_on_gpu: Number of layers to keep on GPU (sliding window size)
+                          Higher = faster but more VRAM
+                          Recommended: 4-8 for 24GB, 10-15 for 40GB+
+        max_memory_gb: If set, auto-tune num_layers_on_gpu to fit this budget
+                       e.g., 20.0 for 24GB GPU with headroom
         verbose: Print debug information
 
     Returns:
         Tuple of (LayerOffloadManager, list of hook handles)
 
     Usage:
-        manager, handles = enable_offloading(pipe)
+        manager, handles = enable_offloading(pipe, num_layers_on_gpu=8)
         output = pipe(prompt=..., ...)
         manager.print_statistics()
     """
     config = OffloadConfig(
         use_pinned_memory=use_pinned_memory,
         enable_prefetch=enable_prefetch,
+        num_layers_on_gpu=num_layers_on_gpu,
+        max_memory_gb=max_memory_gb,
         verbose=verbose,
     )
 

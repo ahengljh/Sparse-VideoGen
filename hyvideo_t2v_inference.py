@@ -73,6 +73,8 @@ if __name__ == "__main__":
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
+    parser.add_argument("--offload_num_layers", type=int, default=6, help="Number of transformer layers to keep on GPU (sliding window size). Higher=faster but more VRAM. Recommended: 4-8 for 24GB, 10-15 for 40GB+.")
+    parser.add_argument("--offload_max_memory_gb", type=float, default=None, help="Auto-tune num_layers based on memory budget (e.g., 20.0 for 24GB GPU).")
     parser.add_argument("--offload_pinned_memory", action="store_true", default=True, help="Use pinned CPU memory for faster transfers.")
     parser.add_argument("--offload_no_pinned_memory", action="store_false", dest="offload_pinned_memory", help="Disable pinned memory.")
     parser.add_argument("--offload_prefetch", action="store_true", default=True, help="Enable async prefetching of next layer.")
@@ -114,6 +116,8 @@ if __name__ == "__main__":
             pipe,
             use_pinned_memory=args.offload_pinned_memory,
             enable_prefetch=args.offload_prefetch,
+            num_layers_on_gpu=args.offload_num_layers,
+            max_memory_gb=args.offload_max_memory_gb,
             verbose=args.offload_verbose,
         )
         # Note: enable_offloading already handles device placement
