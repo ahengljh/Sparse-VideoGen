@@ -654,8 +654,8 @@ def setup_offloading_for_pipeline(
     pre_encode_and_offload() BEFORE this function to pre-compute prompt embeddings.
 
     This function:
-    1. Keeps the transformer on CPU initially
-    2. Wraps transformer blocks with offloading logic
+    1. Keeps transformer blocks on CPU (loaded on-demand)
+    2. Keeps transformer embedders/norms on GPU (needed for forward pass)
     3. Keeps VAE on GPU for decoding
 
     Args:
@@ -681,25 +681,46 @@ def setup_offloading_for_pipeline(
         single_blocks_attr="single_transformer_blocks",
     )
 
-    # IMPORTANT: Don't move the entire transformer to CPU!
+    # IMPORTANT: Don't move the entire transformer to GPU - that would cause OOM!
     # The transformer has components that need to stay on GPU:
     # - time_text_embed: processes timestep + pooled_projections
     # - x_embedder: processes input latents
     # - context_embedder: processes prompt_embeds
     # - norm_out, proj_out: final output processing
     #
-    # Only the transformer_blocks and single_transformer_blocks should be offloaded.
+    # Only these small components should be on GPU, while the large blocks stay on CPU.
 
-    # First, move the entire transformer to GPU to ensure all components are there
-    pipe.transformer.to(config.compute_device)
+    # First, ensure transformer is on CPU
+    pipe.transformer.to('cpu')
 
-    # Then, move ONLY the transformer blocks to CPU (they will be loaded on-demand)
-    for block in pipe.transformer.transformer_blocks:
-        block.to('cpu')
-    for block in pipe.transformer.single_transformer_blocks:
-        block.to('cpu')
+    # Then, move ONLY the embedder/norm/proj components to GPU (these are small)
+    # These are the components that process inputs BEFORE and AFTER the block loop
+    components_to_keep_on_gpu = [
+        'time_text_embed',   # Processes timestep + pooled_projections
+        'x_embedder',        # Processes input latents
+        'context_embedder',  # Processes prompt_embeds
+        'norm_out',          # Final normalization
+        'proj_out',          # Final projection
+    ]
 
-    logger.info(f"Transformer embedders/norms on GPU, {len(pipe.transformer.transformer_blocks) + len(pipe.transformer.single_transformer_blocks)} blocks on CPU")
+    for comp_name in components_to_keep_on_gpu:
+        if hasattr(pipe.transformer, comp_name):
+            comp = getattr(pipe.transformer, comp_name)
+            if comp is not None:
+                comp.to(config.compute_device)
+                if config.verbose:
+                    logger.debug(f"Moved {comp_name} to GPU")
+
+    # Count what's on GPU vs CPU
+    gpu_params = 0
+    cpu_params = 0
+    for name, param in pipe.transformer.named_parameters():
+        if param.device.type == 'cuda':
+            gpu_params += param.numel() * param.element_size()
+        else:
+            cpu_params += param.numel() * param.element_size()
+
+    logger.info(f"Transformer: {gpu_params/1024**3:.2f}GB on GPU (embedders), {cpu_params/1024**3:.2f}GB on CPU (blocks)")
 
     # VAE - keep on GPU for decoding (it's small ~300MB)
     if keep_vae_on_gpu:
