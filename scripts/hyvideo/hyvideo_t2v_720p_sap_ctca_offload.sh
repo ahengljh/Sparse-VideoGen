@@ -55,11 +55,10 @@ first_layers_fp=0.03             # Dense attention for first 3% layers
 offload_num_layers=8             # Keep 8 layers on GPU (~1.7GB)
 # offload_max_memory_gb=20       # Alternative: auto-tune based on memory budget
 
-# Text encoder offload mode:
-#   - "sequential": Move to GPU for encoding, then release (saves ~3-5GB) [RECOMMENDED]
-#   - "keep": Keep on GPU always (uses more memory)
-#   - "cpu": Keep on CPU (may cause issues)
-text_encoder_mode="sequential"
+# Note: Text encoders are now handled automatically with pre-encode strategy.
+# The prompt is encoded first while text encoders are on GPU,
+# then text encoders are offloaded to CPU before the denoising loop.
+# This saves ~14GB of GPU memory!
 
 # Output configuration
 output_dir="outputs/hyvideo_sap_ctca_offload"
@@ -97,7 +96,6 @@ python hyvideo_t2v_inference.py \
     --ctca_adaptive \
     --enable_offload \
     --offload_num_layers $offload_num_layers \
-    --offload_text_encoder_mode $text_encoder_mode \
     --offload_pinned_memory \
     --offload_prefetch \
     --seed 42

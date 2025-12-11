@@ -21,7 +21,7 @@ from svg.models.hyvideo.inference import (
     reset_ctca,
 )
 from svg.models.hyvideo.utils import get_prompt_length
-from svg.offload import enable_offloading, OffloadConfig
+from svg.offload import enable_offloading, pre_encode_and_offload, OffloadConfig
 
 from svg.logger import logger
 
@@ -75,7 +75,6 @@ if __name__ == "__main__":
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
     parser.add_argument("--offload_num_layers", type=int, default=6, help="Number of transformer layers to keep on GPU (sliding window size). Higher=faster but more VRAM. Recommended: 4-8 for 24GB, 10-15 for 40GB+.")
     parser.add_argument("--offload_max_memory_gb", type=float, default=None, help="Auto-tune num_layers based on memory budget (e.g., 20.0 for 24GB GPU).")
-    parser.add_argument("--offload_text_encoder_mode", type=str, default="sequential", choices=["sequential", "keep", "cpu"], help="Text encoder offload mode: 'sequential' (GPU during encode then release, saves ~3-5GB), 'keep' (always on GPU), 'cpu' (always on CPU).")
     parser.add_argument("--offload_pinned_memory", action="store_true", default=True, help="Use pinned CPU memory for faster transfers.")
     parser.add_argument("--offload_no_pinned_memory", action="store_false", dest="offload_pinned_memory", help="Disable pinned memory.")
     parser.add_argument("--offload_prefetch", action="store_true", default=True, help="Enable async prefetching of next layer.")
@@ -107,22 +106,18 @@ if __name__ == "__main__":
 
     #########################################################
     # Setup device placement (with optional offloading)
+    # Note: If offloading is enabled, we pre-encode the prompt first,
+    # then offload text encoders to CPU to save ~14GB of GPU memory.
     #########################################################
     offload_manager = None
     offload_hooks = None
+    pre_encoded_embeds = None  # Will store pre-computed prompt embeddings if offloading
 
     if args.enable_offload:
-        logger.info("Enabling dynamic layer offloading for low-memory GPU...")
-        offload_manager, offload_hooks = enable_offloading(
-            pipe,
-            use_pinned_memory=args.offload_pinned_memory,
-            enable_prefetch=args.offload_prefetch,
-            num_layers_on_gpu=args.offload_num_layers,
-            max_memory_gb=args.offload_max_memory_gb,
-            text_encoder_offload_mode=args.offload_text_encoder_mode,
-            verbose=args.offload_verbose,
-        )
-        # Note: enable_offloading already handles device placement
+        # For offloading, we need to:
+        # 1. First move to CUDA to enable text encoding
+        # 2. Pre-encode will be done later after prompt is loaded
+        logger.info("Offload mode: Pipeline will use pre-encoded embeddings")
     else:
         # Standard mode: load everything to GPU
         pipe.to("cuda")
@@ -162,6 +157,32 @@ if __name__ == "__main__":
     
     prompt_length = get_prompt_length(pipe, args.prompt)
     print(f"Prompt length: {prompt_length}")
+
+    #########################################################
+    # Pre-encode prompt and setup offloading (if enabled)
+    # This must happen BEFORE replacing attention
+    #########################################################
+    if args.enable_offload:
+        logger.info("Pre-encoding prompt (text encoders temporarily on GPU)...")
+        # Pre-encode prompt - this moves text encoders to GPU, encodes, then offloads to CPU
+        pre_encoded_embeds = pre_encode_and_offload(
+            pipe,
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+        # Now enable transformer layer offloading (text encoders already on CPU)
+        logger.info("Setting up transformer layer offloading...")
+        offload_manager, offload_hooks = enable_offloading(
+            pipe,
+            use_pinned_memory=args.offload_pinned_memory,
+            enable_prefetch=args.offload_prefetch,
+            num_layers_on_gpu=args.offload_num_layers,
+            max_memory_gb=args.offload_max_memory_gb,
+            verbose=args.offload_verbose,
+        )
 
     #########################################################
     # Replace the attention
@@ -243,15 +264,30 @@ if __name__ == "__main__":
     #########################################################
     # Generate the video
     #########################################################
-    output = pipe(
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        height=args.height,
-        width=args.width,
-        num_frames=args.num_frames,
-        guidance_scale=6.0,
-        num_inference_steps=args.num_inference_steps,
-    ).frames[0]
+    if pre_encoded_embeds is not None:
+        # Use pre-computed embeddings (offload mode)
+        logger.info("Using pre-computed prompt embeddings...")
+        output = pipe(
+            prompt_embeds=pre_encoded_embeds['prompt_embeds'],
+            pooled_prompt_embeds=pre_encoded_embeds['pooled_prompt_embeds'],
+            prompt_attention_mask=pre_encoded_embeds['prompt_attention_mask'],
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            guidance_scale=6.0,
+            num_inference_steps=args.num_inference_steps,
+        ).frames[0]
+    else:
+        # Standard mode - encode prompt on-the-fly
+        output = pipe(
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            guidance_scale=6.0,
+            num_inference_steps=args.num_inference_steps,
+        ).frames[0]
 
     # Create parent directory for output file if it doesn't exist
     output_dir = os.path.dirname(args.output_file)

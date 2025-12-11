@@ -469,35 +469,28 @@ class OffloadedModuleWrapper(nn.Module):
 
 class TextEncoderOffloadManager:
     """
-    Manages "encode-then-release" offloading for text encoders.
+    Manages text encoder offloading using pre-encode strategy.
 
-    Text encoders are only needed once at the beginning for prompt encoding.
-    This class:
-    1. Keeps text encoders on CPU by default
-    2. Moves them to GPU just before encoding
-    3. Moves them back to CPU immediately after encoding
-    4. Frees ~3-5GB of GPU memory during the denoising loop
+    The clean approach:
+    1. Keep text encoders on GPU initially
+    2. Pre-encode the prompt BEFORE setting up transformer offloading
+    3. Then offload text encoders to CPU
+    4. Pass pre-computed embeddings to pipeline
 
-    This is implemented using forward hooks - completely transparent to the pipeline.
+    This avoids device mismatch issues that occur with hook-based approaches.
     """
 
     def __init__(
         self,
         pipe,
         compute_device: str = "cuda",
-        use_pinned_memory: bool = True,
         verbose: bool = False,
     ):
         self.pipe = pipe
         self.compute_device = compute_device
-        self.use_pinned_memory = use_pinned_memory
         self.verbose = verbose
-
-        # Track text encoders and their hooks
         self._text_encoders: Dict[str, nn.Module] = {}
-        self._hooks: List[torch.utils.hooks.RemovableHandle] = []
-        self._encoder_call_count: Dict[str, int] = {}
-        self._encoders_released: bool = False
+        self._is_offloaded: bool = False
 
         # Find all text encoders
         encoder_names = ['text_encoder', 'text_encoder_2', 'text_encoder_3']
@@ -506,107 +499,151 @@ class TextEncoderOffloadManager:
                 encoder = getattr(pipe, name)
                 if encoder is not None:
                     self._text_encoders[name] = encoder
-                    self._encoder_call_count[name] = 0
 
-        logger.info(f"TextEncoderOffloadManager: Found {len(self._text_encoders)} text encoder(s)")
+        if self.verbose:
+            logger.info(f"TextEncoderOffloadManager: Found {len(self._text_encoders)} text encoder(s)")
 
-    def setup(self):
-        """
-        Set up the encode-then-release strategy.
-
-        Moves text encoders to CPU and installs hooks for automatic GPU transfer.
-        """
-        for name, encoder in self._text_encoders.items():
-            # Move to CPU initially
-            encoder.to('cpu')
-            if self.verbose:
-                logger.info(f"{name} moved to CPU (will transfer to GPU during encoding)")
-
-            # Install pre-forward hook: move to GPU before encoding
-            def make_pre_hook(enc_name, enc_module):
-                def pre_hook(module, args):
-                    if not self._encoders_released:
-                        # Move to GPU for encoding
-                        enc_module.to(self.compute_device)
-                        if self.verbose:
-                            logger.debug(f"{enc_name}: Moved to GPU for encoding")
-                    return args
-                return pre_hook
-
-            # Install post-forward hook: move back to CPU after encoding
-            def make_post_hook(enc_name, enc_module):
-                def post_hook(module, args, output):
-                    self._encoder_call_count[enc_name] += 1
-                    # After first encoding, move back to CPU
-                    if self._encoder_call_count[enc_name] >= 1 and not self._encoders_released:
-                        enc_module.to('cpu')
-                        torch.cuda.empty_cache()
-                        if self.verbose:
-                            logger.debug(f"{enc_name}: Moved back to CPU after encoding")
-
-                        # Check if all encoders are done
-                        if all(c >= 1 for c in self._encoder_call_count.values()):
-                            self._encoders_released = True
-                            allocated = torch.cuda.memory_allocated() / 1024**3
-                            logger.info(f"All text encoders released. GPU memory: {allocated:.2f}GB")
-                    return output
-                return post_hook
-
-            pre_handle = encoder.register_forward_pre_hook(make_pre_hook(name, encoder))
-            post_handle = encoder.register_forward_hook(make_post_hook(name, encoder))
-            self._hooks.extend([pre_handle, post_handle])
-
-        logger.info("TextEncoderOffloadManager: Encode-then-release hooks installed")
-
-    def release_all(self):
-        """Force release all text encoders to CPU (if not already done)."""
-        if not self._encoders_released:
-            for name, encoder in self._text_encoders.items():
-                encoder.to('cpu')
-            torch.cuda.empty_cache()
-            self._encoders_released = True
-            logger.info("TextEncoderOffloadManager: Forced release of all text encoders")
-
-    def remove_hooks(self):
-        """Remove all installed hooks."""
-        for handle in self._hooks:
-            handle.remove()
-        self._hooks.clear()
-
-    def get_memory_saved(self) -> float:
-        """Estimate memory saved by offloading text encoders (in GB)."""
+    def get_memory_estimate(self) -> float:
+        """Estimate memory used by text encoders (in GB)."""
         total_bytes = 0
         for encoder in self._text_encoders.values():
             for param in encoder.parameters():
                 total_bytes += param.numel() * param.element_size()
         return total_bytes / (1024 ** 3)
 
+    def ensure_on_gpu(self):
+        """Ensure text encoders are on GPU for encoding."""
+        for name, encoder in self._text_encoders.items():
+            encoder.to(self.compute_device)
+            if self.verbose:
+                logger.info(f"{name} moved to GPU")
+        self._is_offloaded = False
+
+    def offload_to_cpu(self):
+        """Offload text encoders to CPU after encoding."""
+        for name, encoder in self._text_encoders.items():
+            encoder.to('cpu')
+            if self.verbose:
+                logger.info(f"{name} offloaded to CPU")
+        torch.cuda.empty_cache()
+        self._is_offloaded = True
+
+        memory_freed = self.get_memory_estimate()
+        logger.info(f"Text encoders offloaded to CPU. Freed ~{memory_freed:.1f}GB GPU memory")
+
+    def pre_encode_prompt(
+        self,
+        prompt: str,
+        prompt_2: Optional[str] = None,
+        negative_prompt: Optional[str] = None,
+        negative_prompt_2: Optional[str] = None,
+        num_videos_per_prompt: int = 1,
+        device: Optional[str] = None,
+        dtype: Optional[torch.dtype] = None,
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Pre-encode prompt while text encoders are on GPU.
+
+        Returns dict with prompt_embeds, pooled_prompt_embeds, prompt_attention_mask
+        that can be passed directly to the pipeline.
+        """
+        if device is None:
+            device = self.compute_device
+        if dtype is None:
+            dtype = torch.bfloat16
+
+        # Ensure text encoders are on GPU
+        self.ensure_on_gpu()
+
+        # Use pipeline's encode_prompt method
+        prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.pipe.encode_prompt(
+            prompt=prompt,
+            prompt_2=prompt_2,
+            device=device,
+            dtype=dtype,
+            num_videos_per_prompt=num_videos_per_prompt,
+            do_classifier_free_guidance=negative_prompt is not None or True,  # Usually True
+            negative_prompt=negative_prompt,
+            negative_prompt_2=negative_prompt_2,
+        )
+
+        # Offload text encoders to CPU
+        self.offload_to_cpu()
+
+        return {
+            'prompt_embeds': prompt_embeds,
+            'pooled_prompt_embeds': pooled_prompt_embeds,
+            'prompt_attention_mask': prompt_attention_mask,
+        }
+
+
+def pre_encode_and_offload(
+    pipe,
+    prompt: str,
+    negative_prompt: Optional[str] = None,
+    device: str = "cuda",
+    dtype: torch.dtype = torch.bfloat16,
+) -> Dict[str, torch.Tensor]:
+    """
+    Convenience function: Pre-encode prompt then offload text encoders.
+
+    This should be called BEFORE setting up transformer offloading.
+
+    Args:
+        pipe: HunyuanVideoPipeline
+        prompt: The text prompt
+        negative_prompt: Optional negative prompt
+        device: Target device for embeddings
+        dtype: Data type for embeddings
+
+    Returns:
+        Dict with prompt_embeds, pooled_prompt_embeds, prompt_attention_mask
+
+    Usage:
+        # 1. Pre-encode prompt (text encoders on GPU temporarily)
+        prompt_embeds = pre_encode_and_offload(pipe, prompt)
+
+        # 2. Set up transformer offloading
+        manager, hooks = enable_offloading(pipe)
+
+        # 3. Run pipeline with pre-computed embeddings
+        output = pipe(prompt_embeds=prompt_embeds['prompt_embeds'], ...)
+    """
+    manager = TextEncoderOffloadManager(pipe, compute_device=device, verbose=True)
+    return manager.pre_encode_prompt(
+        prompt=prompt,
+        negative_prompt=negative_prompt,
+        device=device,
+        dtype=dtype,
+    )
+
 
 def setup_offloading_for_pipeline(
     pipe,
     config: Optional[OffloadConfig] = None,
     keep_vae_on_gpu: bool = True,
-    text_encoder_offload_mode: str = "sequential",  # "keep", "sequential", or "cpu"
-) -> Tuple[LayerOffloadManager, Optional[TextEncoderOffloadManager]]:
+    offload_text_encoders: bool = True,  # If True, assumes text encoders are already on CPU (pre-encoded)
+) -> LayerOffloadManager:
     """
     Set up dynamic offloading for a HunyuanVideo pipeline.
+
+    IMPORTANT: If using offload_text_encoders=True (default), you should call
+    pre_encode_and_offload() BEFORE this function to pre-compute prompt embeddings.
 
     This function:
     1. Keeps the transformer on CPU initially
     2. Wraps transformer blocks with offloading logic
-    3. Manages text encoder offloading based on mode
+    3. Keeps VAE on GPU for decoding
 
     Args:
         pipe: HunyuanVideoPipeline instance
         config: Offloading configuration
         keep_vae_on_gpu: Whether to keep VAE on GPU (needed for decode)
-        text_encoder_offload_mode: How to handle text encoders:
-            - "keep": Keep on GPU always (uses more memory)
-            - "sequential": Move to GPU for encoding, then release (recommended)
-            - "cpu": Keep on CPU (may cause issues with some pipelines)
+        offload_text_encoders: If True, ensures text encoders stay on CPU
+                              (assumes pre_encode_and_offload was called first)
 
     Returns:
-        Tuple of (LayerOffloadManager, TextEncoderOffloadManager or None)
+        LayerOffloadManager instance
     """
     if config is None:
         config = OffloadConfig()
@@ -633,40 +670,16 @@ def setup_offloading_for_pipeline(
         pipe.vae.to('cpu')
         logger.info("VAE on CPU")
 
-    # Text encoders - handle based on offload mode
-    text_encoder_manager = None
-
-    if text_encoder_offload_mode == "sequential":
-        # Recommended: Move to GPU for encoding, then release to free memory
-        text_encoder_manager = TextEncoderOffloadManager(
-            pipe,
-            compute_device=config.compute_device,
-            use_pinned_memory=config.use_pinned_memory,
-            verbose=config.verbose,
-        )
-        text_encoder_manager.setup()
-        memory_saved = text_encoder_manager.get_memory_saved()
-        logger.info(f"Text encoder mode: sequential (will save ~{memory_saved:.1f}GB after encoding)")
-
-    elif text_encoder_offload_mode == "keep":
-        # Keep text encoders on GPU always
-        text_encoder_names = ['text_encoder', 'text_encoder_2', 'text_encoder_3']
-        for enc_name in text_encoder_names:
-            if hasattr(pipe, enc_name):
-                encoder = getattr(pipe, enc_name)
-                if encoder is not None:
-                    encoder.to(config.compute_device)
-                    logger.info(f"{enc_name} kept on GPU")
-
-    else:  # "cpu"
-        # Keep text encoders on CPU (may cause issues)
+    # Text encoders - ensure they're on CPU if offloading is enabled
+    # (They should already be on CPU if pre_encode_and_offload was called)
+    if offload_text_encoders:
         text_encoder_names = ['text_encoder', 'text_encoder_2', 'text_encoder_3']
         for enc_name in text_encoder_names:
             if hasattr(pipe, enc_name):
                 encoder = getattr(pipe, enc_name)
                 if encoder is not None:
                     encoder.to('cpu')
-                    logger.info(f"{enc_name} on CPU (warning: may cause issues)")
+        logger.info("Text encoders on CPU (use pre-computed embeddings)")
 
     # Prepare offload manager
     offload_manager.prepare_for_inference()
@@ -681,7 +694,7 @@ def setup_offloading_for_pipeline(
         reserved = torch.cuda.memory_reserved() / 1024**3
         logger.info(f"GPU memory after setup: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
-    return offload_manager, text_encoder_manager
+    return offload_manager
 
 
 def create_offloaded_forward_hook(
@@ -755,7 +768,6 @@ def install_offload_hooks(
 def offloaded_inference(
     pipe,
     config: Optional[OffloadConfig] = None,
-    text_encoder_offload_mode: str = "sequential",
 ):
     """
     Context manager for running inference with offloading.
@@ -769,9 +781,7 @@ def offloaded_inference(
         config = OffloadConfig()
 
     # Setup offloading
-    manager, text_enc_manager = setup_offloading_for_pipeline(
-        pipe, config, text_encoder_offload_mode=text_encoder_offload_mode
-    )
+    manager = setup_offloading_for_pipeline(pipe, config)
 
     # Install hooks
     handles = install_offload_hooks(pipe, manager)
@@ -782,10 +792,6 @@ def offloaded_inference(
         # Remove hooks
         for handle in handles:
             handle.remove()
-
-        # Remove text encoder hooks if present
-        if text_enc_manager is not None:
-            text_enc_manager.remove_hooks()
 
         # Print statistics
         if config.verbose:
@@ -799,13 +805,13 @@ def enable_offloading(
     enable_prefetch: bool = True,
     num_layers_on_gpu: int = 6,
     max_memory_gb: Optional[float] = None,
-    text_encoder_offload_mode: str = "sequential",
     verbose: bool = False,
 ) -> Tuple[LayerOffloadManager, List]:
     """
     Enable dynamic offloading for a pipeline.
 
-    This is the main entry point for using offloading.
+    IMPORTANT: For best memory efficiency, call pre_encode_and_offload() BEFORE
+    this function to pre-compute prompt embeddings and free text encoder memory.
 
     Args:
         pipe: HunyuanVideoPipeline
@@ -816,18 +822,25 @@ def enable_offloading(
                           Recommended: 4-8 for 24GB, 10-15 for 40GB+
         max_memory_gb: If set, auto-tune num_layers_on_gpu to fit this budget
                        e.g., 20.0 for 24GB GPU with headroom
-        text_encoder_offload_mode: How to handle text encoders:
-                          - "sequential": GPU during encoding, then release (recommended, saves ~3-5GB)
-                          - "keep": Keep on GPU always
-                          - "cpu": Keep on CPU (may cause issues)
         verbose: Print debug information
 
     Returns:
         Tuple of (LayerOffloadManager, list of hook handles)
 
     Usage:
+        # Step 1: Pre-encode prompt (text encoders temporarily on GPU)
+        prompt_embeds = pre_encode_and_offload(pipe, "your prompt here")
+
+        # Step 2: Enable offloading (text encoders now on CPU)
         manager, handles = enable_offloading(pipe, num_layers_on_gpu=8)
-        output = pipe(prompt=..., ...)
+
+        # Step 3: Run pipeline with pre-computed embeddings
+        output = pipe(
+            prompt_embeds=prompt_embeds['prompt_embeds'],
+            pooled_prompt_embeds=prompt_embeds['pooled_prompt_embeds'],
+            prompt_attention_mask=prompt_embeds['prompt_attention_mask'],
+            ...
+        )
         manager.print_statistics()
     """
     config = OffloadConfig(
@@ -838,9 +851,7 @@ def enable_offloading(
         verbose=verbose,
     )
 
-    manager, text_enc_manager = setup_offloading_for_pipeline(
-        pipe, config, text_encoder_offload_mode=text_encoder_offload_mode
-    )
+    manager = setup_offloading_for_pipeline(pipe, config)
     handles = install_offload_hooks(pipe, manager)
 
     return manager, handles
