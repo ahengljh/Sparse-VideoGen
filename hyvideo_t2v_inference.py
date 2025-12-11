@@ -268,6 +268,23 @@ if __name__ == "__main__":
         # Use pre-computed embeddings (offload mode)
         # Move embeddings back to GPU for inference
         logger.info("Using pre-computed prompt embeddings (moving to GPU)...")
+
+        # CRITICAL: Explicitly ensure transformer embedders are on GPU
+        # This must happen right before inference on the exact transformer instance
+        transformer = pipe.transformer
+        embedder_components = ['time_text_embed', 'x_embedder', 'context_embedder', 'norm_out', 'proj_out']
+        if hasattr(transformer, 'rope'):
+            embedder_components.append('rope')
+        for comp_name in embedder_components:
+            if hasattr(transformer, comp_name):
+                comp = getattr(transformer, comp_name)
+                if comp is not None:
+                    comp.to('cuda')
+                    # Verify
+                    first_param = next(comp.parameters(), None)
+                    if first_param is not None:
+                        logger.info(f"  {comp_name} → {first_param.device}")
+
         output = pipe(
             prompt_embeds=pre_encoded_embeds['prompt_embeds'].cuda(),
             pooled_prompt_embeds=pre_encoded_embeds['pooled_prompt_embeds'].cuda(),
