@@ -799,6 +799,7 @@ def setup_offloading_for_pipeline(
 
     def ensure_embedders_on_gpu(module, args):
         """Pre-hook to ensure embedders are on GPU before forward."""
+        logger.info(">>> Embedder hook triggered!")
         for name in embedder_names:
             if hasattr(module, name):
                 comp = getattr(module, name)
@@ -808,9 +809,10 @@ def setup_offloading_for_pipeline(
                         # Check if this submodule has any CPU params
                         for pname, param in submodule.named_parameters(recurse=False):
                             if param.device.type != 'cuda':
-                                logger.warning(f"Hook: {name}.{subname}.{pname} on CPU, moving...")
-                                submodule.to(config.compute_device)
+                                logger.warning(f"Hook: {name}.{subname}.{pname} on {param.device}, forcing to cuda")
+                                submodule.to('cuda')
                                 break  # Move whole submodule, then check next
+        logger.info(">>> Embedder hook completed")
         return args
 
     transformer.register_forward_pre_hook(ensure_embedders_on_gpu)
