@@ -96,12 +96,39 @@ if __name__ == "__main__":
     #########################################################
     # Load the model
     #########################################################
-    transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-        args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16, revision='refs/pr/18'
-    )
+    # When offloading is enabled, load transformer to CPU to save GPU memory
+    # This is crucial for 24GB GPUs
+    if args.enable_offload:
+        logger.info("Loading transformer to CPU for offload mode...")
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(
+            args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16, revision='refs/pr/18',
+            device_map="cpu"  # Keep on CPU initially
+        )
+    else:
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(
+            args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16, revision='refs/pr/18'
+        )
     flow_shift = 7.0
     scheduler = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
-    pipe = HunyuanVideoPipeline.from_pretrained(args.model_id, transformer=transformer, scheduler=scheduler, revision='refs/pr/18', torch_dtype=torch.bfloat16)
+
+    if args.enable_offload:
+        # Load entire pipeline to CPU first to minimize GPU memory during loading
+        # Text encoders will be moved to GPU temporarily for encoding, then back to CPU
+        pipe = HunyuanVideoPipeline.from_pretrained(
+            args.model_id, transformer=transformer, scheduler=scheduler,
+            revision='refs/pr/18', torch_dtype=torch.bfloat16,
+            device_map="cpu"  # Load all components to CPU
+        )
+        # Clear any GPU memory from the loading process
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(f"Pipeline loaded to CPU. GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+    else:
+        pipe = HunyuanVideoPipeline.from_pretrained(
+            args.model_id, transformer=transformer, scheduler=scheduler,
+            revision='refs/pr/18', torch_dtype=torch.bfloat16
+        )
     pipe.vae.enable_tiling()
 
     #########################################################
