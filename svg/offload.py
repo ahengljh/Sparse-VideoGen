@@ -587,8 +587,24 @@ class TextEncoderOffloadManager:
             max_sequence_length=max_sequence_length,
         )
 
+        # Move embeddings to CPU to free GPU memory
+        # They'll be moved back to GPU when passed to the pipeline
+        prompt_embeds = prompt_embeds.cpu()
+        pooled_prompt_embeds = pooled_prompt_embeds.cpu()
+        prompt_attention_mask = prompt_attention_mask.cpu()
+
         # Offload text encoders to CPU
         self.offload_to_cpu()
+
+        # Aggressive memory cleanup
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        gc.collect()
+
+        # Log actual GPU memory after cleanup
+        if torch.cuda.is_available():
+            allocated = torch.cuda.memory_allocated() / 1024**3
+            logger.info(f"GPU memory after encoding cleanup: {allocated:.2f}GB")
 
         return {
             'prompt_embeds': prompt_embeds,
@@ -683,46 +699,47 @@ def setup_offloading_for_pipeline(
         single_blocks_attr="single_transformer_blocks",
     )
 
-    # STRATEGY: Simple and reliable approach
-    # 1. Move ENTIRE transformer to GPU (text encoders already on CPU, so we have room)
-    # 2. Move ONLY the block lists back to CPU
-    # This guarantees all embedders/norms stay on GPU
+    # STRATEGY: Move each non-block component to GPU individually
+    # This avoids needing to load the entire 13GB transformer at once
 
     logger.info("Moving transformer components to appropriate devices...")
 
-    # Step 1: Move entire transformer to GPU
-    # At this point, text encoders should already be on CPU (from pre_encode_and_offload)
-    # so we have ~14GB free on a 24GB GPU - enough for the 13GB transformer briefly
-    logger.info("  Loading entire transformer to GPU temporarily...")
-    transformer.to(config.compute_device)
-    torch.cuda.empty_cache()
+    # Log current GPU memory
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        logger.info(f"  GPU memory before setup: {allocated:.2f}GB")
 
-    # Step 2: Move ONLY the block ModuleLists back to CPU
-    # These will be loaded on-demand by the offload manager
+    # Components that need to be on GPU for forward pass
+    # (everything except the transformer blocks)
+    gpu_components = ['time_text_embed', 'x_embedder', 'context_embedder', 'norm_out', 'proj_out']
+
+    # Also check for rope/rotary embedding if present
+    if hasattr(transformer, 'rope'):
+        gpu_components.append('rope')
+
+    # Move each component to GPU individually
+    for comp_name in gpu_components:
+        if hasattr(transformer, comp_name):
+            comp = getattr(transformer, comp_name)
+            if comp is not None:
+                comp.to(config.compute_device)
+                # Verify it moved
+                first_param = next(comp.parameters(), None)
+                if first_param is not None:
+                    actual_device = first_param.device
+                    size_mb = sum(p.numel() * p.element_size() for p in comp.parameters()) / 1024**2
+                    logger.info(f"  {comp_name}: {size_mb:.1f}MB → {actual_device}")
+
+    # Ensure blocks stay on CPU (they should already be there from loading)
     num_double = len(transformer.transformer_blocks)
     num_single = len(transformer.single_transformer_blocks)
-
-    logger.info(f"  Moving transformer_blocks ({num_double} blocks) back to CPU...")
     transformer.transformer_blocks.to('cpu')
-
-    logger.info(f"  Moving single_transformer_blocks ({num_single} blocks) back to CPU...")
     transformer.single_transformer_blocks.to('cpu')
+    logger.info(f"  transformer_blocks: {num_double} blocks → CPU (on-demand loading)")
+    logger.info(f"  single_transformer_blocks: {num_single} blocks → CPU (on-demand loading)")
 
-    # Clear GPU cache after moving blocks to CPU
+    # Clear cache
     torch.cuda.empty_cache()
-    gc.collect()
-
-    # Verify the setup
-    gpu_components = []
-    for name, child in transformer.named_children():
-        first_param = next(child.parameters(), None)
-        if first_param is not None:
-            device = first_param.device
-            if device.type == 'cuda':
-                size_mb = sum(p.numel() * p.element_size() for p in child.parameters()) / 1024**2
-                gpu_components.append(f"{name}: {size_mb:.1f}MB")
-
-    logger.info(f"  Components on GPU: {', '.join(gpu_components)}")
 
     # Count total on GPU vs CPU
     gpu_params = 0

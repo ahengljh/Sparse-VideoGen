@@ -266,11 +266,12 @@ if __name__ == "__main__":
     #########################################################
     if pre_encoded_embeds is not None:
         # Use pre-computed embeddings (offload mode)
-        logger.info("Using pre-computed prompt embeddings...")
+        # Move embeddings back to GPU for inference
+        logger.info("Using pre-computed prompt embeddings (moving to GPU)...")
         output = pipe(
-            prompt_embeds=pre_encoded_embeds['prompt_embeds'],
-            pooled_prompt_embeds=pre_encoded_embeds['pooled_prompt_embeds'],
-            prompt_attention_mask=pre_encoded_embeds['prompt_attention_mask'],
+            prompt_embeds=pre_encoded_embeds['prompt_embeds'].cuda(),
+            pooled_prompt_embeds=pre_encoded_embeds['pooled_prompt_embeds'].cuda(),
+            prompt_attention_mask=pre_encoded_embeds['prompt_attention_mask'].cuda(),
             height=args.height,
             width=args.width,
             num_frames=args.num_frames,
