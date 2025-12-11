@@ -184,7 +184,8 @@ class LayerOffloadManager:
         """
         Prepare the model for offloaded inference.
 
-        This moves all transformer layers to CPU and sets up CUDA streams.
+        This sets up CUDA streams and tracking for layers.
+        Layers should already be on CPU (moved by setup_offloading_for_pipeline).
         Call this before starting inference.
         """
         if self._initialized:
@@ -197,10 +198,18 @@ class LayerOffloadManager:
             self._prefetch_stream = torch.cuda.Stream()
             self._compute_stream = torch.cuda.Stream()
 
-        # Move all layers to CPU
+        # Check layer locations and set up tracking
+        # Layers should already be on CPU from setup_offloading_for_pipeline
         for idx, layer in enumerate(self.all_blocks):
-            self._move_layer_to_cpu(idx, use_pinned=self.config.use_pinned_memory)
-            self._layer_on_gpu[idx] = False
+            # Check if layer is on CPU or GPU
+            first_param = next(layer.parameters(), None)
+            if first_param is not None:
+                is_on_cpu = first_param.device.type == 'cpu'
+                self._layer_on_gpu[idx] = not is_on_cpu
+
+                # If on CPU but we want pinned memory, convert to pinned
+                if is_on_cpu and self.config.use_pinned_memory:
+                    self._ensure_pinned_memory(idx)
 
         # Clear CUDA cache
         torch.cuda.empty_cache()
@@ -208,8 +217,21 @@ class LayerOffloadManager:
 
         self._initialized = True
 
-        if self.config.verbose:
-            logger.info(f"Offload manager initialized. All {self.num_layers} layers on CPU.")
+        num_on_cpu = sum(1 for v in self._layer_on_gpu.values() if not v)
+        logger.info(f"Offload manager initialized. {num_on_cpu}/{self.num_layers} layers on CPU.")
+
+    def _ensure_pinned_memory(self, layer_idx: int):
+        """Convert a CPU layer to use pinned memory for faster GPU transfers."""
+        layer = self.all_blocks[layer_idx]
+
+        for param in layer.parameters():
+            if param.device.type == 'cpu' and not param.data.is_pinned():
+                # Create pinned tensor and copy data
+                pinned_tensor = torch.empty_like(param.data, pin_memory=True)
+                pinned_tensor.copy_(param.data)
+                param.data = pinned_tensor
+
+        self._layer_pinned[layer_idx] = True
 
     def _move_layer_to_cpu(self, layer_idx: int, use_pinned: bool = False):
         """Move a layer to CPU, optionally with pinned memory."""
@@ -659,9 +681,25 @@ def setup_offloading_for_pipeline(
         single_blocks_attr="single_transformer_blocks",
     )
 
-    # Move components to appropriate devices
-    # Transformer stays on CPU, we'll load layers on-demand
-    pipe.transformer.to('cpu')
+    # IMPORTANT: Don't move the entire transformer to CPU!
+    # The transformer has components that need to stay on GPU:
+    # - time_text_embed: processes timestep + pooled_projections
+    # - x_embedder: processes input latents
+    # - context_embedder: processes prompt_embeds
+    # - norm_out, proj_out: final output processing
+    #
+    # Only the transformer_blocks and single_transformer_blocks should be offloaded.
+
+    # First, move the entire transformer to GPU to ensure all components are there
+    pipe.transformer.to(config.compute_device)
+
+    # Then, move ONLY the transformer blocks to CPU (they will be loaded on-demand)
+    for block in pipe.transformer.transformer_blocks:
+        block.to('cpu')
+    for block in pipe.transformer.single_transformer_blocks:
+        block.to('cpu')
+
+    logger.info(f"Transformer embedders/norms on GPU, {len(pipe.transformer.transformer_blocks) + len(pipe.transformer.single_transformer_blocks)} blocks on CPU")
 
     # VAE - keep on GPU for decoding (it's small ~300MB)
     if keep_vae_on_gpu:
@@ -682,7 +720,7 @@ def setup_offloading_for_pipeline(
                     encoder.to('cpu')
         logger.info("Text encoders on CPU (use pre-computed embeddings)")
 
-    # Prepare offload manager
+    # Prepare offload manager (this will set up tracking for the blocks)
     offload_manager.prepare_for_inference()
 
     # Clear CUDA cache after setup
