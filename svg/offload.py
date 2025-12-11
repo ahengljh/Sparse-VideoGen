@@ -569,7 +569,7 @@ class TextEncoderOffloadManager:
         max_sequence_length: int = 256,
     ) -> Dict[str, torch.Tensor]:
         """
-        Pre-encode prompt on CPU to avoid GPU memory issues.
+        Pre-encode prompt on GPU (fast) then aggressively free memory.
 
         Returns dict with prompt_embeds, pooled_prompt_embeds, prompt_attention_mask
         that can be passed directly to the pipeline.
@@ -583,41 +583,65 @@ class TextEncoderOffloadManager:
         initial_gpu_mem = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
         logger.info(f"GPU memory before encoding: {initial_gpu_mem:.2f}GB")
 
-        # ENCODE ON CPU to avoid GPU memory issues
-        # This is slower but prevents the 14GB memory leak from text encoders
-        logger.info("Encoding prompt on CPU (avoiding GPU memory usage)...")
-
-        # Ensure text encoders are on CPU
+        # Move text encoders to GPU for fast encoding
+        logger.info("Moving text encoders to GPU for encoding...")
         for name, encoder in self._text_encoders.items():
-            encoder.to('cpu')
+            encoder.to(device)
 
-        # Use pipeline's encode_prompt method - encoding on CPU
+        gpu_after_load = torch.cuda.memory_allocated() / 1024**3
+        logger.info(f"GPU memory after loading encoders: {gpu_after_load:.2f}GB")
+
+        # Encode on GPU (fast!)
+        logger.info("Encoding prompt on GPU...")
         with torch.no_grad():
             prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.pipe.encode_prompt(
                 prompt=prompt,
                 prompt_2=prompt_2,
-                device='cpu',  # Encode on CPU!
+                device=device,
                 dtype=dtype,
                 num_videos_per_prompt=num_videos_per_prompt,
                 max_sequence_length=max_sequence_length,
             )
 
-        # Embeddings stay on CPU, will be moved to GPU when passed to pipeline
-        prompt_embeds = prompt_embeds.cpu()
-        pooled_prompt_embeds = pooled_prompt_embeds.cpu()
-        prompt_attention_mask = prompt_attention_mask.cpu()
+        # Clone embeddings to CPU immediately
+        prompt_embeds = prompt_embeds.cpu().clone()
+        pooled_prompt_embeds = pooled_prompt_embeds.cpu().clone()
+        prompt_attention_mask = prompt_attention_mask.cpu().clone()
+
+        logger.info("Embeddings saved to CPU. Now freeing GPU memory...")
+
+        # AGGRESSIVE MEMORY CLEANUP
+        # Step 1: Move encoders to CPU
+        for name, encoder in self._text_encoders.items():
+            encoder.to('cpu')
+
+        # Step 2: Synchronize CUDA to ensure all operations complete
+        torch.cuda.synchronize()
+
+        # Step 3: Delete encoder references from pipeline to break reference chains
+        # This is key - the pipeline holds references that prevent memory from being freed
+        for name in list(self._text_encoders.keys()):
+            if hasattr(self.pipe, name):
+                # Set to None to break reference
+                delattr(self.pipe, name)
+                setattr(self.pipe, name, None)
+
+        # Step 4: Clear our own references
+        self._text_encoders.clear()
+
+        # Step 5: Multiple rounds of garbage collection
+        gc.collect()
+        gc.collect()
+        torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()
 
         self._is_offloaded = True
 
-        # Clear any GPU memory that might have been used
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-        # Log actual GPU memory after encoding
+        # Log actual GPU memory after cleanup
         if torch.cuda.is_available():
             allocated = torch.cuda.memory_allocated() / 1024**3
-            logger.info(f"GPU memory after CPU encoding: {allocated:.2f}GB (should be ~0)")
+            logger.info(f"GPU memory after cleanup: {allocated:.2f}GB")
 
         return {
             'prompt_embeds': prompt_embeds,
