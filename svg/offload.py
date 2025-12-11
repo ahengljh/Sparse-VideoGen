@@ -800,6 +800,20 @@ def setup_offloading_for_pipeline(
     def ensure_embedders_on_gpu(module, args):
         """Pre-hook to ensure embedders are on GPU before forward."""
         logger.info(">>> Embedder hook triggered!")
+
+        # DIRECT CHECK: The exact parameter causing the error
+        if hasattr(module, 'time_text_embed'):
+            tte = module.time_text_embed
+            if hasattr(tte, 'timestep_embedder'):
+                te = tte.timestep_embedder
+                if hasattr(te, 'linear_1'):
+                    l1 = te.linear_1
+                    logger.info(f"DIRECT CHECK: linear_1.weight.device = {l1.weight.device}")
+                    if l1.weight.device.type != 'cuda':
+                        logger.warning("FORCING linear_1 to CUDA!")
+                        l1.to('cuda')
+                        logger.info(f"AFTER FORCE: linear_1.weight.device = {l1.weight.device}")
+
         for name in embedder_names:
             if hasattr(module, name):
                 comp = getattr(module, name)
