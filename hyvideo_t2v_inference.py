@@ -266,47 +266,8 @@ if __name__ == "__main__":
     #########################################################
     if pre_encoded_embeds is not None:
         # Use pre-computed embeddings (offload mode)
-        # Move embeddings back to GPU for inference
-        logger.info("Using pre-computed prompt embeddings (moving to GPU)...")
-
-        # CRITICAL: Explicitly ensure ALL transformer embedder parameters are on GPU
-        # Check and move EVERY parameter, not just the module
-        transformer = pipe.transformer
-        embedder_components = ['time_text_embed', 'x_embedder', 'context_embedder', 'norm_out', 'proj_out']
-        if hasattr(transformer, 'rope'):
-            embedder_components.append('rope')
-
-        for comp_name in embedder_components:
-            if hasattr(transformer, comp_name):
-                comp = getattr(transformer, comp_name)
-                if comp is not None:
-                    # Check ALL parameters and force-move any on CPU
-                    cpu_params = []
-                    for pname, param in comp.named_parameters():
-                        if param.device.type != 'cuda':
-                            cpu_params.append(pname)
-
-                    if cpu_params:
-                        logger.warning(f"  {comp_name} has {len(cpu_params)} params on CPU, moving...")
-                        comp.to('cuda')
-
-                    # Verify ALL params are now on GPU
-                    all_on_gpu = all(p.device.type == 'cuda' for p in comp.parameters())
-                    logger.info(f"  {comp_name}: all_on_gpu={all_on_gpu}")
-
-        # DIRECT CHECK: The exact parameter causing the error
-        tte = transformer.time_text_embed
-        te = tte.timestep_embedder
-        l1 = te.linear_1
-        logger.info(f"  DIRECT CHECK: timestep_embedder.linear_1.weight.device = {l1.weight.device}")
-        logger.info(f"  DIRECT CHECK: timestep_embedder.linear_1.bias.device = {l1.bias.device}")
-
-        # Force move if still on CPU
-        if l1.weight.device.type != 'cuda':
-            logger.warning("  FORCING linear_1 to CUDA!")
-            l1.to('cuda')
-            logger.info(f"  After force: linear_1.weight.device = {l1.weight.device}")
-
+        # Note: Embedders will be moved to GPU by the forward pre-hook registered in enable_offloading
+        logger.info("Using pre-computed prompt embeddings...")
         output = pipe(
             prompt_embeds=pre_encoded_embeds['prompt_embeds'].cuda(),
             pooled_prompt_embeds=pre_encoded_embeds['pooled_prompt_embeds'].cuda(),

@@ -547,7 +547,13 @@ class TextEncoderOffloadManager:
             encoder.to('cpu')
             if self.verbose:
                 logger.info(f"{name} offloaded to CPU")
+
+        # Aggressive cleanup - delete cached states that might hold GPU tensors
+        torch.cuda.synchronize()
         torch.cuda.empty_cache()
+        gc.collect()
+        torch.cuda.empty_cache()  # Call again after gc
+
         self._is_offloaded = True
 
         memory_freed = self.get_memory_estimate()
@@ -783,6 +789,28 @@ def setup_offloading_for_pipeline(
         allocated = torch.cuda.memory_allocated() / 1024**3
         reserved = torch.cuda.memory_reserved() / 1024**3
         logger.info(f"GPU memory after setup: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
+
+    # CRITICAL: Register a forward pre-hook on the transformer to ensure embedders
+    # are on GPU right at the moment of forward. This bypasses any pipeline device
+    # management that might be moving things around.
+    embedder_names = ['time_text_embed', 'x_embedder', 'context_embedder', 'norm_out', 'proj_out']
+    if hasattr(transformer, 'rope'):
+        embedder_names.append('rope')
+
+    def ensure_embedders_on_gpu(module, args):
+        """Pre-hook to ensure embedders are on GPU before forward."""
+        for name in embedder_names:
+            if hasattr(module, name):
+                comp = getattr(module, name)
+                if comp is not None:
+                    # Check first param - if on CPU, move entire component
+                    first_param = next(comp.parameters(), None)
+                    if first_param is not None and first_param.device.type != 'cuda':
+                        comp.to(config.compute_device)
+        return args
+
+    transformer.register_forward_pre_hook(ensure_embedders_on_gpu)
+    logger.info("Registered embedder-ensure hook on transformer")
 
     return offload_manager
 
