@@ -321,10 +321,15 @@ class LayerOffloadManager:
 
     def _evict_oldest_layers(self, keep_layer_idx: int):
         """
-        Evict oldest layers to make room in the GPU sliding window.
+        Evict layers outside the current GPU sliding window.
 
         This implements a sliding window strategy: keep the most recent N layers
         on GPU, where N = num_layers_on_gpu.
+
+        IMPORTANT: During diffusion, we loop back to layer 0 at each timestep,
+        so we need to evict layers both BEFORE the window start AND AFTER
+        the window end. Without this, layers from the end of the previous
+        timestep would never be evicted, causing OOM.
 
         Args:
             keep_layer_idx: The layer we're about to use (must stay on GPU)
@@ -334,10 +339,12 @@ class LayerOffloadManager:
         window_end = keep_layer_idx
         window_start = max(0, keep_layer_idx - self.config.num_layers_on_gpu + 1)
 
-        # Find layers outside the window
+        # Find layers outside the window (both BEFORE start AND AFTER end)
+        # This handles the wrap-around case when we loop back to layer 0
         layers_to_evict = []
         for idx in list(self._layers_on_gpu_set):
-            if idx < window_start:
+            # Evict if outside the window [window_start, window_end]
+            if idx < window_start or idx > window_end:
                 layers_to_evict.append(idx)
 
         # Evict layers outside the window
