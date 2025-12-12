@@ -8,10 +8,10 @@ from diffusers.models.embeddings import apply_rotary_emb
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from torch.nn.attention.flex_attention import flex_attention
 
-# Check if FlashInfer is available and supports this GPU
-# Note: Our sparse attention implementation requires VariableBlockSparseAttentionWrapper
-# which may not exist in newer FlashInfer versions (they have BlockSparseAttentionWrapper with different API)
-FLASHINFER_AVAILABLE = False
+# Check if FlashInfer is available for dense varlen attention
+# Note: Sparse attention now uses Triton fallback when FlashInfer's VariableBlockSparseAttentionWrapper is unavailable
+FLASHINFER_DENSE_AVAILABLE = False
+FLASHINFER_SPARSE_AVAILABLE = False
 try:
     import flashinfer
     # Check if GPU architecture is supported (sm75+)
@@ -21,17 +21,19 @@ try:
         sm_version = capability[0] * 10 + capability[1]
         if sm_version >= 75:
             # Check for the specific API our code requires (VariableBlockSparseAttentionWrapper)
-            # BlockSparseAttentionWrapper has a different plan() signature and won't work
             if hasattr(flashinfer, 'sparse') and hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
-                FLASHINFER_AVAILABLE = True
+                FLASHINFER_DENSE_AVAILABLE = True
+                FLASHINFER_SPARSE_AVAILABLE = True
                 from ...logger import logger as _logger
                 _logger.info(f"FlashInfer enabled (GPU sm{sm_version}, VariableBlockSparseAttentionWrapper found)")
             elif hasattr(flashinfer, 'sparse') and hasattr(flashinfer.sparse, 'BlockSparseAttentionWrapper'):
+                # Dense attention via FlashInfer may still work
+                FLASHINFER_DENSE_AVAILABLE = True
                 from ...logger import logger as _logger
-                _logger.warning(f"FlashInfer disabled: BlockSparseAttentionWrapper found but incompatible API, falling back to flash_attn")
+                _logger.info(f"FlashInfer sparse: using Triton fallback (BlockSparseAttentionWrapper has incompatible API)")
             else:
                 from ...logger import logger as _logger
-                _logger.warning(f"FlashInfer disabled: no compatible sparse attention API found, falling back to flash_attn")
+                _logger.info(f"FlashInfer: no sparse API found, using Triton for sparse attention")
         else:
             from ...logger import logger as _logger
             _logger.warning(f"FlashInfer disabled: GPU sm{sm_version} < sm75, falling back to flash_attn")
@@ -40,6 +42,9 @@ except ImportError:
 except Exception as e:
     from ...logger import logger as _logger
     _logger.warning(f"FlashInfer disabled: {e}, falling back to flash_attn")
+
+# For backward compatibility - sparse attention always available via Triton
+FLASHINFER_AVAILABLE = FLASHINFER_DENSE_AVAILABLE
 
 from ...kernels.triton.permute import apply_inverse_permutation_triton, permute_tensor_by_labels_triton
 from ...kmeans_utils import (
@@ -786,12 +791,10 @@ class Hunyuan_SAPAttn_Processor2_0(Hunyuan_SVGAttn_Processor2_0):
         if timestep[0] > self.first_times_fp:
             full_attention_flag = True
 
-        # Force dense attention if FlashInfer is not available (sparse path requires FlashInfer)
-        if not FLASHINFER_AVAILABLE:
-            full_attention_flag = True
+        # Sparse attention is now available via Triton fallback even without FlashInfer
 
         if full_attention_flag:
-            if self.zero_step_kmeans_init and FLASHINFER_AVAILABLE:
+            if self.zero_step_kmeans_init:
                 video_length = self.num_frame * self.frame_size
                 query_video = query[:, :, :video_length, :].contiguous()
                 key_video = key[:, :, :video_length, :].contiguous()
@@ -830,11 +833,11 @@ class Hunyuan_SAPAttn_Processor2_0(Hunyuan_SVGAttn_Processor2_0):
                 unprompt_length,
             )
 
+            # Uses FlashInfer if available, otherwise falls back to Triton
             output_permuted = dynamic_block_sparse_fwd_flashinfer(
                 q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, is_cpu=False
             )
 
-            # attn_output = apply_inverse_permutation(output_permuted, q_sorted_indices, dim=2)
             attn_output = apply_inverse_permutation_triton(output_permuted, q_sorted_indices, dim=2)
 
             # Save time, layer, density information to logging file
@@ -849,8 +852,6 @@ class Hunyuan_SAPAttn_Processor2_0(Hunyuan_SVGAttn_Processor2_0):
                     "avg_density": avg_density,
                     "density": densities.tolist(),
                 }
-
-                # print(f"Time Step: {timestep[0].item()} Layer: {layer_idx} Density: {avg_density}")
 
                 # Append to log file
                 with open(self.logging_file, "a") as f:
@@ -1044,13 +1045,11 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         if timestep[0] > self.first_times_fp:
             full_attention_flag = True
 
-        # Force dense attention if FlashInfer is not available (sparse path requires FlashInfer)
-        if not FLASHINFER_AVAILABLE:
-            full_attention_flag = True
+        # Sparse attention is now available via Triton fallback even without FlashInfer
 
         if full_attention_flag:
             # During warmup, still initialize CTCA clusters for later use
-            if self.zero_step_kmeans_init and FLASHINFER_AVAILABLE:
+            if self.zero_step_kmeans_init:
                 video_length = self.num_frame * self.frame_size
                 query_video = query[:, :, :video_length, :].contiguous()
                 key_video = key[:, :, :video_length, :].contiguous()
@@ -1090,6 +1089,7 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
                 unprompt_length,
             )
 
+            # Uses FlashInfer if available, otherwise falls back to Triton
             output_permuted = dynamic_block_sparse_fwd_flashinfer(
                 q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, is_cpu=False
             )

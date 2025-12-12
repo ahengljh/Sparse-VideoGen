@@ -1316,6 +1316,13 @@ def dynamic_block_sparse_fwd_triton(q, k, v, dynamic_map, qc_size, kc_size):
     return out
 
 
+# Check if FlashInfer VariableBlockSparseAttentionWrapper is available
+_FLASHINFER_VARBLOCK_AVAILABLE = (
+    hasattr(flashinfer, 'sparse') and
+    hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper')
+)
+
+
 @time_logging_decorator("Level 3 - dynamic block sparse fwd flashinfer on GPU")
 def dynamic_block_sparse_fwd_flashinfer(
     q: torch.Tensor,
@@ -1327,16 +1334,18 @@ def dynamic_block_sparse_fwd_flashinfer(
     is_cpu: bool = True,
 ):
     """
-    Launcher for the Flashinfer dynamic block sparse attention kernel.
+    Launcher for dynamic block sparse attention.
+
+    Tries FlashInfer's VariableBlockSparseAttentionWrapper first, falls back to Triton.
 
     Args:
         q (torch.Tensor): Query tensor, shape [B, H, S, D].
         k (torch.Tensor): Key tensor, shape [B, H, S, D].
         v (torch.Tensor): Value tensor, shape [B, H, S, D].
-        block_mask_map (torch.Tensor): Boolean mask, shape [B, H, qc_num, kc_num]. Currently must on CPU.
-        block_row_sz (torch.Tensor): Query block sizes, shape [B, H, qc_num]. Currently must on CPU.
-        block_col_sz (torch.Tensor): Key block sizes, shape [B, H, kc_num]. Currently must on CPU.
-        is_cpu (bool): Whether to run on CPU. Flashinfer default is to run on CPU. We switch to GPU for faster planning. Default is True.
+        block_mask_map (torch.Tensor): Boolean mask, shape [B, H, qc_num, kc_num].
+        block_row_sz (torch.Tensor): Query block sizes, shape [B, H, qc_num].
+        block_col_sz (torch.Tensor): Key block sizes, shape [B, H, kc_num].
+        is_cpu (bool): Whether mask/sizes are on CPU. Only used for FlashInfer path.
     """
     # Input shape check
     B, H, S, D = q.shape
@@ -1344,23 +1353,57 @@ def dynamic_block_sparse_fwd_flashinfer(
     kc_num = block_col_sz.shape[-1]
     assert block_mask_map.shape == (B, H, qc_num, kc_num)
 
-    assert (
-        all(t.device == torch.device("cpu") for t in [block_mask_map, block_row_sz, block_col_sz]) if is_cpu else True
-    )
-
     # Check if block_col_sz and block_row_sz are the same for each head
     assert torch.all(block_col_sz.sum(dim=2) == block_col_sz.sum(dim=2)[0, 0])
     assert torch.all(block_row_sz.sum(dim=2) == block_row_sz.sum(dim=2)[0, 0])
 
-    # Check if FlashInfer API is available - return None if not
-    # (caller should handle this and use fallback)
-    if not hasattr(flashinfer, 'sparse') or not hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
-        return None
+    # Try FlashInfer first if available
+    if _FLASHINFER_VARBLOCK_AVAILABLE:
+        try:
+            return _dynamic_block_sparse_fwd_flashinfer_impl(
+                q, k, v, block_mask_map, block_row_sz, block_col_sz, is_cpu
+            )
+        except Exception as e:
+            import logging
+            logging.warning(f"FlashInfer sparse attention failed: {e}, falling back to Triton")
+
+    # Fall back to Triton implementation
+    # Triton expects tensors on GPU, ensure mask/sizes are on GPU
+    if block_mask_map.device.type == 'cpu':
+        block_mask_map = block_mask_map.to(q.device)
+    if block_row_sz.device.type == 'cpu':
+        block_row_sz = block_row_sz.to(q.device)
+    if block_col_sz.device.type == 'cpu':
+        block_col_sz = block_col_sz.to(q.device)
+
+    return dynamic_block_sparse_fwd_triton(
+        q, k, v, block_mask_map, block_row_sz, block_col_sz
+    )
+
+
+def _dynamic_block_sparse_fwd_flashinfer_impl(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    block_mask_map: torch.Tensor,
+    block_row_sz: torch.Tensor,
+    block_col_sz: torch.Tensor,
+    is_cpu: bool = True,
+):
+    """
+    Internal FlashInfer implementation using VariableBlockSparseAttentionWrapper.
+    """
+    B, H, S, D = q.shape
+    qc_num = block_row_sz.shape[-1]
+    kc_num = block_col_sz.shape[-1]
+
+    assert (
+        all(t.device == torch.device("cpu") for t in [block_mask_map, block_row_sz, block_col_sz]) if is_cpu else True
+    )
 
     with time_logging_decorator("Level 4 - Planning"):
 
         # Prepare flashinfer wrapper - requires VariableBlockSparseAttentionWrapper
-        # (BlockSparseAttentionWrapper has incompatible plan() API)
         float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
         vector_sparse_indices_buffer = torch.empty(1024 * 1024 * 1024, device=q.device)
 
@@ -1390,8 +1433,6 @@ def dynamic_block_sparse_fwd_flashinfer(
             q_data_type=q.dtype,
             kv_data_type=k.dtype,
         )
-
-        # print_memory_usage("After plan")
 
     with time_logging_decorator("Level 4 - Running"):
         o = wrapper.run(q, k, v)  # [num_qo_heads, qo_len, head_dim]
