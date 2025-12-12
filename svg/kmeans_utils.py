@@ -1317,10 +1317,61 @@ def dynamic_block_sparse_fwd_triton(q, k, v, dynamic_map, qc_size, kc_size):
 
 
 # Check if FlashInfer VariableBlockSparseAttentionWrapper is available
-_FLASHINFER_VARBLOCK_AVAILABLE = (
-    hasattr(flashinfer, 'sparse') and
-    hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper')
-)
+# The API might be in different locations depending on FlashInfer version
+_FLASHINFER_VARBLOCK_AVAILABLE = False
+_VariableBlockSparseAttentionWrapper = None
+
+def _init_flashinfer_sparse():
+    """Initialize FlashInfer sparse attention API, checking multiple import paths."""
+    global _FLASHINFER_VARBLOCK_AVAILABLE, _VariableBlockSparseAttentionWrapper
+
+    # Try to get FlashInfer version for debugging
+    try:
+        fi_version = getattr(flashinfer, '__version__', 'unknown')
+        print(f"[FlashInfer] Version: {fi_version}")
+    except Exception:
+        fi_version = 'unknown'
+
+    # Try different import paths for VariableBlockSparseAttentionWrapper
+    # Path 1: flashinfer.sparse.VariableBlockSparseAttentionWrapper (documented in 0.3.1+)
+    if hasattr(flashinfer, 'sparse') and hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
+        _VariableBlockSparseAttentionWrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper
+        _FLASHINFER_VARBLOCK_AVAILABLE = True
+        print(f"[FlashInfer] Found VariableBlockSparseAttentionWrapper in flashinfer.sparse")
+        return
+
+    # Path 2: flashinfer.VariableBlockSparseAttentionWrapper (older versions)
+    if hasattr(flashinfer, 'VariableBlockSparseAttentionWrapper'):
+        _VariableBlockSparseAttentionWrapper = flashinfer.VariableBlockSparseAttentionWrapper
+        _FLASHINFER_VARBLOCK_AVAILABLE = True
+        print(f"[FlashInfer] Found VariableBlockSparseAttentionWrapper in flashinfer root")
+        return
+
+    # Path 3: Try direct import
+    try:
+        from flashinfer.sparse import VariableBlockSparseAttentionWrapper as VBSAW
+        _VariableBlockSparseAttentionWrapper = VBSAW
+        _FLASHINFER_VARBLOCK_AVAILABLE = True
+        print(f"[FlashInfer] Imported VariableBlockSparseAttentionWrapper via direct import")
+        return
+    except ImportError:
+        pass
+
+    # Check what IS available in flashinfer.sparse
+    if hasattr(flashinfer, 'sparse'):
+        available_attrs = [attr for attr in dir(flashinfer.sparse) if not attr.startswith('_')]
+        print(f"[FlashInfer] sparse module available attrs: {available_attrs}")
+        if 'BlockSparseAttentionWrapper' in available_attrs:
+            print(f"[FlashInfer] WARNING: Only BlockSparseAttentionWrapper found (fixed block sizes).")
+            print(f"[FlashInfer] VariableBlockSparseAttentionWrapper requires FlashInfer >= 0.3.1")
+            print(f"[FlashInfer] Please upgrade: pip install flashinfer-python>=0.3.1")
+    else:
+        print(f"[FlashInfer] WARNING: flashinfer.sparse module not found")
+
+    print(f"[FlashInfer] Using Triton fallback for sparse attention")
+
+# Initialize on module load
+_init_flashinfer_sparse()
 
 
 @time_logging_decorator("Level 3 - dynamic block sparse fwd flashinfer on GPU")
@@ -1393,6 +1444,11 @@ def _dynamic_block_sparse_fwd_flashinfer_impl(
     """
     Internal FlashInfer implementation using VariableBlockSparseAttentionWrapper.
     """
+    global _VariableBlockSparseAttentionWrapper
+
+    if _VariableBlockSparseAttentionWrapper is None:
+        raise RuntimeError("VariableBlockSparseAttentionWrapper not available")
+
     B, H, S, D = q.shape
     qc_num = block_row_sz.shape[-1]
     kc_num = block_col_sz.shape[-1]
@@ -1403,11 +1459,11 @@ def _dynamic_block_sparse_fwd_flashinfer_impl(
 
     with time_logging_decorator("Level 4 - Planning"):
 
-        # Prepare flashinfer wrapper - requires VariableBlockSparseAttentionWrapper
+        # Prepare flashinfer wrapper - use dynamically found class
         float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
         vector_sparse_indices_buffer = torch.empty(1024 * 1024 * 1024, device=q.device)
 
-        wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
+        wrapper = _VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
         wrapper.reset_workspace_buffer(
             float_workspace_buffer=wrapper._float_workspace_buffer,
             int_workspace_buffer=wrapper._int_workspace_buffer,

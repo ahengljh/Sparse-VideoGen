@@ -8,10 +8,36 @@ from diffusers.models.embeddings import apply_rotary_emb
 from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from torch.nn.attention.flex_attention import flex_attention
 
-# Check if FlashInfer is available for dense varlen attention
-# Note: Sparse attention now uses Triton fallback when FlashInfer's VariableBlockSparseAttentionWrapper is unavailable
+# Check if FlashInfer is available for dense and sparse attention
+# Note: Sparse attention uses Triton fallback when FlashInfer's VariableBlockSparseAttentionWrapper is unavailable
 FLASHINFER_DENSE_AVAILABLE = False
 FLASHINFER_SPARSE_AVAILABLE = False
+_flashinfer_VariableBlockSparseAttentionWrapper = None
+
+def _check_flashinfer_varblock():
+    """Check multiple import paths for VariableBlockSparseAttentionWrapper."""
+    global _flashinfer_VariableBlockSparseAttentionWrapper
+    try:
+        import flashinfer
+        # Path 1: flashinfer.sparse.VariableBlockSparseAttentionWrapper
+        if hasattr(flashinfer, 'sparse') and hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
+            _flashinfer_VariableBlockSparseAttentionWrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper
+            return True
+        # Path 2: flashinfer.VariableBlockSparseAttentionWrapper
+        if hasattr(flashinfer, 'VariableBlockSparseAttentionWrapper'):
+            _flashinfer_VariableBlockSparseAttentionWrapper = flashinfer.VariableBlockSparseAttentionWrapper
+            return True
+        # Path 3: Direct import
+        try:
+            from flashinfer.sparse import VariableBlockSparseAttentionWrapper
+            _flashinfer_VariableBlockSparseAttentionWrapper = VariableBlockSparseAttentionWrapper
+            return True
+        except ImportError:
+            pass
+    except Exception:
+        pass
+    return False
+
 try:
     import flashinfer
     # Check if GPU architecture is supported (sm75+)
@@ -20,20 +46,22 @@ try:
         capability = torch.cuda.get_device_capability(device)
         sm_version = capability[0] * 10 + capability[1]
         if sm_version >= 75:
-            # Check for the specific API our code requires (VariableBlockSparseAttentionWrapper)
-            if hasattr(flashinfer, 'sparse') and hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
+            fi_version = getattr(flashinfer, '__version__', 'unknown')
+            from ...logger import logger as _logger
+
+            # Check for VariableBlockSparseAttentionWrapper (multiple paths)
+            FLASHINFER_SPARSE_AVAILABLE = _check_flashinfer_varblock()
+
+            if FLASHINFER_SPARSE_AVAILABLE:
                 FLASHINFER_DENSE_AVAILABLE = True
-                FLASHINFER_SPARSE_AVAILABLE = True
-                from ...logger import logger as _logger
-                _logger.info(f"FlashInfer enabled (GPU sm{sm_version}, VariableBlockSparseAttentionWrapper found)")
+                _logger.info(f"FlashInfer {fi_version} enabled (GPU sm{sm_version}, VariableBlockSparseAttentionWrapper found)")
             elif hasattr(flashinfer, 'sparse') and hasattr(flashinfer.sparse, 'BlockSparseAttentionWrapper'):
-                # Dense attention via FlashInfer may still work
+                # Dense attention via FlashInfer may still work, sparse uses Triton
                 FLASHINFER_DENSE_AVAILABLE = True
-                from ...logger import logger as _logger
-                _logger.info(f"FlashInfer sparse: using Triton fallback (BlockSparseAttentionWrapper has incompatible API)")
+                _logger.info(f"FlashInfer {fi_version}: sparse uses Triton (BlockSparseAttentionWrapper has incompatible API)")
+                _logger.info(f"For native FlashInfer sparse, upgrade: pip install flashinfer-python>=0.3.1")
             else:
-                from ...logger import logger as _logger
-                _logger.info(f"FlashInfer: no sparse API found, using Triton for sparse attention")
+                _logger.info(f"FlashInfer {fi_version}: no sparse API found, using Triton for sparse attention")
         else:
             from ...logger import logger as _logger
             _logger.warning(f"FlashInfer disabled: GPU sm{sm_version} < sm75, falling back to flash_attn")
@@ -43,7 +71,7 @@ except Exception as e:
     from ...logger import logger as _logger
     _logger.warning(f"FlashInfer disabled: {e}, falling back to flash_attn")
 
-# For backward compatibility - sparse attention always available via Triton
+# For backward compatibility
 FLASHINFER_AVAILABLE = FLASHINFER_DENSE_AVAILABLE
 
 from ...kernels.triton.permute import apply_inverse_permutation_triton, permute_tensor_by_labels_triton
@@ -1128,10 +1156,16 @@ def flashinfer_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, m
         q (torch.Tensor): Query tensor, shape [B, H, S, D].
         k (torch.Tensor): Key tensor, shape [B, H, S, D].
         v (torch.Tensor): Value tensor, shape [B, H, S, D].
-        block_mask_map (torch.Tensor): Boolean mask, shape [B, H, qc_num, kc_num]. Currently must on CPU.
-        block_row_sz (torch.Tensor): Query block sizes, shape [B, H, qc_num]. Currently must on CPU.
-        block_col_sz (torch.Tensor): Key block sizes, shape [B, H, kc_num]. Currently must on CPU.
+        cu_seqlens_q: Cumulative sequence lengths for queries.
+        cu_seqlens_kv: Cumulative sequence lengths for keys/values.
+        max_seqlen_q: Maximum query sequence length.
+        max_seqlen_kv: Maximum key/value sequence length.
     """
+    global _flashinfer_VariableBlockSparseAttentionWrapper
+
+    # Return None if API unavailable - caller will fall back to flash_attn
+    if _flashinfer_VariableBlockSparseAttentionWrapper is None:
+        return None
 
     # Create block mask map
     B, H, S, D = q.shape
@@ -1163,14 +1197,9 @@ def flashinfer_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, m
     assert torch.all(block_col_sz.sum(dim=2) == block_col_sz.sum(dim=2)[0, 0])
     assert torch.all(block_row_sz.sum(dim=2) == block_row_sz.sum(dim=2)[0, 0])
 
-    # Prepare flashinfer wrapper - requires VariableBlockSparseAttentionWrapper
-    # (BlockSparseAttentionWrapper has incompatible plan() API)
-    # Return None if API unavailable - caller will fall back to flash_attn
-    if not hasattr(flashinfer, 'sparse') or not hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
-        return None
-
+    # Use dynamically found class
     float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
-    wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
+    wrapper = _flashinfer_VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
 
     # Reshape inputs to (B * H, ...)
     q = q.reshape(B * H, S, D)
