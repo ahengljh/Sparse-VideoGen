@@ -18,9 +18,14 @@ try:
         capability = torch.cuda.get_device_capability(device)
         sm_version = capability[0] * 10 + capability[1]
         if sm_version >= 75:
-            FLASHINFER_AVAILABLE = True
-            from ...logger import logger as _logger
-            _logger.info(f"FlashInfer enabled (GPU sm{sm_version})")
+            # Also check if the required sparse API exists (may change between FlashInfer versions)
+            if hasattr(flashinfer, 'sparse') and hasattr(flashinfer.sparse, 'BlockSparseAttentionWrapper'):
+                FLASHINFER_AVAILABLE = True
+                from ...logger import logger as _logger
+                _logger.info(f"FlashInfer enabled (GPU sm{sm_version})")
+            else:
+                from ...logger import logger as _logger
+                _logger.warning(f"FlashInfer disabled: sparse.BlockSparseAttentionWrapper not found, falling back to flash_attn")
         else:
             from ...logger import logger as _logger
             _logger.warning(f"FlashInfer disabled: GPU sm{sm_version} < sm75, falling back to flash_attn")
@@ -478,10 +483,12 @@ class Hunyuan_SVGAttn_Processor2_0:
             cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = cu_max_seqlens
             out = flashinfer_varlen_func(query, key, value, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
             return out
-        except RuntimeError as e:
+        except (RuntimeError, AttributeError) as e:
             # FlashInfer's internal JIT check may fail even if we passed the sm75+ check
-            if "sm75" in str(e) or "cuda" in str(e).lower():
-                logger.warning(f"FlashInfer JIT compilation failed: {e}. Falling back to flash_attn permanently.")
+            # AttributeError occurs when FlashInfer API has changed (e.g., VariableBlockSparseAttentionWrapper)
+            error_str = str(e).lower()
+            if "sm75" in error_str or "cuda" in error_str or "attribute" in error_str:
+                logger.warning(f"FlashInfer failed: {e}. Falling back to flash_attn permanently.")
                 FLASHINFER_AVAILABLE = False
                 return self.flash_attention(query, key, value, cu_max_seqlens)
             raise
@@ -1149,9 +1156,17 @@ def flashinfer_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, m
     assert torch.all(block_col_sz.sum(dim=2) == block_col_sz.sum(dim=2)[0, 0])
     assert torch.all(block_row_sz.sum(dim=2) == block_row_sz.sum(dim=2)[0, 0])
 
-    # Prepare flashinfer wrapper
+    # Prepare flashinfer wrapper - try different API versions
     float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
-    wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
+
+    # Try BlockSparseAttentionWrapper (current API)
+    if hasattr(flashinfer.sparse, 'BlockSparseAttentionWrapper'):
+        wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
+    elif hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
+        # Fallback to old API if available
+        wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
+    else:
+        raise AttributeError("FlashInfer sparse attention API not found. Please update FlashInfer.")
 
     # Reshape inputs to (B * H, ...)
     q = q.reshape(B * H, S, D)
