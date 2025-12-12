@@ -1411,6 +1411,20 @@ def dynamic_block_sparse_fwd_flashinfer(
 
     # Try FlashInfer first if available and hasn't OOMed before
     global _FLASHINFER_OOM_DETECTED
+
+    # Skip FlashInfer if block dimensions are too large (will OOM during plan())
+    # Heuristic: qc_num * kc_num * num_heads > threshold indicates too much memory needed
+    # For 24GB GPU with offloading, threshold ~100k seems reasonable
+    num_heads = B * H
+    block_complexity = qc_num * kc_num * num_heads
+    MAX_BLOCK_COMPLEXITY = 100000  # ~100k blocks is the limit for 24GB GPU
+
+    if block_complexity > MAX_BLOCK_COMPLEXITY and not _FLASHINFER_OOM_DETECTED:
+        import logging
+        logging.warning(f"Skipping FlashInfer: block complexity {block_complexity} ({qc_num}x{kc_num}x{num_heads}) exceeds limit {MAX_BLOCK_COMPLEXITY}")
+        logging.warning(f"Using Triton for sparse attention (more memory efficient)")
+        _FLASHINFER_OOM_DETECTED = True  # Don't log this warning again
+
     if _FLASHINFER_VARBLOCK_AVAILABLE and not _FLASHINFER_OOM_DETECTED:
         try:
             return _dynamic_block_sparse_fwd_flashinfer_impl(
@@ -1418,12 +1432,15 @@ def dynamic_block_sparse_fwd_flashinfer(
             )
         except torch.cuda.OutOfMemoryError as e:
             import logging
+            import gc
             logging.warning(f"FlashInfer OOM (plan() requires too much memory for {qc_num}x{kc_num} blocks)")
             logging.warning(f"Permanently switching to Triton for sparse attention")
             # Set flag to skip FlashInfer for all future calls
             _FLASHINFER_OOM_DETECTED = True
-            # Clear any partial allocations
+            # Aggressive memory cleanup
+            gc.collect()
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
         except Exception as e:
             import logging
             logging.warning(f"FlashInfer sparse attention failed: {e}, falling back to Triton")
