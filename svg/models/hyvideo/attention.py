@@ -1004,9 +1004,10 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
             query, key, layer_idx, timestep_val
         )
 
-        # Also update the legacy centroid storage for compatibility
-        self.q_centroids[layer_idx] = q_centroids
-        self.k_centroids[layer_idx] = k_centroids
+        # Also update the legacy centroid storage for compatibility (store CPU copies to save GPU memory)
+        # CTCA already handles warm-starting internally, this is just for backward compatibility
+        self.q_centroids[layer_idx] = q_centroids.cpu()
+        self.k_centroids[layer_idx] = k_centroids.cpu()
         self.centroids_init[layer_idx] = True
 
         # Return in the same format as parent (with dummy iter counts)

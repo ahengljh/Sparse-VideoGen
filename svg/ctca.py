@@ -63,7 +63,11 @@ class CTCAConfig:
 
 @dataclass
 class ClusterCache:
-    """Cache entry for a single layer's cluster state."""
+    """Cache entry for a single layer's cluster state.
+
+    Memory optimization: Tensors are stored on CPU by default and moved to GPU
+    only when needed. This saves ~54MB per layer × 60 layers = ~3.2GB GPU memory.
+    """
 
     # Cluster assignments
     q_cluster_ids: torch.Tensor  # [B*H, S]
@@ -99,6 +103,38 @@ class ClusterCache:
             return 0.0
         recent = list(self.quality_history)
         return recent[-1] - recent[0]
+
+    def to_cpu(self):
+        """Move all tensors to CPU to save GPU memory."""
+        self.q_cluster_ids = self.q_cluster_ids.cpu()
+        self.k_cluster_ids = self.k_cluster_ids.cpu()
+        self.q_centroids = self.q_centroids.cpu()
+        self.k_centroids = self.k_centroids.cpu()
+        self.q_cluster_sizes = self.q_cluster_sizes.cpu()
+        self.k_cluster_sizes = self.k_cluster_sizes.cpu()
+
+    def to_device(self, device: torch.device):
+        """Move all tensors to specified device."""
+        self.q_cluster_ids = self.q_cluster_ids.to(device, non_blocking=True)
+        self.k_cluster_ids = self.k_cluster_ids.to(device, non_blocking=True)
+        self.q_centroids = self.q_centroids.to(device, non_blocking=True)
+        self.k_centroids = self.k_centroids.to(device, non_blocking=True)
+        self.q_cluster_sizes = self.q_cluster_sizes.to(device, non_blocking=True)
+        self.k_cluster_sizes = self.k_cluster_sizes.to(device, non_blocking=True)
+
+    def get_tensors_on_device(self, device: torch.device) -> Tuple:
+        """Get all tensors moved to specified device without modifying cache.
+
+        Returns copies on device, keeping originals on CPU.
+        """
+        return (
+            self.q_cluster_ids.to(device, non_blocking=True),
+            self.q_centroids.to(device, non_blocking=True),
+            self.q_cluster_sizes.to(device, non_blocking=True),
+            self.k_cluster_ids.to(device, non_blocking=True),
+            self.k_centroids.to(device, non_blocking=True),
+            self.k_cluster_sizes.to(device, non_blocking=True),
+        )
 
 
 class CrossTimestepClusterAmortization:
@@ -276,12 +312,20 @@ class CrossTimestepClusterAmortization:
             # Compute current quality with cached assignments
             B_H, S, D = query.shape[0] * query.shape[1], query.shape[2], query.shape[3]
             query_flat = query.reshape(B_H, S, D)
+            device = query.device
+
+            # Move cache tensors to GPU for quality computation
+            q_cluster_ids_gpu = cache.q_cluster_ids.to(device, non_blocking=True)
+            q_centroids_gpu = cache.q_centroids.to(device, non_blocking=True)
 
             q_quality = self.compute_cluster_quality(
                 query_flat,
-                cache.q_cluster_ids,
-                cache.q_centroids,
+                q_cluster_ids_gpu,
+                q_centroids_gpu,
             )
+
+            # Free temporary GPU tensors
+            del q_cluster_ids_gpu, q_centroids_gpu
 
             cache.update_quality(q_quality)
 
@@ -319,15 +363,17 @@ class CrossTimestepClusterAmortization:
             k_cluster_ids, k_centroids, k_cluster_sizes
         """
         cfg, num_heads, seq_len, dim = query.shape
+        device = query.device
 
         # Flatten batch and head dimensions
         query_flat = query.reshape(cfg * num_heads, seq_len, dim)
         key_flat = key.reshape(cfg * num_heads, seq_len, dim)
 
         # Get initial centroids from cache if available (warm start)
+        # Cache tensors are on CPU, need to move to GPU
         cache = self._cache.get(layer_idx, None)
-        init_q_centroids = cache.q_centroids if cache is not None else None
-        init_k_centroids = cache.k_centroids if cache is not None else None
+        init_q_centroids = cache.q_centroids.to(device, non_blocking=True) if cache is not None else None
+        init_k_centroids = cache.k_centroids.to(device, non_blocking=True) if cache is not None else None
 
         # Full K-means for query
         q_cluster_ids, q_centroids, q_cluster_sizes, q_iters = batch_kmeans_Euclid(
@@ -345,18 +391,20 @@ class CrossTimestepClusterAmortization:
             init_centroids=init_k_centroids,
         )
 
-        # Update cache
+        # Update cache (keep tensors on GPU for return, cache stores CPU copies)
         self._cache[layer_idx] = ClusterCache(
-            q_cluster_ids=q_cluster_ids,
-            k_cluster_ids=k_cluster_ids,
-            q_centroids=q_centroids,
-            k_centroids=k_centroids,
-            q_cluster_sizes=q_cluster_sizes,
-            k_cluster_sizes=k_cluster_sizes,
+            q_cluster_ids=q_cluster_ids.clone(),
+            k_cluster_ids=k_cluster_ids.clone(),
+            q_centroids=q_centroids.clone(),
+            k_centroids=k_centroids.clone(),
+            q_cluster_sizes=q_cluster_sizes.clone(),
+            k_cluster_sizes=k_cluster_sizes.clone(),
             last_full_cluster_timestep=timestep,
             last_update_timestep=timestep,
             creation_timestep=timestep,
         )
+        # Move cache to CPU immediately to save GPU memory (~54MB per layer)
+        self._cache[layer_idx].to_cpu()
 
         # Update stats
         self.stats['full_cluster_count'] += 1
@@ -394,27 +442,30 @@ class CrossTimestepClusterAmortization:
         """
         cache = self._cache[layer_idx]
         cfg, num_heads, seq_len, dim = query.shape
+        device = query.device
 
         # Flatten batch and head dimensions
         query_flat = query.reshape(cfg * num_heads, seq_len, dim)
         key_flat = key.reshape(cfg * num_heads, seq_len, dim)
 
-        # Reuse cluster assignments from cache
-        q_cluster_ids = cache.q_cluster_ids
-        k_cluster_ids = cache.k_cluster_ids
+        # Move cached cluster assignments to GPU (cache is stored on CPU)
+        q_cluster_ids = cache.q_cluster_ids.to(device, non_blocking=True)
+        k_cluster_ids = cache.k_cluster_ids.to(device, non_blocking=True)
+        cached_q_centroids = cache.q_centroids.to(device, non_blocking=True)
+        cached_k_centroids = cache.k_centroids.to(device, non_blocking=True)
 
         # Update centroids based on new data positions
         # This computes new centroids as the mean of assigned points
         q_centroids, q_cluster_sizes = triton_centroid_update_sorted_euclid(
             query_flat,
             q_cluster_ids,
-            cache.q_centroids,
+            cached_q_centroids,
         )
 
         k_centroids, k_cluster_sizes = triton_centroid_update_sorted_euclid(
             key_flat,
             k_cluster_ids,
-            cache.k_centroids,
+            cached_k_centroids,
         )
 
         # Optional: Run a few reassignment iterations for refinement
@@ -435,16 +486,16 @@ class CrossTimestepClusterAmortization:
                     key_flat, k_cluster_ids, k_centroids
                 )
 
-        # Update cache with new centroids (keep assignments if no reassignment)
-        cache.q_centroids = q_centroids
-        cache.k_centroids = k_centroids
-        cache.q_cluster_sizes = q_cluster_sizes
-        cache.k_cluster_sizes = k_cluster_sizes
+        # Update cache with new values (store CPU copies to save GPU memory)
+        cache.q_centroids = q_centroids.cpu()
+        cache.k_centroids = k_centroids.cpu()
+        cache.q_cluster_sizes = q_cluster_sizes.cpu()
+        cache.k_cluster_sizes = k_cluster_sizes.cpu()
         cache.last_update_timestep = timestep
 
         if self.config.update_only_iters > 1:
-            cache.q_cluster_ids = q_cluster_ids
-            cache.k_cluster_ids = k_cluster_ids
+            cache.q_cluster_ids = q_cluster_ids.cpu()
+            cache.k_cluster_ids = k_cluster_ids.cpu()
 
         # Update stats
         self.stats['update_only_count'] += 1
@@ -452,6 +503,7 @@ class CrossTimestepClusterAmortization:
         if self.config.verbose:
             print(f"[CTCA] Layer {layer_idx} @ t={timestep}: Centroid update only")
 
+        # Return GPU tensors for caller
         return (q_cluster_ids, q_centroids, q_cluster_sizes,
                 k_cluster_ids, k_centroids, k_cluster_sizes)
 
