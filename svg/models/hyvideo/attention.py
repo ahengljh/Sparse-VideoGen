@@ -9,6 +9,8 @@ from flash_attn.flash_attn_interface import flash_attn_varlen_func
 from torch.nn.attention.flex_attention import flex_attention
 
 # Check if FlashInfer is available and supports this GPU
+# Note: Our sparse attention implementation requires VariableBlockSparseAttentionWrapper
+# which may not exist in newer FlashInfer versions (they have BlockSparseAttentionWrapper with different API)
 FLASHINFER_AVAILABLE = False
 try:
     import flashinfer
@@ -18,14 +20,18 @@ try:
         capability = torch.cuda.get_device_capability(device)
         sm_version = capability[0] * 10 + capability[1]
         if sm_version >= 75:
-            # Also check if the required sparse API exists (may change between FlashInfer versions)
-            if hasattr(flashinfer, 'sparse') and hasattr(flashinfer.sparse, 'BlockSparseAttentionWrapper'):
+            # Check for the specific API our code requires (VariableBlockSparseAttentionWrapper)
+            # BlockSparseAttentionWrapper has a different plan() signature and won't work
+            if hasattr(flashinfer, 'sparse') and hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
                 FLASHINFER_AVAILABLE = True
                 from ...logger import logger as _logger
-                _logger.info(f"FlashInfer enabled (GPU sm{sm_version})")
+                _logger.info(f"FlashInfer enabled (GPU sm{sm_version}, VariableBlockSparseAttentionWrapper found)")
+            elif hasattr(flashinfer, 'sparse') and hasattr(flashinfer.sparse, 'BlockSparseAttentionWrapper'):
+                from ...logger import logger as _logger
+                _logger.warning(f"FlashInfer disabled: BlockSparseAttentionWrapper found but incompatible API, falling back to flash_attn")
             else:
                 from ...logger import logger as _logger
-                _logger.warning(f"FlashInfer disabled: sparse.BlockSparseAttentionWrapper not found, falling back to flash_attn")
+                _logger.warning(f"FlashInfer disabled: no compatible sparse attention API found, falling back to flash_attn")
         else:
             from ...logger import logger as _logger
             _logger.warning(f"FlashInfer disabled: GPU sm{sm_version} < sm75, falling back to flash_attn")
@@ -1156,17 +1162,17 @@ def flashinfer_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, m
     assert torch.all(block_col_sz.sum(dim=2) == block_col_sz.sum(dim=2)[0, 0])
     assert torch.all(block_row_sz.sum(dim=2) == block_row_sz.sum(dim=2)[0, 0])
 
-    # Prepare flashinfer wrapper - try different API versions
+    # Prepare flashinfer wrapper - requires VariableBlockSparseAttentionWrapper
+    # (BlockSparseAttentionWrapper has incompatible plan() API)
     float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
 
-    # Try BlockSparseAttentionWrapper (current API)
-    if hasattr(flashinfer.sparse, 'BlockSparseAttentionWrapper'):
-        wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
-    elif hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
-        # Fallback to old API if available
-        wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
-    else:
-        raise AttributeError("FlashInfer sparse attention API not found. Please update FlashInfer.")
+    if not hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
+        raise AttributeError(
+            "FlashInfer VariableBlockSparseAttentionWrapper not found. "
+            "Your FlashInfer version may be incompatible. "
+            "Consider installing flashinfer==0.1.6 or using flash_attn fallback."
+        )
+    wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
 
     # Reshape inputs to (B * H, ...)
     q = q.reshape(B * H, S, D)

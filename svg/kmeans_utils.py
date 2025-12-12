@@ -1354,31 +1354,24 @@ def dynamic_block_sparse_fwd_flashinfer(
 
     with time_logging_decorator("Level 4 - Planning"):
 
-        # Prepare flashinfer wrapper - try different API versions
+        # Prepare flashinfer wrapper - requires VariableBlockSparseAttentionWrapper
+        # (BlockSparseAttentionWrapper has incompatible plan() API)
         float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
         vector_sparse_indices_buffer = torch.empty(1024 * 1024 * 1024, device=q.device)
 
-        # Try BlockSparseAttentionWrapper (current API)
-        if hasattr(flashinfer.sparse, 'BlockSparseAttentionWrapper'):
-            wrapper = flashinfer.sparse.BlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
-        elif hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
-            # Fallback to old API if available
-            wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
-        else:
-            raise AttributeError("FlashInfer sparse attention API not found. Please update FlashInfer.")
-
-        # Reset workspace buffer if the method exists (API may vary between versions)
-        if hasattr(wrapper, 'reset_workspace_buffer'):
-            try:
-                wrapper.reset_workspace_buffer(
-                    float_workspace_buffer=wrapper._float_workspace_buffer,
-                    int_workspace_buffer=wrapper._int_workspace_buffer,
-                    vector_sparse_indices_buffer=vector_sparse_indices_buffer,
-                    vector_sparse_indptr_buffer=wrapper._vector_sparse_indptr_buffer,
-                )
-            except (AttributeError, TypeError):
-                # API might have changed, continue without reset
-                pass
+        if not hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
+            raise AttributeError(
+                "FlashInfer VariableBlockSparseAttentionWrapper not found. "
+                "Your FlashInfer version may be incompatible. "
+                "Consider installing flashinfer==0.1.6 or using flash_attn fallback."
+            )
+        wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
+        wrapper.reset_workspace_buffer(
+            float_workspace_buffer=wrapper._float_workspace_buffer,
+            int_workspace_buffer=wrapper._int_workspace_buffer,
+            vector_sparse_indices_buffer=vector_sparse_indices_buffer,
+            vector_sparse_indptr_buffer=wrapper._vector_sparse_indptr_buffer,
+        )
 
         # Reshape inputs to (B * H, ...)
         q = q.reshape(B * H, S, D)
