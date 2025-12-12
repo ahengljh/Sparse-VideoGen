@@ -1352,6 +1352,11 @@ def dynamic_block_sparse_fwd_flashinfer(
     assert torch.all(block_col_sz.sum(dim=2) == block_col_sz.sum(dim=2)[0, 0])
     assert torch.all(block_row_sz.sum(dim=2) == block_row_sz.sum(dim=2)[0, 0])
 
+    # Check if FlashInfer API is available - return None if not
+    # (caller should handle this and use fallback)
+    if not hasattr(flashinfer, 'sparse') or not hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
+        return None
+
     with time_logging_decorator("Level 4 - Planning"):
 
         # Prepare flashinfer wrapper - requires VariableBlockSparseAttentionWrapper
@@ -1359,12 +1364,6 @@ def dynamic_block_sparse_fwd_flashinfer(
         float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
         vector_sparse_indices_buffer = torch.empty(1024 * 1024 * 1024, device=q.device)
 
-        if not hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
-            raise AttributeError(
-                "FlashInfer VariableBlockSparseAttentionWrapper not found. "
-                "Your FlashInfer version may be incompatible. "
-                "Consider installing flashinfer==0.1.6 or using flash_attn fallback."
-            )
         wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
         wrapper.reset_workspace_buffer(
             float_workspace_buffer=wrapper._float_workspace_buffer,

@@ -488,16 +488,17 @@ class Hunyuan_SVGAttn_Processor2_0:
         try:
             cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv = cu_max_seqlens
             out = flashinfer_varlen_func(query, key, value, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, max_seqlen_kv)
-            return out
-        except (RuntimeError, AttributeError) as e:
-            # FlashInfer's internal JIT check may fail even if we passed the sm75+ check
-            # AttributeError occurs when FlashInfer API has changed (e.g., VariableBlockSparseAttentionWrapper)
-            error_str = str(e).lower()
-            if "sm75" in error_str or "cuda" in error_str or "attribute" in error_str:
-                logger.warning(f"FlashInfer failed: {e}. Falling back to flash_attn permanently.")
+            # flashinfer_varlen_func returns None if API is unavailable
+            if out is None:
+                logger.warning("FlashInfer API unavailable. Falling back to flash_attn permanently.")
                 FLASHINFER_AVAILABLE = False
                 return self.flash_attention(query, key, value, cu_max_seqlens)
-            raise
+            return out
+        except Exception as e:
+            # Catch any FlashInfer errors and fall back
+            logger.warning(f"FlashInfer failed: {e}. Falling back to flash_attn permanently.")
+            FLASHINFER_AVAILABLE = False
+            return self.flash_attention(query, key, value, cu_max_seqlens)
 
     @time_logging_decorator("Level 3 - Dense Flash Attention")
     def flash_attention(self, query, key, value, cu_max_seqlens):
@@ -1164,14 +1165,11 @@ def flashinfer_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, m
 
     # Prepare flashinfer wrapper - requires VariableBlockSparseAttentionWrapper
     # (BlockSparseAttentionWrapper has incompatible plan() API)
-    float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
+    # Return None if API unavailable - caller will fall back to flash_attn
+    if not hasattr(flashinfer, 'sparse') or not hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
+        return None
 
-    if not hasattr(flashinfer.sparse, 'VariableBlockSparseAttentionWrapper'):
-        raise AttributeError(
-            "FlashInfer VariableBlockSparseAttentionWrapper not found. "
-            "Your FlashInfer version may be incompatible. "
-            "Consider installing flashinfer==0.1.6 or using flash_attn fallback."
-        )
+    float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
     wrapper = flashinfer.sparse.VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
 
     # Reshape inputs to (B * H, ...)
