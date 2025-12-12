@@ -77,10 +77,17 @@ class ClusterCache:
     q_cluster_sizes: torch.Tensor  # [B*H, Kc_q]
     k_cluster_sizes: torch.Tensor  # [B*H, Kc_k]
 
-    # Metadata
+    # Metadata - timestep values (for reference only)
     last_full_cluster_timestep: int = -1
     last_update_timestep: int = -1
     creation_timestep: int = -1
+
+    # Call counting (THIS IS WHAT WE USE FOR INTERVAL DECISIONS)
+    # Bug fix: Use call counts, not timestep value differences!
+    # Timesteps in diffusion have large jumps (e.g., 1000->967->933)
+    # which would trigger constant re-clustering with max_interval=10
+    call_count: int = 0  # Total calls to this layer
+    last_full_cluster_call: int = 0  # Call number when we last did full clustering
 
     # Quality tracking
     quality_history: deque = field(default_factory=lambda: deque(maxlen=5))
@@ -250,6 +257,10 @@ class CrossTimestepClusterAmortization:
         """
         Decide whether to perform full re-clustering or reuse cached assignments.
 
+        IMPORTANT: Uses CALL COUNTS, not timestep values!
+        Timesteps in diffusion have large jumps (e.g., 1000 -> 967 -> 933),
+        so using timestep differences would trigger constant re-clustering.
+
         Returns:
             Tuple[bool, str]: (should_recluster, reason)
         """
@@ -259,16 +270,16 @@ class CrossTimestepClusterAmortization:
         if cache is None:
             return True, "no_cache"
 
-        steps_since_full = cache.last_full_cluster_timestep - timestep
-        # Note: timesteps decrease in diffusion (1000 -> 0)
-        # So steps_since_full will be positive if we clustered earlier
+        # Calculate calls since last full clustering (NOT timestep difference!)
+        # This is the key fix: we count forward calls, not timestep value changes
+        calls_since_full = cache.call_count - cache.last_full_cluster_call
 
         # Check minimum interval (prevent thrashing)
-        if steps_since_full < self.config.min_recluster_interval:
+        if calls_since_full < self.config.min_recluster_interval:
             return False, "min_interval"
 
         # Check maximum interval (force periodic refresh)
-        if steps_since_full >= self.config.max_recluster_interval:
+        if calls_since_full >= self.config.max_recluster_interval:
             return True, "max_interval"
 
         # Adaptive quality-based decision
@@ -345,6 +356,10 @@ class CrossTimestepClusterAmortization:
             init_centroids=init_k_centroids,
         )
 
+        # Get previous call count if cache exists, otherwise start at 0
+        old_cache = self._cache.get(layer_idx, None)
+        new_call_count = (old_cache.call_count + 1) if old_cache else 1
+
         # Update cache
         self._cache[layer_idx] = ClusterCache(
             q_cluster_ids=q_cluster_ids,
@@ -356,6 +371,9 @@ class CrossTimestepClusterAmortization:
             last_full_cluster_timestep=timestep,
             last_update_timestep=timestep,
             creation_timestep=timestep,
+            # Track call count for interval decisions
+            call_count=new_call_count,
+            last_full_cluster_call=new_call_count,  # We just did full clustering at this call
         )
 
         # Update stats
@@ -441,6 +459,9 @@ class CrossTimestepClusterAmortization:
         cache.q_cluster_sizes = q_cluster_sizes
         cache.k_cluster_sizes = k_cluster_sizes
         cache.last_update_timestep = timestep
+
+        # Increment call count (critical for interval tracking!)
+        cache.call_count += 1
 
         if self.config.update_only_iters > 1:
             cache.q_cluster_ids = q_cluster_ids
