@@ -1414,6 +1414,11 @@ def dynamic_block_sparse_fwd_flashinfer(
             return _dynamic_block_sparse_fwd_flashinfer_impl(
                 q, k, v, block_mask_map, block_row_sz, block_col_sz, is_cpu
             )
+        except torch.cuda.OutOfMemoryError as e:
+            import logging
+            logging.warning(f"FlashInfer OOM (plan() requires too much memory for {qc_num}x{kc_num} blocks), using Triton")
+            # Clear any partial allocations
+            torch.cuda.empty_cache()
         except Exception as e:
             import logging
             logging.warning(f"FlashInfer sparse attention failed: {e}, falling back to Triton")
@@ -1460,16 +1465,10 @@ def _dynamic_block_sparse_fwd_flashinfer_impl(
     with time_logging_decorator("Level 4 - Planning"):
 
         # Prepare flashinfer wrapper - use dynamically found class
-        float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)
-        vector_sparse_indices_buffer = torch.empty(1024 * 1024 * 1024, device=q.device)
+        # Use smaller workspace buffers to save memory
+        float_workspace_buffer = torch.empty(128 * 1024 * 1024, device=q.device)  # 128MB
 
         wrapper = _VariableBlockSparseAttentionWrapper(float_workspace_buffer, backend="auto")
-        wrapper.reset_workspace_buffer(
-            float_workspace_buffer=wrapper._float_workspace_buffer,
-            int_workspace_buffer=wrapper._int_workspace_buffer,
-            vector_sparse_indices_buffer=vector_sparse_indices_buffer,
-            vector_sparse_indptr_buffer=wrapper._vector_sparse_indptr_buffer,
-        )
 
         # Reshape inputs to (B * H, ...)
         q = q.reshape(B * H, S, D)
