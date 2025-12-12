@@ -1319,6 +1319,7 @@ def dynamic_block_sparse_fwd_triton(q, k, v, dynamic_map, qc_size, kc_size):
 # Check if FlashInfer VariableBlockSparseAttentionWrapper is available
 # The API might be in different locations depending on FlashInfer version
 _FLASHINFER_VARBLOCK_AVAILABLE = False
+_FLASHINFER_OOM_DETECTED = False  # Set to True after first OOM to skip FlashInfer attempts
 _VariableBlockSparseAttentionWrapper = None
 
 def _init_flashinfer_sparse():
@@ -1408,15 +1409,19 @@ def dynamic_block_sparse_fwd_flashinfer(
     assert torch.all(block_col_sz.sum(dim=2) == block_col_sz.sum(dim=2)[0, 0])
     assert torch.all(block_row_sz.sum(dim=2) == block_row_sz.sum(dim=2)[0, 0])
 
-    # Try FlashInfer first if available
-    if _FLASHINFER_VARBLOCK_AVAILABLE:
+    # Try FlashInfer first if available and hasn't OOMed before
+    global _FLASHINFER_OOM_DETECTED
+    if _FLASHINFER_VARBLOCK_AVAILABLE and not _FLASHINFER_OOM_DETECTED:
         try:
             return _dynamic_block_sparse_fwd_flashinfer_impl(
                 q, k, v, block_mask_map, block_row_sz, block_col_sz, is_cpu
             )
         except torch.cuda.OutOfMemoryError as e:
             import logging
-            logging.warning(f"FlashInfer OOM (plan() requires too much memory for {qc_num}x{kc_num} blocks), using Triton")
+            logging.warning(f"FlashInfer OOM (plan() requires too much memory for {qc_num}x{kc_num} blocks)")
+            logging.warning(f"Permanently switching to Triton for sparse attention")
+            # Set flag to skip FlashInfer for all future calls
+            _FLASHINFER_OOM_DETECTED = True
             # Clear any partial allocations
             torch.cuda.empty_cache()
         except Exception as e:
