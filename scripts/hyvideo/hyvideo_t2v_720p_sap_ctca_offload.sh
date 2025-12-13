@@ -195,8 +195,8 @@ eval "$cmd" 2>&1 | tee "$temp_output"
 end_time=$(date +%s.%N)
 echo "end_time=$(date -Iseconds)" >> "$metrics_file"
 
-# Calculate duration
-duration=$(echo "$end_time - $start_time" | bc)
+# Calculate duration (use awk instead of bc for portability)
+duration=$(awk "BEGIN {printf \"%.2f\", $end_time - $start_time}")
 echo "duration_seconds=${duration}" >> "$metrics_file"
 
 # =============================================================================
@@ -278,13 +278,20 @@ if [ -n "$kmeans_speedup" ] && [ "$kmeans_speedup" != "N/A" ]; then
     echo "  Interval Triggers: ${interval_triggered}"
     echo "  K-means Speedup:   ${kmeans_speedup}"
 
-    # Performance assessment
+    # Performance assessment (use awk for float comparison)
     speedup_num=$(echo "$kmeans_speedup" | tr -d 'x')
-    if (( $(echo "$speedup_num >= 5" | bc -l) )); then
+    assessment=$(awk -v s="$speedup_num" 'BEGIN {
+        if (s >= 5) print "EXCELLENT"
+        else if (s >= 3) print "GOOD"
+        else if (s >= 2) print "MODERATE"
+        else print "NEEDS_TUNING"
+    }')
+
+    if [ "$assessment" = "EXCELLENT" ]; then
         echo "  Assessment:        EXCELLENT (>= 5x speedup)"
-    elif (( $(echo "$speedup_num >= 3" | bc -l) )); then
+    elif [ "$assessment" = "GOOD" ]; then
         echo "  Assessment:        GOOD (3-5x speedup)"
-    elif (( $(echo "$speedup_num >= 2" | bc -l) )); then
+    elif [ "$assessment" = "MODERATE" ]; then
         echo "  Assessment:        MODERATE (2-3x speedup)"
     else
         echo "  Assessment:        NEEDS TUNING (< 2x speedup)"
@@ -306,13 +313,20 @@ if [ -n "$prefetch_ratio" ] && [ "$prefetch_ratio" != "N/A" ]; then
     echo "  Prefetch Misses:   ${prefetch_misses}"
     echo "  Prefetch Ratio:    ${prefetch_ratio}"
 
-    # Offload efficiency assessment
+    # Offload efficiency assessment (use awk for float comparison)
     ratio_num=$(echo "$prefetch_ratio" | tr -d '%')
-    if (( $(echo "$ratio_num >= 80" | bc -l) )); then
+    offload_assessment=$(awk -v r="$ratio_num" 'BEGIN {
+        if (r >= 80) print "EXCELLENT"
+        else if (r >= 60) print "GOOD"
+        else if (r >= 40) print "MODERATE"
+        else print "NEEDS_TUNING"
+    }')
+
+    if [ "$offload_assessment" = "EXCELLENT" ]; then
         echo "  Assessment:        EXCELLENT (>= 80% prefetch hits)"
-    elif (( $(echo "$ratio_num >= 60" | bc -l) )); then
+    elif [ "$offload_assessment" = "GOOD" ]; then
         echo "  Assessment:        GOOD (60-80% prefetch hits)"
-    elif (( $(echo "$ratio_num >= 40" | bc -l) )); then
+    elif [ "$offload_assessment" = "MODERATE" ]; then
         echo "  Assessment:        MODERATE (40-60% prefetch hits)"
     else
         echo "  Assessment:        NEEDS TUNING (< 40% prefetch hits)"
