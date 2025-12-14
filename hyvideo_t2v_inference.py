@@ -229,14 +229,17 @@ if __name__ == "__main__":
         assert args.pattern == "dense", f"Invalid pattern: {args.pattern}"
         
     # Print time logger
+    logger.info("Registering forward hooks for timing...")
     for layer_idx, block in enumerate(pipe.transformer.transformer_blocks):
         block.register_forward_hook(print_operator_log_data)
     for layer_idx, block in enumerate(pipe.transformer.single_transformer_blocks):
         block.register_forward_hook(print_operator_log_data)
+    logger.info("Forward hooks registered")
 
     #########################################################
     # Generate the video
     #########################################################
+    logger.info("Starting video generation pipeline...")
     output = pipe(
         prompt=args.prompt,
         negative_prompt=args.negative_prompt,
