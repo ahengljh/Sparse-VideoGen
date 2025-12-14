@@ -1144,7 +1144,8 @@ def hierarchical_sparse_attention_fwd(
 
     # Centroid attention output per Q cluster: [B, H, qc_num, D]
     # This is small: 1 * 24 * 400 * 128 * 2 = 2.4MB
-    centroid_out_per_cluster = torch.matmul(masked_weights.float(), v_centroids)
+    # Ensure both tensors are same dtype for matmul
+    centroid_out_per_cluster = torch.matmul(masked_weights.float(), v_centroids.float())
     del masked_weights  # Free immediately
 
     # 3. Build token-to-cluster mapping (reuse across calls if possible)
