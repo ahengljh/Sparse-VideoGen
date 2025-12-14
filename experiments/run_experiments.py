@@ -173,7 +173,6 @@ def run_single_experiment(
 
     # Setup offloading
     offload_config = OffloadConfig(
-        enabled=True,
         num_layers_on_gpu=8,
         enable_prefetch=True,
     )
