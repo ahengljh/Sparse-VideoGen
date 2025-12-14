@@ -1184,6 +1184,13 @@ def hierarchical_sparse_attention_fwd(
     full_output.add_(centroid_out)
     del centroid_out  # Free the centroid output
 
+    # 8. Update CTAA statistics
+    global _CTAA_STATS
+    _CTAA_STATS['calls'] += 1
+    _CTAA_STATS['full_attention_blocks'] += full_attention_map.sum().item()
+    _CTAA_STATS['centroid_attention_blocks'] += centroid_attention_map.sum().item()
+    _CTAA_STATS['total_blocks'] += full_attention_map.numel()
+
     return full_output
 
 

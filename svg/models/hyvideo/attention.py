@@ -920,7 +920,7 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
     ctca_verbose: bool = False
 
     # CTAA configuration (Cross-Timestep Attention Amortization)
-    ctaa_enabled: bool = False  # Enable hierarchical sparse attention
+    ctaa_enabled: bool = True  # Enable hierarchical sparse attention
     ctaa_p_full: float = 0.7    # Top-p for full token attention
     ctaa_p_total: float = 0.95  # Top-p including centroid attention
 

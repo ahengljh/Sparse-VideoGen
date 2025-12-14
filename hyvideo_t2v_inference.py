@@ -18,7 +18,9 @@ from svg.models.hyvideo.inference import (
     replace_hyvideo_flashattention,
     replace_hyvideo_attention,
     print_ctca_statistics,
+    print_ctaa_statistics,
     reset_ctca,
+    reset_ctaa_statistics,
 )
 from svg.models.hyvideo.utils import get_prompt_length
 from svg.offload import enable_offloading, pre_encode_and_offload, OffloadConfig
@@ -285,6 +287,9 @@ if __name__ == "__main__":
     #########################################################
     # Generate the video
     #########################################################
+    # Reset CTAA statistics for fresh tracking
+    reset_ctaa_statistics()
+
     if pre_encoded_embeds is not None:
         # Use pre-computed embeddings (offload mode)
         # Note: Embedders will be moved to GPU by the forward pre-hook registered in enable_offloading
@@ -318,9 +323,10 @@ if __name__ == "__main__":
 
     export_to_video(output, args.output_file, fps=24)
 
-    # Print CTCA statistics if using SAP_CTCA pattern
+    # Print CTCA and CTAA statistics if using SAP_CTCA pattern
     if args.pattern == "SAP_CTCA":
         print_ctca_statistics()
+        print_ctaa_statistics()
 
     # Print offloading statistics if enabled
     if offload_manager is not None:

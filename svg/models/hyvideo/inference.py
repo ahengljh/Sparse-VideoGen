@@ -255,3 +255,15 @@ def reset_ctca():
 def print_ctca_statistics():
     """Print CTCA performance statistics."""
     Hunyuan_SAPAttn_CTCA_Processor2_0.print_ctca_statistics()
+
+
+def print_ctaa_statistics():
+    """Print CTAA (Cross-Timestep Attention Amortization) statistics."""
+    from ...kmeans_utils import print_ctaa_statistics as _print_ctaa_statistics
+    _print_ctaa_statistics()
+
+
+def reset_ctaa_statistics():
+    """Reset CTAA statistics for a new video generation."""
+    from ...kmeans_utils import reset_ctaa_statistics as _reset_ctaa_statistics
+    _reset_ctaa_statistics()
