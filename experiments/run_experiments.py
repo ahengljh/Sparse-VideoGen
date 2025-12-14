@@ -86,6 +86,7 @@ def run_single_experiment(
     num_inference_steps: int = 30,
     resolution: str = "480p",
     seed: int = 42,
+    model_id: str = "tencent/HunyuanVideo",
 ) -> dict:
     """
     Run a single experiment and collect metrics.
@@ -93,8 +94,10 @@ def run_single_experiment(
     Returns:
         Dictionary containing timing, memory, and quality metrics.
     """
-    from diffusers import HunyuanVideoPipeline
+    import gc
+    from diffusers import HunyuanVideoPipeline, FlowMatchEulerDiscreteScheduler
     from diffusers.utils import export_to_video
+    from diffusers.models import HunyuanVideoTransformer3DModel
 
     from svg.models.hyvideo.inference import (
         replace_hyvideo_flashattention,
@@ -142,10 +145,29 @@ def run_single_experiment(
     print(f"{'='*60}")
 
     load_start = time.time()
-    pipe = HunyuanVideoPipeline.from_pretrained(
-        "tencent/HunyuanVideo",
-        torch_dtype=torch.bfloat16,
+
+    # Load transformer separately (matching main inference script)
+    transformer = HunyuanVideoTransformer3DModel.from_pretrained(
+        model_id, subfolder="transformer", torch_dtype=torch.bfloat16, revision='refs/pr/18'
     )
+
+    # Create scheduler
+    flow_shift = 7.0
+    scheduler = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
+
+    # Load pipeline with transformer and scheduler
+    pipe = HunyuanVideoPipeline.from_pretrained(
+        model_id, transformer=transformer, scheduler=scheduler,
+        revision='refs/pr/18', torch_dtype=torch.bfloat16
+    )
+
+    # Move to CPU first to free GPU memory (for offload mode)
+    pipe.to('cpu')
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    pipe.vae.enable_tiling()
+
     load_time = time.time() - load_start
     results['model_load_time'] = load_time
 
@@ -213,7 +235,8 @@ def run_single_experiment(
     return results
 
 
-def run_experiment_suite(suite: ExperimentSuite, output_base_dir: str = "experiment_results"):
+def run_experiment_suite(suite: ExperimentSuite, output_base_dir: str = "experiment_results",
+                         model_id: str = "tencent/HunyuanVideo"):
     """
     Run a full experiment suite.
     """
@@ -225,6 +248,7 @@ def run_experiment_suite(suite: ExperimentSuite, output_base_dir: str = "experim
     print(f"Running experiment suite: {suite.name}")
     print(f"Total experiments: {suite.total_experiments()}")
     print(f"Output directory: {suite_dir}")
+    print(f"Model: {model_id}")
     print(f"{'#'*60}\n")
 
     all_results = []
@@ -250,6 +274,7 @@ def run_experiment_suite(suite: ExperimentSuite, output_base_dir: str = "experim
                         num_inference_steps=suite.num_inference_steps,
                         resolution=suite.resolution,
                         seed=seed,
+                        model_id=model_id,
                     )
                     result['prompt_idx'] = prompt_idx
                     result['run_idx'] = run_idx
@@ -292,6 +317,8 @@ def main():
     parser.add_argument("--output_dir", type=str, default="experiment_results")
     parser.add_argument("--steps", type=int, default=30)
     parser.add_argument("--resolution", type=str, default="480p", choices=["480p", "720p"])
+    parser.add_argument("--model_id", type=str, default="tencent/HunyuanVideo",
+                        help="Model ID or local path to HunyuanVideo model")
 
     args = parser.parse_args()
 
@@ -304,7 +331,7 @@ def main():
             "ablation_study": ABLATION_SUITE,
         }
         suite = suites[args.suite]
-        run_experiment_suite(suite, args.output_dir)
+        run_experiment_suite(suite, args.output_dir, model_id=args.model_id)
 
     elif args.config and args.prompt:
         # Run single custom experiment
@@ -325,6 +352,7 @@ def main():
             output_dir=args.output_dir,
             num_inference_steps=args.steps,
             resolution=args.resolution,
+            model_id=args.model_id,
         )
     else:
         parser.print_help()
