@@ -85,6 +85,7 @@ class ClusterCache:
     last_full_cluster_timestep: int = -1
     last_update_timestep: int = -1
     creation_timestep: int = -1
+    calls_since_full_cluster: int = 0  # Track call counts instead of timestep differences
 
     # Quality tracking
     quality_history: deque = field(default_factory=lambda: deque(maxlen=5))
@@ -295,16 +296,16 @@ class CrossTimestepClusterAmortization:
         if cache is None:
             return True, "no_cache"
 
-        steps_since_full = cache.last_full_cluster_timestep - timestep
-        # Note: timesteps decrease in diffusion (1000 -> 0)
-        # So steps_since_full will be positive if we clustered earlier
+        # Use call counts instead of timestep differences
+        # (timesteps can have large gaps, e.g., 1000->966->933 with gaps of 33-34)
+        calls_since_full = cache.calls_since_full_cluster
 
         # Check minimum interval (prevent thrashing)
-        if steps_since_full < self.config.min_recluster_interval:
+        if calls_since_full < self.config.min_recluster_interval:
             return False, "min_interval"
 
         # Check maximum interval (force periodic refresh)
-        if steps_since_full >= self.config.max_recluster_interval:
+        if calls_since_full >= self.config.max_recluster_interval:
             return True, "max_interval"
 
         # Adaptive quality-based decision
@@ -492,6 +493,7 @@ class CrossTimestepClusterAmortization:
         cache.q_cluster_sizes = q_cluster_sizes.cpu()
         cache.k_cluster_sizes = k_cluster_sizes.cpu()
         cache.last_update_timestep = timestep
+        cache.calls_since_full_cluster += 1  # Track calls for interval-based re-clustering
 
         if self.config.update_only_iters > 1:
             cache.q_cluster_ids = q_cluster_ids.cpu()
