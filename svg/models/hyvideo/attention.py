@@ -1060,6 +1060,7 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
             self._ctaa_video_full_map = full_attention_map
             self._ctaa_video_centroid_map = centroid_attention_map
             self._ctaa_video_centroid_weights = centroid_attn_weights
+            self._ctaa_video_qc_num = self.num_q_centroids  # Remember original Q cluster count
             self._ctaa_video_kc_num = self.num_k_centroids  # Remember original K cluster count
             # For compatibility, dynamic_map is the full attention map
             dynamic_map = full_attention_map
@@ -1154,28 +1155,44 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
             # CTAA: Use hierarchical sparse attention if enabled
             if self.ctaa_enabled and hasattr(self, '_ctaa_video_full_map'):
                 # Extend CTAA maps for text token clusters added by post-processing
-                # Text tokens are appended as extra K clusters - use full attention for them
+                # Text tokens are appended as extra Q and K clusters - use full attention for them
                 B, H, qc_num_post, kc_num_post = dyn_map.shape
+                video_qc_num = self._ctaa_video_qc_num
                 video_kc_num = self._ctaa_video_kc_num
-                extra_kc = kc_num_post - video_kc_num  # Number of text clusters added
+                extra_qc = qc_num_post - video_qc_num  # Number of text Q clusters added
+                extra_kc = kc_num_post - video_kc_num  # Number of text K clusters added
 
+                full_attention_map = self._ctaa_video_full_map
+                centroid_attention_map = self._ctaa_video_centroid_map
+                centroid_attn_weights = self._ctaa_video_centroid_weights
+
+                # Pad Q dimension (rows) if text Q clusters were added
+                if extra_qc > 0:
+                    # Full attention: text Q clusters attend to all K clusters
+                    full_q_pad = torch.ones(B, H, extra_qc, video_kc_num, dtype=torch.bool, device=dyn_map.device)
+                    full_attention_map = torch.cat([full_attention_map, full_q_pad], dim=2)
+
+                    # Centroid attention: text Q clusters don't use centroid attention
+                    centroid_q_pad = torch.zeros(B, H, extra_qc, video_kc_num, dtype=torch.bool, device=dyn_map.device)
+                    centroid_attention_map = torch.cat([centroid_attention_map, centroid_q_pad], dim=2)
+
+                    # Centroid weights: text Q clusters have zero weight
+                    weights_q_pad = torch.zeros(B, H, extra_qc, video_kc_num, dtype=centroid_attn_weights.dtype, device=dyn_map.device)
+                    centroid_attn_weights = torch.cat([centroid_attn_weights, weights_q_pad], dim=2)
+
+                # Pad K dimension (columns) if text K clusters were added
                 if extra_kc > 0:
-                    # Pad CTAA maps for text clusters
-                    # Full attention map: text clusters get full attention (True)
-                    full_map_pad = torch.ones(B, H, qc_num_post, extra_kc, dtype=torch.bool, device=dyn_map.device)
-                    full_attention_map = torch.cat([self._ctaa_video_full_map, full_map_pad], dim=-1)
+                    # Full attention: all Q clusters attend to text K clusters
+                    full_k_pad = torch.ones(B, H, qc_num_post, extra_kc, dtype=torch.bool, device=dyn_map.device)
+                    full_attention_map = torch.cat([full_attention_map, full_k_pad], dim=3)
 
-                    # Centroid attention map: text clusters get no centroid attention (False)
-                    centroid_map_pad = torch.zeros(B, H, qc_num_post, extra_kc, dtype=torch.bool, device=dyn_map.device)
-                    centroid_attention_map = torch.cat([self._ctaa_video_centroid_map, centroid_map_pad], dim=-1)
+                    # Centroid attention: no centroid attention for text K clusters
+                    centroid_k_pad = torch.zeros(B, H, qc_num_post, extra_kc, dtype=torch.bool, device=dyn_map.device)
+                    centroid_attention_map = torch.cat([centroid_attention_map, centroid_k_pad], dim=3)
 
-                    # Centroid weights: text clusters have zero weight (no centroid attention)
-                    weights_pad = torch.zeros(B, H, qc_num_post, extra_kc, dtype=self._ctaa_video_centroid_weights.dtype, device=dyn_map.device)
-                    centroid_attn_weights = torch.cat([self._ctaa_video_centroid_weights, weights_pad], dim=-1)
-                else:
-                    full_attention_map = self._ctaa_video_full_map
-                    centroid_attention_map = self._ctaa_video_centroid_map
-                    centroid_attn_weights = self._ctaa_video_centroid_weights
+                    # Centroid weights: text K clusters have zero weight
+                    weights_k_pad = torch.zeros(B, H, qc_num_post, extra_kc, dtype=centroid_attn_weights.dtype, device=dyn_map.device)
+                    centroid_attn_weights = torch.cat([centroid_attn_weights, weights_k_pad], dim=3)
 
                 # Hierarchical attention: full + centroid (memory-optimized)
                 output_permuted = hierarchical_sparse_attention_fwd(
