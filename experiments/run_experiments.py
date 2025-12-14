@@ -14,9 +14,11 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import sys
 import time
+from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
@@ -105,6 +107,7 @@ def run_single_experiment(
         reset_ctca,
         reset_ctaa_statistics,
     )
+    from svg.models.hyvideo.utils import get_prompt_length
     from svg.offload import enable_offloading, pre_encode_and_offload, OffloadConfig
     from svg.utils.seed import seed_everything
 
@@ -181,9 +184,44 @@ def run_single_experiment(
     # Pre-encode prompts
     pre_encoded_embeds = pre_encode_and_offload(pipe, prompt, None)
 
+    # Get prompt length for attention setup
+    prompt_length = get_prompt_length(pipe, prompt)
+
+    # Compute warmup parameters (matching main inference script)
+    transformer_config = pipe.transformer.config
+    total_layers = transformer_config.num_layers + transformer_config.num_single_layers
+
+    # Default warmup percentages
+    first_layers_fp_pct = 0.025  # 2.5% of layers
+    first_times_fp_pct = 0.075   # 7.5% of timesteps
+
+    # Convert percentages to actual values
+    num_fp_timesteps = math.floor(first_times_fp_pct * num_inference_steps)
+    num_fp_layers = math.floor(first_layers_fp_pct * total_layers)
+
+    # Compute first_times_fp from scheduler timesteps
+    ref_scheduler = deepcopy(pipe.scheduler)
+    ref_scheduler.set_timesteps(num_inference_steps)
+    if num_fp_timesteps > 0:
+        first_times_fp = ref_scheduler.timesteps[num_fp_timesteps - 1].item() - 1
+    else:
+        first_times_fp = 1001  # 1000 is the first timestep
+    first_layers_fp = num_fp_layers
+
     # Replace attention
     replace_hyvideo_flashattention(pipe)
-    replace_hyvideo_attention(pipe, pattern="SAP_CTCA")
+    replace_hyvideo_attention(
+        pipe,
+        height,
+        width,
+        num_frames,
+        prompt_length,
+        first_layers_fp=first_layers_fp,
+        first_times_fp=first_times_fp,
+        pattern="SAP_CTCA",
+        num_q_centroids=50,
+        num_k_centroids=200,
+    )
 
     # Reset statistics before generation
     reset_ctca()
