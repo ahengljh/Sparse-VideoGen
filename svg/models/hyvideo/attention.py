@@ -579,9 +579,9 @@ class Hunyuan_SVGAttn_Processor2_0:
         # Determine if we use Full Attention to calculate
         full_attention_flag = False
 
-        if self.layer_idx < self.first_layers_fp:
+        if self.layer_idx < (self.first_layers_fp or 0):
             full_attention_flag = True
-        if timestep[0] > self.first_times_fp:
+        if timestep[0] > (self.first_times_fp or 0):
             full_attention_flag = True
 
         # print(f"Full Attention Flag: {full_attention_flag}")
@@ -819,9 +819,9 @@ class Hunyuan_SAPAttn_Processor2_0(Hunyuan_SVGAttn_Processor2_0):
         # Determine if we use Full Attention to calculate
         full_attention_flag = False
 
-        if self.layer_idx < self.first_layers_fp:
+        if self.layer_idx < (self.first_layers_fp or 0):
             full_attention_flag = True
-        if timestep[0] > self.first_times_fp:
+        if timestep[0] > (self.first_times_fp or 0):
             full_attention_flag = True
 
         # Sparse attention is now available via Triton fallback even without FlashInfer
@@ -1103,9 +1103,9 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         # Determine if we use Full Attention to calculate
         full_attention_flag = False
 
-        if self.layer_idx < self.first_layers_fp:
+        if self.layer_idx < (self.first_layers_fp or 0):
             full_attention_flag = True
-        if timestep[0] > self.first_times_fp:
+        if timestep[0] > (self.first_times_fp or 0):
             full_attention_flag = True
 
         # Sparse attention is now available via Triton fallback even without FlashInfer
