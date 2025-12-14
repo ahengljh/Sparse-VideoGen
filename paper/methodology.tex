@@ -1,0 +1,225 @@
+% Methodology Section for CTCA/CTAA Paper
+% Compile with: pdflatex methodology.tex
+
+\section{Methodology}
+\label{sec:methodology}
+
+We present \textbf{Cross-Timestep Amortization} (CTA), a suite of techniques that exploit temporal coherence in diffusion models to accelerate sparse attention computation. Our approach consists of two complementary components: \textbf{Cross-Timestep Cluster Amortization} (CTCA) for reducing K-means clustering overhead, and \textbf{Cross-Timestep Attention Amortization} (CTAA) for hierarchical sparse attention computation. Figure~\ref{fig:overview} illustrates the overall architecture.
+
+\subsection{Preliminaries}
+\label{sec:preliminaries}
+
+\paragraph{Video Diffusion Transformers.}
+Video diffusion models generate videos by iteratively denoising a latent representation $\mathbf{z}_t$ over $T$ timesteps. At each timestep $t$, a transformer processes the latent through self-attention layers:
+\begin{equation}
+    \text{Attention}(\mathbf{Q}, \mathbf{K}, \mathbf{V}) = \text{softmax}\left(\frac{\mathbf{Q}\mathbf{K}^\top}{\sqrt{d}}\right)\mathbf{V}
+\end{equation}
+where $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{N \times d}$ are query, key, and value matrices with sequence length $N$ and head dimension $d$. For video generation, $N$ can exceed 100,000 tokens, making full attention with $\mathcal{O}(N^2)$ complexity prohibitively expensive.
+
+\paragraph{Semantic-Aware Permutation (SAP).}
+SAP~\cite{sap} addresses this by clustering tokens using K-means and permuting them to achieve block-diagonal sparsity:
+\begin{equation}
+    \mathbf{Q}' = \mathbf{P}_Q \mathbf{Q}, \quad \mathbf{K}' = \mathbf{P}_K \mathbf{K}, \quad \mathbf{V}' = \mathbf{P}_K \mathbf{V}
+\end{equation}
+where $\mathbf{P}_Q$ and $\mathbf{P}_K$ are permutation matrices derived from K-means clustering with $C_Q$ query clusters and $C_K$ key clusters. A dynamic attention map $\mathbf{M} \in \{0,1\}^{C_Q \times C_K}$ determines which cluster pairs attend to each other, achieving sparse attention with complexity $\mathcal{O}(N \cdot B)$ where $B$ is the effective block size.
+
+\paragraph{The Clustering Bottleneck.}
+While SAP reduces attention complexity, K-means clustering introduces significant overhead. For each attention layer at each timestep, clustering requires:
+\begin{equation}
+    \mathcal{T}_{\text{kmeans}} = \mathcal{O}(N \cdot C \cdot I \cdot d)
+\end{equation}
+where $C$ is the number of clusters and $I$ is the number of iterations. With 60 layers and 50 timesteps, this results in 3,000 clustering operations per video generation.
+
+\subsection{Key Insight: Temporal Coherence}
+\label{sec:temporal_coherence}
+
+Our key observation is that latent representations in diffusion models exhibit strong \textit{temporal coherence}—they change smoothly across consecutive timesteps. Formally, for latent representations $\mathbf{z}_t$ and $\mathbf{z}_{t-1}$:
+\begin{equation}
+    \|\mathbf{z}_t - \mathbf{z}_{t-1}\|_2 \ll \|\mathbf{z}_t\|_2
+\end{equation}
+
+This coherence has two important implications:
+\begin{enumerate}
+    \item \textbf{Cluster Stability}: Token cluster assignments remain largely stable across timesteps, with only boundary tokens shifting between clusters.
+    \item \textbf{Attention Pattern Stability}: The importance distribution across cluster pairs changes gradually, allowing for hierarchical approximation.
+\end{enumerate}
+
+We exploit both properties to amortize computation across timesteps, achieving substantial speedup without quality degradation.
+
+\subsection{Cross-Timestep Cluster Amortization (CTCA)}
+\label{sec:ctca}
+
+CTCA reduces K-means overhead by intelligently reusing cluster assignments across timesteps. Instead of performing full clustering at every step, we maintain a cluster cache and selectively update it based on quality metrics.
+
+\paragraph{Cluster Cache.}
+For each attention layer $\ell$, we maintain a cache $\mathcal{C}^\ell$ containing:
+\begin{equation}
+    \mathcal{C}^\ell = \{(\mathbf{c}_Q, \mathbf{c}_K, \mathbf{a}_Q, \mathbf{a}_K, t_{\text{last}})\}
+\end{equation}
+where $\mathbf{c}_Q, \mathbf{c}_K$ are cluster centroids, $\mathbf{a}_Q, \mathbf{a}_K$ are token-to-cluster assignments, and $t_{\text{last}}$ is the timestep of last full clustering.
+
+\paragraph{Adaptive Reclustering.}
+At each timestep, we decide whether to perform full reclustering or reuse cached assignments based on two criteria:
+
+\textit{Quality Criterion}: We measure cluster quality using the silhouette-like score:
+\begin{equation}
+    Q(\mathbf{a}, \mathbf{X}) = 1 - \frac{\sum_{i} \|\mathbf{x}_i - \mathbf{c}_{a_i}\|_2}{\sum_{i} \|\mathbf{x}_i - \bar{\mathbf{x}}\|_2}
+\end{equation}
+where $\mathbf{x}_i$ is the $i$-th token, $\mathbf{c}_{a_i}$ is its assigned centroid, and $\bar{\mathbf{x}}$ is the global mean. If $Q < \tau_q$ (quality threshold), we trigger reclustering.
+
+\textit{Interval Criterion}: To prevent drift accumulation, we enforce reclustering after $\Delta_{\max}$ timesteps regardless of quality.
+
+\paragraph{Centroid Update.}
+When reusing assignments, we efficiently update centroids without full clustering:
+\begin{equation}
+    \mathbf{c}_k^{(t)} = \frac{1}{|S_k|} \sum_{i \in S_k} \mathbf{x}_i^{(t)}
+\end{equation}
+where $S_k = \{i : a_i = k\}$ is the set of tokens assigned to cluster $k$. This reduces complexity from $\mathcal{O}(NCI)$ to $\mathcal{O}(NC)$.
+
+The complete CTCA algorithm is presented in Algorithm~\ref{alg:ctca}.
+
+\begin{algorithm}[t]
+\caption{Cross-Timestep Cluster Amortization (CTCA)}
+\label{alg:ctca}
+\begin{algorithmic}[1]
+\REQUIRE Tokens $\mathbf{X}$, cache $\mathcal{C}$, quality threshold $\tau_q$, max interval $\Delta_{\max}$
+\ENSURE Cluster assignments $\mathbf{a}$, centroids $\mathbf{c}$
+
+\STATE $\Delta \gets t_{\text{current}} - t_{\text{last}}$
+\IF{$\mathcal{C}$ is empty \OR $\Delta \geq \Delta_{\max}$}
+    \STATE $\mathbf{a}, \mathbf{c} \gets \text{KMeans}(\mathbf{X})$ \COMMENT{Full clustering}
+    \STATE Update $\mathcal{C}$ with $(\mathbf{a}, \mathbf{c}, t_{\text{current}})$
+\ELSE
+    \STATE $\mathbf{c}' \gets \text{UpdateCentroids}(\mathbf{X}, \mathcal{C}.\mathbf{a})$
+    \STATE $Q \gets \text{ComputeQuality}(\mathbf{X}, \mathbf{c}', \mathcal{C}.\mathbf{a})$
+    \IF{$Q < \tau_q$}
+        \STATE $\mathbf{a}, \mathbf{c} \gets \text{KMeans}(\mathbf{X})$ \COMMENT{Quality-triggered}
+        \STATE Update $\mathcal{C}$
+    \ELSE
+        \STATE $\mathbf{a} \gets \mathcal{C}.\mathbf{a}$, $\mathbf{c} \gets \mathbf{c}'$ \COMMENT{Reuse}
+    \ENDIF
+\ENDIF
+\RETURN $\mathbf{a}, \mathbf{c}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Cross-Timestep Attention Amortization (CTAA)}
+\label{sec:ctaa}
+
+While CTCA accelerates clustering, the dominant cost in sparse attention is still the attention computation itself. CTAA introduces a hierarchical attention mechanism that further exploits temporal coherence in attention patterns.
+
+\paragraph{Hierarchical Attention Tiers.}
+We partition cluster pairs into three tiers based on their attention importance (Figure~\ref{fig:ctaa_tiers}):
+
+\begin{enumerate}
+    \item \textbf{Full Attention} ($\mathcal{F}$): High-importance pairs receive standard token-level attention.
+    \item \textbf{Centroid Attention} ($\mathcal{A}$): Medium-importance pairs use centroid-to-centroid attention as approximation.
+    \item \textbf{Skip} ($\mathcal{S}$): Low-importance pairs are skipped entirely.
+\end{enumerate}
+
+\paragraph{Importance Estimation.}
+We estimate the importance of cluster pair $(i, j)$ using centroid dot products:
+\begin{equation}
+    w_{ij} = \frac{\exp(\mathbf{c}_Q^{(i)} \cdot \mathbf{c}_K^{(j)} / \sqrt{d})}{\sum_{j'} \exp(\mathbf{c}_Q^{(i)} \cdot \mathbf{c}_K^{(j')} / \sqrt{d})}
+\end{equation}
+
+For each query cluster $i$, we sort key clusters by importance and apply top-$p$ selection:
+\begin{align}
+    \mathcal{F}_i &= \{j : \sum_{j' \leq j} w_{ij'} \leq p_{\text{full}}\} \\
+    \mathcal{A}_i &= \{j : p_{\text{full}} < \sum_{j' \leq j} w_{ij'} \leq p_{\text{total}}\} \\
+    \mathcal{S}_i &= \{j : \sum_{j' \leq j} w_{ij'} > p_{\text{total}}\}
+\end{align}
+
+\paragraph{Centroid Attention Computation.}
+For cluster pairs in $\mathcal{A}$, we compute attention at the centroid level:
+\begin{equation}
+    \mathbf{O}_{\text{centroid}}^{(i)} = \sum_{j \in \mathcal{A}_i} \alpha_{ij} \cdot \bar{\mathbf{V}}^{(j)}
+\end{equation}
+where $\bar{\mathbf{V}}^{(j)} = \frac{1}{|S_j|}\sum_{k \in S_j} \mathbf{v}_k$ is the mean value vector for cluster $j$, and $\alpha_{ij}$ is the centroid-level attention weight. This reduces complexity from $\mathcal{O}(|S_i| \cdot |S_j|)$ to $\mathcal{O}(1)$ per cluster pair.
+
+\paragraph{Output Aggregation.}
+The final output combines contributions from all tiers:
+\begin{equation}
+    \mathbf{O}^{(i)} = \mathbf{O}_{\text{full}}^{(i)} + \mathbf{O}_{\text{centroid}}^{(i)}
+\end{equation}
+
+The complete CTAA procedure is detailed in Algorithm~\ref{alg:ctaa}.
+
+\begin{algorithm}[t]
+\caption{Cross-Timestep Attention Amortization (CTAA)}
+\label{alg:ctaa}
+\begin{algorithmic}[1]
+\REQUIRE $\mathbf{Q}, \mathbf{K}, \mathbf{V}$, assignments $\mathbf{a}_Q, \mathbf{a}_K$, thresholds $p_{\text{full}}, p_{\text{total}}$
+\ENSURE Output $\mathbf{O}$
+
+\STATE Compute centroids: $\mathbf{c}_Q, \mathbf{c}_K, \bar{\mathbf{V}}$
+\STATE Compute importance: $\mathbf{W} = \text{softmax}(\mathbf{c}_Q \mathbf{c}_K^\top / \sqrt{d})$
+\STATE Identify tiers: $\mathcal{F}, \mathcal{A}, \mathcal{S} \gets \text{TopPSelection}(\mathbf{W}, p_{\text{full}}, p_{\text{total}})$
+
+\STATE $\mathbf{O} \gets \mathbf{0}$
+\FOR{each query cluster $i$}
+    \STATE \COMMENT{Full attention for high-importance pairs}
+    \FOR{$j \in \mathcal{F}_i$}
+        \STATE $\mathbf{O}[S_i] \mathrel{+}= \text{Attention}(\mathbf{Q}[S_i], \mathbf{K}[S_j], \mathbf{V}[S_j])$
+    \ENDFOR
+    \STATE \COMMENT{Centroid attention for medium-importance pairs}
+    \STATE $\mathbf{O}[S_i] \mathrel{+}= \sum_{j \in \mathcal{A}_i} W_{ij} \cdot \bar{\mathbf{V}}^{(j)}$
+\ENDFOR
+\RETURN $\mathbf{O}$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Complexity Analysis}
+\label{sec:complexity}
+
+Table~\ref{tab:complexity} summarizes the computational complexity of each component.
+
+\begin{table}[h]
+\centering
+\caption{Computational complexity comparison}
+\label{tab:complexity}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Operation} & \textbf{Baseline} & \textbf{Ours} \\
+\midrule
+K-means per layer & $\mathcal{O}(NCI)$ & $\mathcal{O}(NC/R)$ \\
+Attention (full) & $\mathcal{O}(N^2)$ & $\mathcal{O}(p_{\text{full}} \cdot N \cdot B)$ \\
+Attention (centroid) & - & $\mathcal{O}(C_Q \cdot C_K)$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+where $R$ is the CTCA reuse ratio (typically $\sim$7$\times$), $B$ is the average block size, and $p_{\text{full}}$ is the full attention threshold (typically 0.7).
+
+\paragraph{Theoretical Speedup.}
+The combined speedup from CTCA and CTAA can be estimated as:
+\begin{equation}
+    S_{\text{total}} = \frac{1}{p_{\text{full}} + p_{\text{centroid}} \cdot \epsilon + p_{\text{skip}} \cdot 0}
+\end{equation}
+where $\epsilon \ll 1$ is the relative cost of centroid attention. With typical parameters ($p_{\text{full}}=0.7$, $p_{\text{total}}=0.95$), this yields $S_{\text{total}} \approx 1.4\times$ on attention computation, combined with $7\times$ K-means speedup from CTCA.
+
+\subsection{Memory-Efficient Implementation}
+\label{sec:memory}
+
+To enable video generation on consumer GPUs (24GB), we implement dynamic layer offloading:
+
+\paragraph{Layer Windowing.}
+We maintain a sliding window of $W$ transformer layers on GPU (typically $W=8$), with remaining layers on CPU. As inference progresses, we prefetch the next layer asynchronously:
+\begin{equation}
+    \text{GPU}_t = \{\ell : t \leq \ell < t + W\}, \quad \text{Prefetch: } \ell_{t+W}
+\end{equation}
+
+\paragraph{CPU Cluster Cache.}
+CTCA caches are stored on CPU memory to minimize GPU memory pressure. The cache size scales as $\mathcal{O}(L \cdot C \cdot d)$ where $L$ is the number of layers, resulting in approximately 3GB of CPU memory usage.
+
+\subsection{Implementation Details}
+\label{sec:implementation}
+
+We implement CTCA and CTAA as drop-in replacements for standard attention in the HunyuanVideo~\cite{hunyuanvideo} pipeline using PyTorch and Triton. Key implementation choices:
+
+\begin{itemize}
+    \item \textbf{CTCA Parameters}: Quality threshold $\tau_q = 0.8$, max interval $\Delta_{\max} = 10$ timesteps, adaptive interval based on quality trends.
+    \item \textbf{CTAA Parameters}: $p_{\text{full}} = 0.7$, $p_{\text{total}} = 0.95$, configurable for quality-speed tradeoff.
+    \item \textbf{Warmup}: First 7.5\% of timesteps and 2.5\% of layers use full precision attention to ensure generation quality.
+    \item \textbf{Hardware}: Tested on NVIDIA RTX 4090 (24GB) with dynamic offloading enabled.
+\end{itemize}
