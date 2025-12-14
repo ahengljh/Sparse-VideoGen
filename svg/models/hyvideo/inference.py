@@ -223,14 +223,18 @@ def replace_hyvideo_attention(
         for layer_idx, m in enumerate(pipe.transformer.transformer_blocks):
             self_attn = m.attn
             self_attn.processor = AttnModule(layer_idx=layer_idx)
-            print(f"Replaced SAP+CTCA block for Double Stream Transformer at layer {layer_idx}")
+            print(f"Replaced SAP+CTCA block for Double Stream Transformer at layer {layer_idx}", flush=True)
 
         for layer_idx, m in enumerate(pipe.transformer.single_transformer_blocks):
             self_attn = m.attn
             self_attn.processor = AttnModule(layer_idx=layer_idx + len(pipe.transformer.transformer_blocks))
             print(
-                f"Replaced SAP+CTCA block for Single Stream Transformer at layer {layer_idx + len(pipe.transformer.transformer_blocks)}"
+                f"Replaced SAP+CTCA block for Single Stream Transformer at layer {layer_idx + len(pipe.transformer.transformer_blocks)}",
+                flush=True
             )
+
+        total_layers = len(pipe.transformer.transformer_blocks) + len(pipe.transformer.single_transformer_blocks)
+        logger.info(f"SAP+CTCA replacement complete: {total_layers} layers configured")
 
     else:
         assert pattern == "dense", f"Invalid pattern: {pattern}"
