@@ -1152,18 +1152,18 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
 
             # CTAA: Use hierarchical sparse attention if enabled
             if self.ctaa_enabled and hasattr(self, '_ctaa_full_map'):
-                # Compute V centroids for centroid attention
-                v_centroids = compute_v_centroids_triton(v_perm, kc_sz_s)
-
-                # Hierarchical attention: full + centroid
+                # Hierarchical attention: full + centroid (memory-optimized)
+                # Note: v_centroids computed inside hierarchical_sparse_attention_fwd
                 output_permuted = hierarchical_sparse_attention_fwd(
                     q_perm, k_perm, v_perm,
                     self._ctaa_full_map,
                     self._ctaa_centroid_map,
                     self._ctaa_centroid_weights,
                     qc_sz_s, kc_sz_s,
-                    v_centroids=v_centroids,
+                    v_centroids=None,  # Computed internally
                 )
+                # Free CTAA maps immediately after use to reduce memory pressure
+                del self._ctaa_full_map, self._ctaa_centroid_map, self._ctaa_centroid_weights
             else:
                 # Standard sparse attention (FlashInfer if available, otherwise Triton)
                 output_permuted = dynamic_block_sparse_fwd_flashinfer(

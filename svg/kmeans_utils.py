@@ -1102,15 +1102,14 @@ def hierarchical_sparse_attention_fwd(
     v_centroids=None,       # [B, H, kc_num, D] - optional pre-computed V centroids
 ):
     """
-    CTAA Hierarchical Sparse Attention.
+    CTAA Hierarchical Sparse Attention (Memory-Optimized).
 
     Combines:
     1. Full token-level attention for important cluster pairs (high attention weight)
     2. Centroid-level attention for moderate cluster pairs (lower attention weight)
 
-    The output properly combines both contributions, weighted by their attention masses.
-
-    Memory: Only requires V centroids (~6MB), no per-block caching needed.
+    Memory optimization: Computes centroid attention first (small tensors), then
+    adds to full attention output in-place to minimize peak memory usage.
 
     Args:
         q_permuted: Query tensor permuted by Q clusters [B, H, S, D]
@@ -1128,53 +1127,63 @@ def hierarchical_sparse_attention_fwd(
     """
     B, H, S, D = q_permuted.shape
     qc_num = qc_size.shape[-1]
-    kc_num = kc_size.shape[-1]
     device = q_permuted.device
-    dtype = q_permuted.dtype
 
-    # 1. Compute full attention for important blocks
+    # Memory optimization: Compute centroid attention FIRST (small tensors)
+    # Then compute full attention and add centroid contribution in-place
+
+    # 1. Compute V centroids if not provided (~6MB, very small)
+    if v_centroids is None:
+        v_centroids = compute_v_centroids_triton(v_permuted, kc_size)
+
+    # 2. Compute centroid attention contribution (small tensor operations)
+    # Mask weights to only include centroid attention blocks - use in-place multiply
+    # centroid_attn_weights is [B, H, qc_num, kc_num], centroid_attention_map is bool
+    # Avoid creating float copy of mask - multiply directly
+    masked_weights = centroid_attn_weights * centroid_attention_map  # stays in original dtype
+
+    # Centroid attention output per Q cluster: [B, H, qc_num, D]
+    # This is small: 1 * 24 * 400 * 128 * 2 = 2.4MB
+    centroid_out_per_cluster = torch.matmul(masked_weights.float(), v_centroids)
+    del masked_weights  # Free immediately
+
+    # 3. Build token-to-cluster mapping (reuse across calls if possible)
+    qc_cum = torch.cumsum(
+        torch.cat([torch.zeros_like(qc_size[..., :1]), qc_size], dim=-1),
+        dim=-1
+    ).long()
+
+    # Create mapping tensor - int32 is enough and uses less memory
+    token_to_qc = torch.zeros(B, H, S, dtype=torch.int32, device=device)
+    for qc in range(qc_num):
+        start = qc_cum[0, 0, qc].item()
+        end = qc_cum[0, 0, qc + 1].item()
+        token_to_qc[:, :, start:end] = qc
+
+    # 4. Gather centroid output for each token position
+    token_to_qc_long = token_to_qc.long().unsqueeze(-1).expand(-1, -1, -1, D)
+    centroid_out = torch.gather(centroid_out_per_cluster, 2, token_to_qc_long)
+    del token_to_qc, token_to_qc_long, centroid_out_per_cluster, qc_cum  # Free immediately
+
+    # Convert centroid_out to same dtype as input
+    centroid_out = centroid_out.to(q_permuted.dtype)
+
+    # 5. Free V centroids if we computed them
+    del v_centroids
+
+    # 6. NOW compute full attention (this is the memory-heavy part)
+    # The centroid_out tensor is small enough to keep alive during this
     full_output = dynamic_block_sparse_fwd_flashinfer(
         q_permuted, k_permuted, v_permuted,
         full_attention_map, qc_size, kc_size,
         is_cpu=False
     )
 
-    # 2. Compute V centroids if not provided
-    if v_centroids is None:
-        v_centroids = compute_v_centroids_triton(v_permuted, kc_size)
+    # 7. Add centroid contribution in-place to save memory
+    full_output.add_(centroid_out)
+    del centroid_out  # Free the centroid output
 
-    # 3. Compute centroid attention contribution
-    # Mask weights to only include centroid attention blocks
-    masked_weights = centroid_attn_weights * centroid_attention_map.float()  # [B, H, qc_num, kc_num]
-
-    # Centroid attention output per Q cluster
-    # [B, H, qc_num, kc_num] @ [B, H, kc_num, D] -> [B, H, qc_num, D]
-    centroid_out_per_cluster = torch.matmul(masked_weights, v_centroids)
-
-    # 4. Broadcast centroid output to all tokens in each Q cluster
-    qc_cum = torch.cumsum(
-        torch.cat([torch.zeros_like(qc_size[..., :1]), qc_size], dim=-1),
-        dim=-1
-    ).long()
-
-    # 4. Broadcast centroid output to all tokens efficiently
-    # Build token-to-cluster mapping
-    token_to_qc = torch.zeros(B, H, S, dtype=torch.long, device=device)
-    for qc in range(qc_num):
-        start = qc_cum[0, 0, qc]
-        end = qc_cum[0, 0, qc + 1]
-        token_to_qc[:, :, start:end] = qc
-
-    # Gather centroid output for each token position
-    token_to_qc_expanded = token_to_qc.unsqueeze(-1).expand(-1, -1, -1, D)
-    centroid_out = torch.gather(centroid_out_per_cluster, 2, token_to_qc_expanded)
-
-    # 5. Combine: full attention output + centroid attention contribution
-    # Both are weighted by their respective attention probabilities,
-    # so they sum correctly (attention weights sum to ~1 across both tiers)
-    output = full_output + centroid_out
-
-    return output
+    return full_output
 
 
 # CTAA statistics tracking
