@@ -77,9 +77,14 @@ FLASHINFER_AVAILABLE = FLASHINFER_DENSE_AVAILABLE
 from ...kernels.triton.permute import apply_inverse_permutation_triton, permute_tensor_by_labels_triton
 from ...kmeans_utils import (
     batch_kmeans_Euclid,
+    compute_v_centroids_triton,
     density_calculation,
     dynamic_block_sparse_fwd_flashinfer,
+    hierarchical_sparse_attention_fwd,
     identify_dynamic_map,
+    identify_hierarchical_dynamic_map,
+    print_ctaa_statistics,
+    reset_ctaa_statistics,
 )
 from ...ctca import CrossTimestepClusterAmortization, CTCAConfig, create_ctca
 from ...logger import logger
@@ -914,6 +919,11 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
     ctca_max_interval: int = 10
     ctca_verbose: bool = False
 
+    # CTAA configuration (Cross-Timestep Attention Amortization)
+    ctaa_enabled: bool = False  # Enable hierarchical sparse attention
+    ctaa_p_full: float = 0.7    # Top-p for full token attention
+    ctaa_p_total: float = 0.95  # Top-p including centroid attention
+
     @classmethod
     def initialize_ctca(cls):
         """
@@ -1019,6 +1029,7 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
     def semantic_aware_permutation(self, query, key, value, timestep, layer_idx):
         """
         Override to pass timestep to kmeans_clustering for CTCA.
+        Supports CTAA hierarchical attention when enabled.
         """
         cfg, num_heads, seq_len, dim = query.size()
 
@@ -1031,14 +1042,35 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         q_cluster_sizes = qcluster_sizes.view(cfg, num_heads, self.num_q_centroids)
         k_cluster_sizes = kcluster_sizes.view(cfg, num_heads, self.num_k_centroids)
 
-        dynamic_map = identify_dynamic_map(
-            qcentroids.view(cfg, num_heads, self.num_q_centroids, dim),
-            kcentroids.view(cfg, num_heads, self.num_k_centroids, dim),
-            q_cluster_sizes,
-            k_cluster_sizes,
-            self.top_p_kmeans,
-            self.min_kc_ratio,
-        )
+        qcentroids_view = qcentroids.view(cfg, num_heads, self.num_q_centroids, dim)
+        kcentroids_view = kcentroids.view(cfg, num_heads, self.num_k_centroids, dim)
+
+        # CTAA: Use hierarchical dynamic map if enabled
+        if self.ctaa_enabled:
+            full_attention_map, centroid_attention_map, centroid_attn_weights = identify_hierarchical_dynamic_map(
+                qcentroids_view,
+                kcentroids_view,
+                q_cluster_sizes,
+                k_cluster_sizes,
+                self.ctaa_p_full,
+                self.ctaa_p_total,
+                self.min_kc_ratio,
+            )
+            # Store for use in attention_core_logic
+            self._ctaa_full_map = full_attention_map
+            self._ctaa_centroid_map = centroid_attention_map
+            self._ctaa_centroid_weights = centroid_attn_weights
+            # For compatibility, dynamic_map is the full attention map
+            dynamic_map = full_attention_map
+        else:
+            dynamic_map = identify_dynamic_map(
+                qcentroids_view,
+                kcentroids_view,
+                q_cluster_sizes,
+                k_cluster_sizes,
+                self.top_p_kmeans,
+                self.min_kc_ratio,
+            )
 
         # 3. Permute the query, key, value
         q_permuted, q_sorted_indices = permute_tensor_by_labels_triton(query, qlabels, dim=2)
@@ -1118,10 +1150,25 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
                 unprompt_length,
             )
 
-            # Uses FlashInfer if available, otherwise falls back to Triton
-            output_permuted = dynamic_block_sparse_fwd_flashinfer(
-                q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, is_cpu=False
-            )
+            # CTAA: Use hierarchical sparse attention if enabled
+            if self.ctaa_enabled and hasattr(self, '_ctaa_full_map'):
+                # Compute V centroids for centroid attention
+                v_centroids = compute_v_centroids_triton(v_perm, kc_sz_s)
+
+                # Hierarchical attention: full + centroid
+                output_permuted = hierarchical_sparse_attention_fwd(
+                    q_perm, k_perm, v_perm,
+                    self._ctaa_full_map,
+                    self._ctaa_centroid_map,
+                    self._ctaa_centroid_weights,
+                    qc_sz_s, kc_sz_s,
+                    v_centroids=v_centroids,
+                )
+            else:
+                # Standard sparse attention (FlashInfer if available, otherwise Triton)
+                output_permuted = dynamic_block_sparse_fwd_flashinfer(
+                    q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, is_cpu=False
+                )
 
             attn_output = apply_inverse_permutation_triton(output_permuted, q_sorted_indices, dim=2)
 

@@ -896,6 +896,331 @@ def identify_dynamic_map(
     return dynamic_map
 
 
+# ============================================================================
+# CTAA: Cross-Timestep Attention Amortization
+# Hierarchical Sparse Attention with Centroid Approximation
+# ============================================================================
+
+@time_logging_decorator("Level 4 - compute V centroids")
+def compute_v_centroids_from_permuted(v_permuted, kc_size):
+    """
+    Compute V centroids from permuted V tensor (tokens already sorted by cluster).
+
+    Args:
+        v_permuted: Value tensor [B, H, S, D] already permuted/sorted by K clusters
+        kc_size: K cluster sizes [B, H, kc_num]
+
+    Returns:
+        v_centroids: [B, H, kc_num, D]
+    """
+    B, H, S, D = v_permuted.shape
+    kc_num = kc_size.shape[-1]
+    device = v_permuted.device
+    dtype = v_permuted.dtype
+
+    # Compute cumulative sizes for indexing
+    kc_cum = torch.cumsum(torch.cat([torch.zeros_like(kc_size[..., :1]), kc_size], dim=-1), dim=-1).long()
+
+    # Compute centroids by averaging within each cluster
+    v_centroids = torch.zeros(B, H, kc_num, D, device=device, dtype=dtype)
+
+    # Use a loop for clarity (can be optimized with scatter if needed)
+    for b in range(B):
+        for h in range(H):
+            for kc in range(kc_num):
+                start = kc_cum[b, h, kc]
+                end = kc_cum[b, h, kc + 1]
+                if end > start:
+                    v_centroids[b, h, kc] = v_permuted[b, h, start:end].mean(dim=0)
+
+    return v_centroids
+
+
+@triton.jit
+def _compute_v_centroids_kernel(
+    v_ptr, out_ptr, kc_cum_ptr,
+    stride_vb, stride_vh, stride_vs, stride_vd,
+    stride_ob, stride_oh, stride_ok, stride_od,
+    stride_kb, stride_kh, stride_kk,
+    B: tl.constexpr, H: tl.constexpr, kc_num: tl.constexpr, D: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Triton kernel for computing V centroids efficiently."""
+    pid = tl.program_id(0)
+
+    # Decode batch, head, cluster indices
+    bh_idx = pid // kc_num
+    kc_idx = pid % kc_num
+    b_idx = bh_idx // H
+    h_idx = bh_idx % H
+
+    # Get cluster boundaries
+    kc_cum_base = kc_cum_ptr + b_idx * stride_kb + h_idx * stride_kh
+    start = tl.load(kc_cum_base + kc_idx * stride_kk)
+    end = tl.load(kc_cum_base + (kc_idx + 1) * stride_kk)
+    count = end - start
+
+    # Initialize accumulator
+    d_offs = tl.arange(0, BLOCK_D)
+    acc = tl.zeros((BLOCK_D,), dtype=tl.float32)
+
+    # Accumulate values in cluster
+    for s in range(start, end):
+        v_offs = b_idx * stride_vb + h_idx * stride_vh + s * stride_vs + d_offs * stride_vd
+        v_vals = tl.load(v_ptr + v_offs, mask=d_offs < D, other=0.0)
+        acc += v_vals.to(tl.float32)
+
+    # Average
+    if count > 0:
+        acc = acc / count.to(tl.float32)
+
+    # Store
+    out_offs = b_idx * stride_ob + h_idx * stride_oh + kc_idx * stride_ok + d_offs * stride_od
+    tl.store(out_ptr + out_offs, acc.to(tl.float16), mask=d_offs < D)
+
+
+def compute_v_centroids_triton(v_permuted, kc_size):
+    """
+    Compute V centroids using Triton kernel for efficiency.
+
+    Args:
+        v_permuted: Value tensor [B, H, S, D] already permuted by K clusters
+        kc_size: K cluster sizes [B, H, kc_num]
+
+    Returns:
+        v_centroids: [B, H, kc_num, D]
+    """
+    B, H, S, D = v_permuted.shape
+    kc_num = kc_size.shape[-1]
+    device = v_permuted.device
+
+    # Compute cumulative sizes
+    kc_cum = torch.cumsum(
+        torch.cat([torch.zeros_like(kc_size[..., :1]), kc_size], dim=-1),
+        dim=-1
+    ).int()
+
+    # Output tensor
+    v_centroids = torch.zeros(B, H, kc_num, D, device=device, dtype=v_permuted.dtype)
+
+    # Launch kernel
+    grid = (B * H * kc_num,)
+    _compute_v_centroids_kernel[grid](
+        v_permuted, v_centroids, kc_cum,
+        v_permuted.stride(0), v_permuted.stride(1), v_permuted.stride(2), v_permuted.stride(3),
+        v_centroids.stride(0), v_centroids.stride(1), v_centroids.stride(2), v_centroids.stride(3),
+        kc_cum.stride(0), kc_cum.stride(1), kc_cum.stride(2),
+        B, H, kc_num, D,
+        BLOCK_D=D,
+    )
+
+    return v_centroids
+
+
+@time_logging_decorator("Level 4 - identify hierarchical dynamic map for CTAA")
+def identify_hierarchical_dynamic_map(
+    query_centroids,
+    key_centroids,
+    q_cluster_sizes,
+    k_cluster_sizes,
+    p_full,       # Top-p threshold for full attention (e.g., 0.7)
+    p_total,      # Top-p threshold including centroid attention (e.g., 0.95)
+    min_kc_ratio=0,
+):
+    """
+    Identify hierarchical attention maps for CTAA.
+
+    Tier 1 (Full attention):     Blocks within top p_full probability mass
+    Tier 2 (Centroid attention): Blocks between p_full and p_total
+    Tier 3 (Skip):               Blocks beyond p_total
+
+    Args:
+        query_centroids: [B, H, qc_num, D]
+        key_centroids: [B, H, kc_num, D]
+        q_cluster_sizes: [B, H, qc_num]
+        k_cluster_sizes: [B, H, kc_num]
+        p_full: Probability threshold for full attention (e.g., 0.7)
+        p_total: Total probability threshold including centroid (e.g., 0.95)
+        min_kc_ratio: Minimum ratio of K clusters to always include
+
+    Returns:
+        full_attention_map: [B, H, qc_num, kc_num] - blocks for full attention
+        centroid_attention_map: [B, H, qc_num, kc_num] - blocks for centroid attention
+        centroid_attn_weights: [B, H, qc_num, kc_num] - pre-computed attention weights
+    """
+    B, H, qc_num, D = query_centroids.shape
+    kc_num = key_centroids.shape[2]
+    device = query_centroids.device
+
+    # Compute centroid attention scores
+    attn_scores = torch.matmul(query_centroids, key_centroids.transpose(-2, -1)) / (D**0.5)
+    k_weights = k_cluster_sizes.unsqueeze(-2).float()
+
+    # Weighted softmax - these ARE the attention weights at cluster level
+    centroid_attn_weights = weighted_softmax(attn_scores, k_weights)
+    sorted_probs, sorted_indices = torch.sort(centroid_attn_weights, dim=-1, descending=True)
+
+    cumsum_probs = torch.cumsum(sorted_probs, dim=-1)
+
+    # Full attention: blocks within top p_full cumulative probability
+    full_remove = cumsum_probs > p_full
+    full_remove[..., 1:] = full_remove[..., :-1].clone()
+    full_remove[..., 0] = False
+
+    # Centroid attention: blocks between p_full and p_total
+    total_remove = cumsum_probs > p_total
+    total_remove[..., 1:] = total_remove[..., :-1].clone()
+    total_remove[..., 0] = False
+
+    if min_kc_ratio > 0:
+        preserve_length = int(min_kc_ratio * kc_num)
+        full_remove[..., :preserve_length] = False
+
+    # Create maps
+    full_keep = ~full_remove
+    centroid_keep = full_remove & (~total_remove)  # Between p_full and p_total
+
+    full_attention_map = torch.zeros(B, H, qc_num, kc_num, dtype=torch.bool, device=device)
+    centroid_attention_map = torch.zeros(B, H, qc_num, kc_num, dtype=torch.bool, device=device)
+
+    full_attention_map.scatter_(-1, sorted_indices, full_keep)
+    centroid_attention_map.scatter_(-1, sorted_indices, centroid_keep)
+
+    return full_attention_map, centroid_attention_map, centroid_attn_weights
+
+
+@time_logging_decorator("Level 3 - CTAA hierarchical sparse attention")
+def hierarchical_sparse_attention_fwd(
+    q_permuted,             # [B, H, S, D] - query permuted by Q clusters
+    k_permuted,             # [B, H, S, D] - key permuted by K clusters
+    v_permuted,             # [B, H, S, D] - value permuted by K clusters
+    full_attention_map,     # [B, H, qc_num, kc_num] - full attention blocks
+    centroid_attention_map, # [B, H, qc_num, kc_num] - centroid attention blocks
+    centroid_attn_weights,  # [B, H, qc_num, kc_num] - centroid-level attention weights
+    qc_size,                # [B, H, qc_num]
+    kc_size,                # [B, H, kc_num]
+    v_centroids=None,       # [B, H, kc_num, D] - optional pre-computed V centroids
+):
+    """
+    CTAA Hierarchical Sparse Attention.
+
+    Combines:
+    1. Full token-level attention for important cluster pairs (high attention weight)
+    2. Centroid-level attention for moderate cluster pairs (lower attention weight)
+
+    The output properly combines both contributions, weighted by their attention masses.
+
+    Memory: Only requires V centroids (~6MB), no per-block caching needed.
+
+    Args:
+        q_permuted: Query tensor permuted by Q clusters [B, H, S, D]
+        k_permuted: Key tensor permuted by K clusters [B, H, S, D]
+        v_permuted: Value tensor permuted by K clusters [B, H, S, D]
+        full_attention_map: Boolean mask for full attention blocks
+        centroid_attention_map: Boolean mask for centroid attention blocks
+        centroid_attn_weights: Pre-computed centroid attention weights
+        qc_size: Query cluster sizes
+        kc_size: Key cluster sizes
+        v_centroids: Pre-computed V centroids (computed if not provided)
+
+    Returns:
+        output: Attention output [B, H, S, D]
+    """
+    B, H, S, D = q_permuted.shape
+    qc_num = qc_size.shape[-1]
+    kc_num = kc_size.shape[-1]
+    device = q_permuted.device
+    dtype = q_permuted.dtype
+
+    # 1. Compute full attention for important blocks
+    full_output = dynamic_block_sparse_fwd_flashinfer(
+        q_permuted, k_permuted, v_permuted,
+        full_attention_map, qc_size, kc_size,
+        is_cpu=False
+    )
+
+    # 2. Compute V centroids if not provided
+    if v_centroids is None:
+        v_centroids = compute_v_centroids_triton(v_permuted, kc_size)
+
+    # 3. Compute centroid attention contribution
+    # Mask weights to only include centroid attention blocks
+    masked_weights = centroid_attn_weights * centroid_attention_map.float()  # [B, H, qc_num, kc_num]
+
+    # Centroid attention output per Q cluster
+    # [B, H, qc_num, kc_num] @ [B, H, kc_num, D] -> [B, H, qc_num, D]
+    centroid_out_per_cluster = torch.matmul(masked_weights, v_centroids)
+
+    # 4. Broadcast centroid output to all tokens in each Q cluster
+    qc_cum = torch.cumsum(
+        torch.cat([torch.zeros_like(qc_size[..., :1]), qc_size], dim=-1),
+        dim=-1
+    ).long()
+
+    # 4. Broadcast centroid output to all tokens efficiently
+    # Build token-to-cluster mapping
+    token_to_qc = torch.zeros(B, H, S, dtype=torch.long, device=device)
+    for qc in range(qc_num):
+        start = qc_cum[0, 0, qc]
+        end = qc_cum[0, 0, qc + 1]
+        token_to_qc[:, :, start:end] = qc
+
+    # Gather centroid output for each token position
+    token_to_qc_expanded = token_to_qc.unsqueeze(-1).expand(-1, -1, -1, D)
+    centroid_out = torch.gather(centroid_out_per_cluster, 2, token_to_qc_expanded)
+
+    # 5. Combine: full attention output + centroid attention contribution
+    # Both are weighted by their respective attention probabilities,
+    # so they sum correctly (attention weights sum to ~1 across both tiers)
+    output = full_output + centroid_out
+
+    return output
+
+
+# CTAA statistics tracking
+_CTAA_STATS = {
+    'full_attention_blocks': 0,
+    'centroid_attention_blocks': 0,
+    'total_blocks': 0,
+    'calls': 0,
+}
+
+
+def get_ctaa_statistics():
+    """Get CTAA performance statistics."""
+    stats = _CTAA_STATS.copy()
+    if stats['total_blocks'] > 0:
+        stats['full_ratio'] = stats['full_attention_blocks'] / stats['total_blocks']
+        stats['centroid_ratio'] = stats['centroid_attention_blocks'] / stats['total_blocks']
+        stats['skip_ratio'] = 1.0 - stats['full_ratio'] - stats['centroid_ratio']
+    return stats
+
+
+def reset_ctaa_statistics():
+    """Reset CTAA statistics."""
+    global _CTAA_STATS
+    _CTAA_STATS = {
+        'full_attention_blocks': 0,
+        'centroid_attention_blocks': 0,
+        'total_blocks': 0,
+        'calls': 0,
+    }
+
+
+def print_ctaa_statistics():
+    """Print CTAA statistics."""
+    stats = get_ctaa_statistics()
+    print("\n" + "=" * 60)
+    print("CTAA (Cross-Timestep Attention Amortization) Statistics")
+    print("=" * 60)
+    print(f"Total calls:              {stats['calls']}")
+    print(f"Total block pairs:        {stats['total_blocks']}")
+    print(f"Full attention blocks:    {stats['full_attention_blocks']} ({stats.get('full_ratio', 0)*100:.1f}%)")
+    print(f"Centroid attention blocks:{stats['centroid_attention_blocks']} ({stats.get('centroid_ratio', 0)*100:.1f}%)")
+    print(f"Skipped blocks:           {stats['total_blocks'] - stats['full_attention_blocks'] - stats['centroid_attention_blocks']} ({stats.get('skip_ratio', 0)*100:.1f}%)")
+    print("=" * 60 + "\n")
+
+
 # --- Functions from analyze/dynamic_block_sparse_attention.py ---
 
 
