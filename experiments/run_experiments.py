@@ -191,9 +191,9 @@ def run_single_experiment(
     transformer_config = pipe.transformer.config
     total_layers = transformer_config.num_layers + transformer_config.num_single_layers
 
-    # Default warmup percentages
-    first_layers_fp_pct = 0.025  # 2.5% of layers
-    first_times_fp_pct = 0.075   # 7.5% of timesteps
+    # Default warmup percentages (matching bash script)
+    first_layers_fp_pct = 0.03   # 3% of layers (same as bash script)
+    first_times_fp_pct = 0.10    # 10% of timesteps (same as bash script)
 
     # Convert percentages to actual values
     num_fp_timesteps = math.floor(first_times_fp_pct * num_inference_steps)
@@ -208,7 +208,7 @@ def run_single_experiment(
         first_times_fp = 1001  # 1000 is the first timestep
     first_layers_fp = num_fp_layers
 
-    # Replace attention
+    # Replace attention with parameters matching bash script
     replace_hyvideo_flashattention(pipe)
     replace_hyvideo_attention(
         pipe,
@@ -219,8 +219,18 @@ def run_single_experiment(
         first_layers_fp=first_layers_fp,
         first_times_fp=first_times_fp,
         pattern="SAP_CTCA",
-        num_q_centroids=50,
-        num_k_centroids=200,
+        # SAP parameters (matching bash script for quality)
+        num_q_centroids=400,         # Was 50, should be 400
+        num_k_centroids=1000,        # Was 200, should be 1000
+        top_p_kmeans=0.9,            # Was not set
+        min_kc_ratio=0.10,           # Was not set (defaulted to 0)
+        kmeans_iter_init=50,         # Was not set (defaulted to 0)
+        kmeans_iter_step=2,          # Was not set (defaulted to 0)
+        # CTCA parameters
+        ctca_quality_threshold=0.80,
+        ctca_adaptive=True,
+        ctca_min_interval=2,
+        ctca_max_interval=10,
     )
 
     # Reset statistics before generation

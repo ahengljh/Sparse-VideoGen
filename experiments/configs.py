@@ -180,7 +180,7 @@ PARAMETER_SWEEP_SUITE = ExperimentSuite(
     name="parameter_sweep",
     configs=generate_parameter_sweep_configs(),
     prompts=QUICK_TEST_PROMPTS,
-    num_inference_steps=30,
+    num_inference_steps=50,  # Match bash script for quality
     resolution="480p",
     num_runs=1,
 )
