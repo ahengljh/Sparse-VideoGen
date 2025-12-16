@@ -15,6 +15,11 @@
 
 set -e
 
+# Memory-safety knobs (override externally if desired)
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export SVG_ROPE_CHUNK_SIZE="${SVG_ROPE_CHUNK_SIZE:-4096}"
+export SVG_ROPE_FORCE_FP32="${SVG_ROPE_FORCE_FP32:-1}"
+
 # Model configuration
 model_id="tencent/HunyuanVideo"
 height=720

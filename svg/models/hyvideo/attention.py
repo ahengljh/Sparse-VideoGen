@@ -1,4 +1,5 @@
 import json
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -266,6 +267,105 @@ try:
 except ImportError:
     ENABLE_FAST_KERNEL = False
 
+    _ROPE_CHUNK_SIZE = int(os.environ.get("SVG_ROPE_CHUNK_SIZE", "4096"))
+    _ROPE_FORCE_FP32 = os.environ.get("SVG_ROPE_FORCE_FP32", "1") not in ("0", "false", "False")
+
+    def _reshape_rope_freqs_for_x(cos: torch.Tensor, sin: torch.Tensor, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Make cos/sin broadcastable to x with the convention (..., seq, dim).
+
+        Expected common cases:
+        - cos/sin: [seq, dim]  -> expand to [1, 1, seq, dim] for x: [B, H, seq, dim]
+        - cos/sin: [1, seq, dim] -> expand to [1, 1, seq, dim]
+        - cos/sin: [B, 1, seq, dim] or [1, 1, seq, dim] -> already broadcastable
+        """
+        # Some pipelines return freqs as (..., seq, 1, dim) or (seq, 1, dim).
+        if cos.ndim >= 3 and cos.shape[-2] == 1 and cos.shape[-1] == x.shape[-1]:
+            cos = cos.squeeze(-2)
+            sin = sin.squeeze(-2)
+        if x.ndim == 4:
+            if cos.ndim == 2:
+                cos = cos.unsqueeze(0).unsqueeze(0)
+                sin = sin.unsqueeze(0).unsqueeze(0)
+            elif cos.ndim == 3:
+                cos = cos.unsqueeze(1)
+                sin = sin.unsqueeze(1)
+        while cos.ndim < x.ndim:
+            cos = cos.unsqueeze(0)
+            sin = sin.unsqueeze(0)
+        return cos, sin
+
+    def _apply_rotary_emb_inplace_chunked(x: torch.Tensor, freqs_cis: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+        """
+        Low-memory rotary embedding application.
+
+        Diffusers' apply_rotary_emb upcasts full tensors to float32, which can OOM at 720p.
+        We apply RoPE in-place and chunk over the sequence dimension to cap peak memory.
+
+        Environment knobs:
+        - SVG_ROPE_CHUNK_SIZE (default: 4096)
+        - SVG_ROPE_FORCE_FP32 (default: 1) -> 0 computes in x.dtype
+        """
+        if freqs_cis is None:
+            return x
+
+        cos, sin = freqs_cis[0], freqs_cis[1]
+        if cos.device != x.device:
+            cos = cos.to(x.device, non_blocking=True)
+            sin = sin.to(x.device, non_blocking=True)
+
+        cos, sin = _reshape_rope_freqs_for_x(cos, sin, x)
+
+        seq_len = x.shape[-2]
+        dim = x.shape[-1]
+        half = dim // 2
+
+        # Handle the common case where freqs are computed for a longer sequence
+        # (e.g., including text tokens) but x only contains the image portion.
+        if cos.shape[-2] != seq_len:
+            if cos.shape[-2] >= seq_len:
+                cos = cos[..., :seq_len, :]
+                sin = sin[..., :seq_len, :]
+            else:
+                raise ValueError(f"RoPE freqs shorter than x: freqs={cos.shape[-2]} x={seq_len}")
+
+        chunk = max(256, int(_ROPE_CHUNK_SIZE))
+        use_fp32 = _ROPE_FORCE_FP32 and x.dtype in (torch.float16, torch.bfloat16)
+        compute_dtype = torch.float32 if use_fp32 else x.dtype
+
+        for start in range(0, seq_len, chunk):
+            end = min(start + chunk, seq_len)
+            x_chunk = x[..., start:end, :]
+            cos_chunk = cos[..., start:end, :]
+            sin_chunk = sin[..., start:end, :]
+
+            if cos_chunk.dtype != compute_dtype:
+                cos_chunk = cos_chunk.to(dtype=compute_dtype)
+                sin_chunk = sin_chunk.to(dtype=compute_dtype)
+
+            x1 = x_chunk[..., :half].to(dtype=compute_dtype)
+            x2 = x_chunk[..., half:].to(dtype=compute_dtype)
+            cos1 = cos_chunk[..., :half]
+            sin1 = sin_chunk[..., :half]
+            cos2 = cos_chunk[..., half:]
+            sin2 = sin_chunk[..., half:]
+
+            # out1 = x1 * cos1 - x2 * sin1
+            out1 = x1.mul(cos1)
+            out1.addcmul_(x2, sin1, value=-1.0)
+
+            # out2 = x2 * cos2 + x1 * sin2
+            out2 = x2.mul(cos2)
+            out2.addcmul_(x1, sin2, value=1.0)
+
+            # Write back in-place (copy_ will cast if needed)
+            x_chunk[..., :half].copy_(out1)
+            x_chunk[..., half:].copy_(out2)
+
+            del x_chunk, cos_chunk, sin_chunk, x1, x2, cos1, sin1, cos2, sin2, out1, out2
+
+        return x
+
     def apply_qk_norm(attn_norm_q, attn_norm_k, query, key):
         if attn_norm_q is not None:
             query = attn_norm_q(query)
@@ -274,23 +374,23 @@ except ImportError:
         return query, key
 
     def apply_qk_rope_single(query, key, image_rotary_emb, encoder_hidden_states):
-
         txt_len = encoder_hidden_states.shape[1]
-        img_q, txt_q = query[:, :, :-txt_len], query[:, :, -txt_len:]
-        img_k, txt_k = key[:, :, :-txt_len], key[:, :, -txt_len:]
 
-        img_q = apply_rotary_emb(img_q, image_rotary_emb)
-        img_k = apply_rotary_emb(img_k, image_rotary_emb)
+        if txt_len > 0:
+            img_q = query[:, :, :-txt_len]
+            img_k = key[:, :, :-txt_len]
+        else:
+            img_q = query
+            img_k = key
 
-        query = torch.cat([img_q, txt_q], dim=2)
-        key = torch.cat([img_k, txt_k], dim=2)
+        _apply_rotary_emb_inplace_chunked(img_q, image_rotary_emb)
+        _apply_rotary_emb_inplace_chunked(img_k, image_rotary_emb)
 
         return query, key
 
     def apply_qk_rope_double(query, key, image_rotary_emb):
-
-        query = apply_rotary_emb(query, image_rotary_emb)
-        key = apply_rotary_emb(key, image_rotary_emb)
+        _apply_rotary_emb_inplace_chunked(query, image_rotary_emb)
+        _apply_rotary_emb_inplace_chunked(key, image_rotary_emb)
         return query, key
 
     logger.info(f"{Color.red}Disable Fast CUDA and Triton Kernels{Color.reset}")
