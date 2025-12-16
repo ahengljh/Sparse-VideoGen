@@ -41,7 +41,9 @@ class MLP2of4SparsityConfig:
     outlier_min_channels: int = 0
     outlier_metric: str = "l2"  # {"l2", "maxabs"}
     use_semi_structured: bool = True  # Use torch.sparse.to_sparse_semi_structured if available
-    drop_dense_after_prepare: bool = False  # Only safe when NOT offloading layers back to CPU
+    # If semi-structured weights are prepared, keep the dense pruned weight on CPU to avoid
+    # doubling GPU weight memory (important for 24GB GPUs).
+    keep_dense_pruned_weight_on_gpu: bool = False
     verbose: bool = False
 
 
@@ -124,26 +126,27 @@ class OutlierSplit2of4Linear(nn.Module):
         outlier_mask[outlier_idx] = True
         self._sparse_idx_cpu = all_idx[~outlier_mask]
 
-        # Materialize weights (buffers) in the same device/dtype as base.
+        # Materialize weights as frozen Parameters so offloading/pinning logic
+        # (which operates on parameters) continues to work.
         device = base.weight.device
         dtype = base.weight.dtype
 
         # Dense outliers
         outlier_weight = base.weight.detach()[self._outlier_idx_cpu.to(device)]
-        self.register_buffer("outlier_weight", outlier_weight.to(dtype), persistent=True)
+        self.outlier_weight = nn.Parameter(outlier_weight.to(dtype), requires_grad=False)
         if self.has_bias:
             outlier_bias = base.bias.detach()[self._outlier_idx_cpu.to(device)]
-            self.register_buffer("outlier_bias", outlier_bias.to(dtype), persistent=True)
+            self.outlier_bias = nn.Parameter(outlier_bias.to(dtype), requires_grad=False)
         else:
             self.outlier_bias = None
 
         # Sparse remainder (2:4 pruned)
         sparse_weight = base.weight.detach()[self._sparse_idx_cpu.to(device)]
         sparse_weight = _prune_2of4_rows(sparse_weight)
-        self.register_buffer("sparse_weight", sparse_weight.to(dtype), persistent=True)
+        self.sparse_weight = nn.Parameter(sparse_weight.to(dtype), requires_grad=False)
         if self.has_bias:
             sparse_bias = base.bias.detach()[self._sparse_idx_cpu.to(device)]
-            self.register_buffer("sparse_bias", sparse_bias.to(dtype), persistent=True)
+            self.sparse_bias = nn.Parameter(sparse_bias.to(dtype), requires_grad=False)
         else:
             self.sparse_bias = None
 
@@ -190,6 +193,15 @@ class OutlierSplit2of4Linear(nn.Module):
         try:
             self._sparse_weight_ss = torch.sparse.to_sparse_semi_structured(self.sparse_weight.contiguous())
             self._sparse_weight_ss_device = dev
+            if not self.config.keep_dense_pruned_weight_on_gpu:
+                # Move dense pruned weight back to CPU to avoid doubling GPU weight memory.
+                # Keep it pinned when possible for faster future transfers.
+                cpu_tensor = self.sparse_weight.detach().to("cpu")
+                if not cpu_tensor.is_pinned():
+                    pinned = torch.empty_like(cpu_tensor, pin_memory=True)
+                    pinned.copy_(cpu_tensor)
+                    cpu_tensor = pinned
+                self.sparse_weight = nn.Parameter(cpu_tensor, requires_grad=False)
         except Exception as e:
             # Fall back to dense pruned weights.
             if self.config.verbose:

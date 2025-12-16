@@ -36,7 +36,7 @@ first_times_fp=0.1
 first_layers_fp=0.03
 
 # Offload configuration
-offload_num_layers=8              # fallback window
+offload_num_layers=8              # fallback window (also acts as a cap unless --offload_auto_allow_increase is set)
 offload_max_fraction=0.90         # target fraction of total VRAM
 offload_activation_reserve_gb=4.0 # reserve for activations/caches
 offload_cuda_overhead_gb=0.5      # reserve for CUDA workspaces
@@ -87,4 +87,3 @@ echo "============================================"
 echo "Done! Video saved to ${output_dir}/output.mp4"
 echo "Logs saved to ${logging_dir}/"
 echo "============================================"
-

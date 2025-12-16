@@ -40,7 +40,7 @@ first_times_fp=0.1
 first_layers_fp=0.03
 
 # Offload configuration
-# Fallback window if auto-tune is disabled / unsupported
+# Fallback window (also acts as a cap unless --offload_auto_allow_increase is set)
 offload_num_layers=8
 offload_max_fraction=0.90          # Target fraction of total VRAM
 offload_activation_reserve_gb=4.0  # Reserve for activations/caches
@@ -99,4 +99,3 @@ echo "============================================"
 echo "Done! Video saved to ${output_dir}/output.mp4"
 echo "Logs saved to ${logging_dir}/"
 echo "============================================"
-

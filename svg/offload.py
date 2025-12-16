@@ -62,6 +62,7 @@ class OffloadConfig:
     max_memory_fraction: float = 0.90   # Fraction of total VRAM to target (0-1)
     activation_reserve_gb: float = 4.0  # Conservative reserve for activations/caches
     cuda_overhead_gb: float = 0.5       # CUDA runtime/kernel workspace headroom
+    auto_tune_allow_increase: bool = False  # If False, auto-tune will never exceed num_layers_on_gpu
 
     # Debugging
     verbose: bool = False
@@ -203,7 +204,20 @@ class LayerOffloadManager:
         # Calculate how many layers fit
         if self._layer_memory_mb > 0:
             max_layers = int((available_gb * 1024) / self._layer_memory_mb)
-            self.config.num_layers_on_gpu = max(1, min(max_layers, self.num_layers))
+            suggested = max(1, min(max_layers, self.num_layers))
+
+            # IMPORTANT: In offload mode, "auto" should be safe by default.
+            # Unless explicitly allowed, never increase the window above the user-provided value.
+            # This prevents unintentionally loading many layers and OOMing during large attention ops.
+            if self.config.auto_tune_allow_increase:
+                tuned = suggested
+            else:
+                if self.config.num_layers_on_gpu and self.config.num_layers_on_gpu > 0:
+                    tuned = min(self.config.num_layers_on_gpu, suggested)
+                else:
+                    tuned = suggested
+
+            self.config.num_layers_on_gpu = tuned
 
             # Prefetch should not exceed the window.
             if self.config.num_layers_on_gpu <= 1:
@@ -1033,6 +1047,7 @@ def enable_offloading(
     max_memory_fraction: float = 0.90,
     activation_reserve_gb: float = 4.0,
     cuda_overhead_gb: float = 0.5,
+    auto_tune_allow_increase: bool = False,
     verbose: bool = False,
 ) -> Tuple[LayerOffloadManager, List]:
     """
@@ -1054,6 +1069,7 @@ def enable_offloading(
         max_memory_fraction: Fraction of total VRAM to target when auto_tune_layers_on_gpu is enabled
         activation_reserve_gb: Heuristic reserve for activations/caches (subtracted from budget)
         cuda_overhead_gb: Additional headroom for CUDA runtime/kernel workspaces
+        auto_tune_allow_increase: If True, auto-tune may increase num_layers_on_gpu above the provided value
         verbose: Print debug information
 
     Returns:
@@ -1084,6 +1100,7 @@ def enable_offloading(
         max_memory_fraction=max_memory_fraction,
         activation_reserve_gb=activation_reserve_gb,
         cuda_overhead_gb=cuda_overhead_gb,
+        auto_tune_allow_increase=auto_tune_allow_increase,
         verbose=verbose,
     )
 

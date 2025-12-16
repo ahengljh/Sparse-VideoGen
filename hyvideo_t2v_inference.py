@@ -87,6 +87,7 @@ if __name__ == "__main__":
     parser.add_argument("--offload_max_fraction", type=float, default=0.90, help="When --offload_auto is set, target this fraction of total VRAM.")
     parser.add_argument("--offload_activation_reserve_gb", type=float, default=4.0, help="Reserve VRAM for activations/caches when auto-tuning offload.")
     parser.add_argument("--offload_cuda_overhead_gb", type=float, default=0.5, help="Extra VRAM headroom for CUDA workspaces when auto-tuning offload.")
+    parser.add_argument("--offload_auto_allow_increase", action="store_true", help="Allow auto-tune to increase num_layers_on_gpu above --offload_num_layers.")
 
     # Training-free MLP 2:4 sparsity (with outlier split)
     parser.add_argument("--enable_mlp_2of4", action="store_true", help="Enable training-free 2:4 structured sparsity for MLP linears (with outlier split).")
@@ -95,6 +96,7 @@ if __name__ == "__main__":
     parser.add_argument("--mlp_outlier_metric", type=str, default="l2", choices=["l2", "maxabs"], help="Metric for selecting outlier rows to keep dense.")
     parser.add_argument("--mlp_use_semi_structured", action="store_true", default=True, help="Use PyTorch semi-structured sparse kernels when available.")
     parser.add_argument("--mlp_no_semi_structured", action="store_false", dest="mlp_use_semi_structured", help="Disable semi-structured sparse kernels (use dense pruned weights).")
+    parser.add_argument("--mlp_keep_dense_pruned_weight_on_gpu", action="store_true", help="Keep dense pruned MLP weights on GPU even when semi-structured weights are prepared (uses more VRAM).")
     parser.add_argument("--mlp_sparsity_verbose", action="store_true", help="Enable verbose logging for MLP sparsity conversion.")
     parser.add_argument("--mlp_prepare_all", action="store_true", help="Pre-build semi-structured sparse weights upfront (recommended only when offload is disabled).")
 
@@ -223,6 +225,7 @@ if __name__ == "__main__":
             max_memory_fraction=args.offload_max_fraction,
             activation_reserve_gb=args.offload_activation_reserve_gb,
             cuda_overhead_gb=args.offload_cuda_overhead_gb,
+            auto_tune_allow_increase=args.offload_auto_allow_increase,
             verbose=args.offload_verbose,
         )
 
@@ -307,6 +310,7 @@ if __name__ == "__main__":
             outlier_min_channels=args.mlp_outlier_min_channels,
             outlier_metric=args.mlp_outlier_metric,
             use_semi_structured=args.mlp_use_semi_structured,
+            keep_dense_pruned_weight_on_gpu=args.mlp_keep_dense_pruned_weight_on_gpu,
             verbose=args.mlp_sparsity_verbose,
         )
 

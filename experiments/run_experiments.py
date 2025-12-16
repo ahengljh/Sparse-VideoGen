@@ -198,6 +198,7 @@ def run_single_experiment(
         max_memory_fraction=offload_config.max_memory_fraction,
         activation_reserve_gb=offload_config.activation_reserve_gb,
         cuda_overhead_gb=offload_config.cuda_overhead_gb,
+        auto_tune_allow_increase=offload_config.auto_tune_allow_increase,
         verbose=offload_config.verbose,
     )
 
