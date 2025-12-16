@@ -24,6 +24,7 @@ from svg.models.hyvideo.inference import (
 )
 from svg.models.hyvideo.utils import get_prompt_length
 from svg.offload import enable_offloading, pre_encode_and_offload, OffloadConfig
+from svg.sparsity import MLP2of4SparsityConfig, apply_mlp_2of4_sparsity
 
 from svg.logger import logger
 
@@ -82,6 +83,20 @@ if __name__ == "__main__":
     parser.add_argument("--offload_prefetch", action="store_true", default=True, help="Enable async prefetching of next layer.")
     parser.add_argument("--offload_no_prefetch", action="store_false", dest="offload_prefetch", help="Disable async prefetching.")
     parser.add_argument("--offload_verbose", action="store_true", help="Enable verbose offloading logging.")
+    parser.add_argument("--offload_auto", action="store_true", help="Auto-tune offloading window based on available VRAM.")
+    parser.add_argument("--offload_max_fraction", type=float, default=0.90, help="When --offload_auto is set, target this fraction of total VRAM.")
+    parser.add_argument("--offload_activation_reserve_gb", type=float, default=4.0, help="Reserve VRAM for activations/caches when auto-tuning offload.")
+    parser.add_argument("--offload_cuda_overhead_gb", type=float, default=0.5, help="Extra VRAM headroom for CUDA workspaces when auto-tuning offload.")
+
+    # Training-free MLP 2:4 sparsity (with outlier split)
+    parser.add_argument("--enable_mlp_2of4", action="store_true", help="Enable training-free 2:4 structured sparsity for MLP linears (with outlier split).")
+    parser.add_argument("--mlp_outlier_ratio", type=float, default=0.02, help="Fraction of MLP output channels to keep dense as outliers (e.g., 0.02 = 2%).")
+    parser.add_argument("--mlp_outlier_min_channels", type=int, default=0, help="Minimum number of outlier output channels to keep dense per Linear.")
+    parser.add_argument("--mlp_outlier_metric", type=str, default="l2", choices=["l2", "maxabs"], help="Metric for selecting outlier rows to keep dense.")
+    parser.add_argument("--mlp_use_semi_structured", action="store_true", default=True, help="Use PyTorch semi-structured sparse kernels when available.")
+    parser.add_argument("--mlp_no_semi_structured", action="store_false", dest="mlp_use_semi_structured", help="Disable semi-structured sparse kernels (use dense pruned weights).")
+    parser.add_argument("--mlp_sparsity_verbose", action="store_true", help="Enable verbose logging for MLP sparsity conversion.")
+    parser.add_argument("--mlp_prepare_all", action="store_true", help="Pre-build semi-structured sparse weights upfront (recommended only when offload is disabled).")
 
     args = parser.parse_args()
 
@@ -204,6 +219,10 @@ if __name__ == "__main__":
             enable_prefetch=args.offload_prefetch,
             num_layers_on_gpu=args.offload_num_layers,
             max_memory_gb=args.offload_max_memory_gb,
+            auto_tune_layers_on_gpu=args.offload_auto,
+            max_memory_fraction=args.offload_max_fraction,
+            activation_reserve_gb=args.offload_activation_reserve_gb,
+            cuda_overhead_gb=args.offload_cuda_overhead_gb,
             verbose=args.offload_verbose,
         )
 
@@ -277,6 +296,33 @@ if __name__ == "__main__":
         )
     else:
         assert args.pattern == "dense", f"Invalid pattern: {args.pattern}"
+
+    #########################################################
+    # Optional: Training-free 2:4 MLP sparsity (with outlier split)
+    #########################################################
+    if args.enable_mlp_2of4:
+        sparsity_cfg = MLP2of4SparsityConfig(
+            enabled=True,
+            outlier_ratio=args.mlp_outlier_ratio,
+            outlier_min_channels=args.mlp_outlier_min_channels,
+            outlier_metric=args.mlp_outlier_metric,
+            use_semi_structured=args.mlp_use_semi_structured,
+            verbose=args.mlp_sparsity_verbose,
+        )
+
+        replaced = 0
+        all_blocks = list(pipe.transformer.transformer_blocks) + list(pipe.transformer.single_transformer_blocks)
+        for block in all_blocks:
+            replaced += apply_mlp_2of4_sparsity(block, sparsity_cfg)
+        logger.info(f"Enabled MLP 2:4 sparsity on {replaced} Linear module(s)")
+
+        if args.mlp_prepare_all:
+            if args.enable_offload:
+                logger.warning("Skipping --mlp_prepare_all because offload is enabled (would rebuild caches repeatedly).")
+            else:
+                from svg.sparsity import prepare_module_for_sparse_inference
+                logger.info("Preparing semi-structured sparse weights for all sparsified modules...")
+                prepare_module_for_sparse_inference(pipe.transformer)
         
     # Print time logger
     for layer_idx, block in enumerate(pipe.transformer.transformer_blocks):

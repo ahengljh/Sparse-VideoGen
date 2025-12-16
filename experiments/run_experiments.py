@@ -174,15 +174,32 @@ def run_single_experiment(
     load_time = time.time() - load_start
     results['model_load_time'] = load_time
 
-    # Setup offloading
+    # Pre-encode prompts first (text encoders temporarily on GPU, then freed).
+    # This must happen BEFORE enabling transformer offloading to avoid VRAM spikes.
+    pre_encoded_embeds = pre_encode_and_offload(
+        pipe,
+        prompt=prompt,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+
+    # Setup offloading (text encoders are now offloaded/removed).
     offload_config = OffloadConfig(
         num_layers_on_gpu=8,
         enable_prefetch=True,
     )
-    offload_manager = enable_offloading(pipe, offload_config)
-
-    # Pre-encode prompts
-    pre_encoded_embeds = pre_encode_and_offload(pipe, prompt, None)
+    offload_manager, offload_hooks = enable_offloading(
+        pipe,
+        use_pinned_memory=offload_config.use_pinned_memory,
+        enable_prefetch=offload_config.enable_prefetch,
+        num_layers_on_gpu=offload_config.num_layers_on_gpu,
+        max_memory_gb=offload_config.max_memory_gb,
+        auto_tune_layers_on_gpu=offload_config.auto_tune_layers_on_gpu,
+        max_memory_fraction=offload_config.max_memory_fraction,
+        activation_reserve_gb=offload_config.activation_reserve_gb,
+        cuda_overhead_gb=offload_config.cuda_overhead_gb,
+        verbose=offload_config.verbose,
+    )
 
     # Get prompt length for attention setup
     prompt_length = get_prompt_length(pipe, prompt)
@@ -269,6 +286,12 @@ def run_single_experiment(
         json.dump(results, f, indent=2)
 
     # Cleanup
+    if 'offload_hooks' in locals() and offload_hooks is not None:
+        for h in offload_hooks:
+            try:
+                h.remove()
+            except Exception:
+                pass
     del pipe
     torch.cuda.empty_cache()
 

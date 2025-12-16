@@ -55,6 +55,14 @@ class OffloadConfig:
     # Memory budget (optional) - if set, auto-tune num_layers_on_gpu
     max_memory_gb: float = None     # e.g., 20.0 for 24GB GPU with headroom
 
+    # Auto budget controller (opt-in)
+    # If enabled and max_memory_gb is None, derive a budget from total VRAM.
+    # If max_memory_gb is set, it acts as a hard ceiling.
+    auto_tune_layers_on_gpu: bool = False
+    max_memory_fraction: float = 0.90   # Fraction of total VRAM to target (0-1)
+    activation_reserve_gb: float = 4.0  # Conservative reserve for activations/caches
+    cuda_overhead_gb: float = 0.5       # CUDA runtime/kernel workspace headroom
+
     # Debugging
     verbose: bool = False
 
@@ -112,10 +120,6 @@ class LayerOffloadManager:
         # Calculate per-layer memory
         self._layer_memory_mb = self._estimate_layer_memory()
 
-        # Auto-tune num_layers_on_gpu if max_memory_gb is specified
-        if config.max_memory_gb is not None:
-            self._auto_tune_layers_on_gpu()
-
         # Track layer locations
         self._layer_on_gpu: Dict[int, bool] = {}
         self._layer_pinned: Dict[int, bool] = {}
@@ -158,27 +162,60 @@ class LayerOffloadManager:
 
     def _auto_tune_layers_on_gpu(self):
         """Auto-tune the number of layers to keep on GPU based on memory budget."""
-        if self.config.max_memory_gb is None:
+        if not torch.cuda.is_available():
             return
 
-        # Reserve memory for:
-        # - VAE: ~300MB
-        # - Activations: ~3GB (conservative estimate for 720p video)
-        # - CUDA overhead: ~500MB
-        reserved_gb = 4.0
+        # Determine whether auto-tuning is enabled.
+        if self.config.max_memory_gb is None and not self.config.auto_tune_layers_on_gpu:
+            return
 
-        available_gb = self.config.max_memory_gb - reserved_gb
-        available_mb = available_gb * 1024
+        # Budget: either explicit max_memory_gb, or fraction of total VRAM.
+        if self.config.max_memory_gb is not None:
+            budget_gb = float(self.config.max_memory_gb)
+        else:
+            total_gb = torch.cuda.get_device_properties(torch.cuda.current_device()).total_memory / (1024**3)
+            fraction = float(self.config.max_memory_fraction)
+            fraction = max(0.50, min(0.98, fraction))
+            budget_gb = total_gb * fraction
+
+        # Current allocations include embedders/VAE already placed on GPU by setup_offloading_for_pipeline.
+        allocated_gb = torch.cuda.memory_allocated() / (1024**3)
+        # Account for other GPU processes: cap budget to what can be allocated right now.
+        try:
+            free_bytes, total_bytes = torch.cuda.mem_get_info()
+            free_gb = free_bytes / (1024**3)
+            max_allocatable_gb = allocated_gb + free_gb
+            budget_gb = min(budget_gb, max_allocatable_gb)
+        except Exception:
+            pass
+        reserve_gb = float(self.config.activation_reserve_gb) + float(self.config.cuda_overhead_gb)
+
+        available_gb = budget_gb - allocated_gb - reserve_gb
+        if available_gb <= 0:
+            self.config.num_layers_on_gpu = 1
+            self.config.prefetch_count = 0
+            logger.warning(
+                f"Auto-tune: insufficient budget (budget={budget_gb:.1f}GB, allocated={allocated_gb:.1f}GB, "
+                f"reserve={reserve_gb:.1f}GB). Forcing num_layers_on_gpu=1."
+            )
+            return
 
         # Calculate how many layers fit
         if self._layer_memory_mb > 0:
-            max_layers = int(available_mb / self._layer_memory_mb)
-            # Clamp to reasonable range
+            max_layers = int((available_gb * 1024) / self._layer_memory_mb)
             self.config.num_layers_on_gpu = max(1, min(max_layers, self.num_layers))
 
-            logger.info(f"Auto-tuned layers on GPU: {self.config.num_layers_on_gpu} "
-                       f"(~{self._layer_memory_mb:.1f}MB/layer, "
-                       f"{available_gb:.1f}GB available)")
+            # Prefetch should not exceed the window.
+            if self.config.num_layers_on_gpu <= 1:
+                self.config.prefetch_count = 0
+            else:
+                self.config.prefetch_count = min(self.config.prefetch_count, self.config.num_layers_on_gpu - 1)
+
+            logger.info(
+                f"Auto-tuned layers on GPU: {self.config.num_layers_on_gpu} "
+                f"(~{self._layer_memory_mb:.1f}MB/layer, budget={budget_gb:.1f}GB, "
+                f"allocated={allocated_gb:.1f}GB, reserve={reserve_gb:.1f}GB)"
+            )
 
     def prepare_for_inference(self):
         """
@@ -192,6 +229,11 @@ class LayerOffloadManager:
             return
 
         logger.info(f"Preparing {self.num_layers} layers for offloaded inference...")
+
+        # Auto-tune once we have a realistic view of current GPU allocations.
+        # At this point setup_offloading_for_pipeline has typically moved embedders/VAE to GPU
+        # while keeping transformer blocks on CPU.
+        self._auto_tune_layers_on_gpu()
 
         # Create CUDA streams
         if self.config.enable_prefetch:
@@ -237,6 +279,16 @@ class LayerOffloadManager:
         """Move a layer to CPU, optionally with pinned memory."""
         layer = self.all_blocks[layer_idx]
 
+        # IMPORTANT: cached sparse weights are not parameters/buffers, so they will NOT
+        # be moved by .to('cpu'). Clear them explicitly to avoid GPU memory leaks.
+        if getattr(layer, "_has_mlp_2of4_sparsity", False):
+            try:
+                from .sparsity import clear_module_sparse_cache
+                clear_module_sparse_cache(layer)
+            except Exception as e:
+                if self.config.verbose:
+                    logger.warning(f"Sparsity cache clear skipped for layer {layer_idx}: {e}")
+
         if use_pinned:
             # Move to CPU with pinned memory for faster future transfers
             for param in layer.parameters():
@@ -269,6 +321,15 @@ class LayerOffloadManager:
         """Move a layer to GPU."""
         layer = self.all_blocks[layer_idx]
         layer.to(self.config.compute_device, non_blocking=non_blocking)
+        # If the layer contains sparsified Linear modules, prepare any GPU-side caches
+        # (e.g., semi-structured sparse weights) on the current stream.
+        if getattr(layer, "_has_mlp_2of4_sparsity", False):
+            try:
+                from .sparsity import prepare_module_for_sparse_inference
+                prepare_module_for_sparse_inference(layer)
+            except Exception as e:
+                if self.config.verbose:
+                    logger.warning(f"Sparsity prepare skipped for layer {layer_idx}: {e}")
         self._layer_on_gpu[layer_idx] = True
         self.stats['gpu_loads'] += 1
 
@@ -968,6 +1029,10 @@ def enable_offloading(
     enable_prefetch: bool = True,
     num_layers_on_gpu: int = 6,
     max_memory_gb: Optional[float] = None,
+    auto_tune_layers_on_gpu: bool = False,
+    max_memory_fraction: float = 0.90,
+    activation_reserve_gb: float = 4.0,
+    cuda_overhead_gb: float = 0.5,
     verbose: bool = False,
 ) -> Tuple[LayerOffloadManager, List]:
     """
@@ -985,6 +1050,10 @@ def enable_offloading(
                           Recommended: 4-8 for 24GB, 10-15 for 40GB+
         max_memory_gb: If set, auto-tune num_layers_on_gpu to fit this budget
                        e.g., 20.0 for 24GB GPU with headroom
+        auto_tune_layers_on_gpu: If True, derive a budget from total VRAM (or max_memory_gb if set)
+        max_memory_fraction: Fraction of total VRAM to target when auto_tune_layers_on_gpu is enabled
+        activation_reserve_gb: Heuristic reserve for activations/caches (subtracted from budget)
+        cuda_overhead_gb: Additional headroom for CUDA runtime/kernel workspaces
         verbose: Print debug information
 
     Returns:
@@ -1011,6 +1080,10 @@ def enable_offloading(
         enable_prefetch=enable_prefetch,
         num_layers_on_gpu=num_layers_on_gpu,
         max_memory_gb=max_memory_gb,
+        auto_tune_layers_on_gpu=auto_tune_layers_on_gpu,
+        max_memory_fraction=max_memory_fraction,
+        activation_reserve_gb=activation_reserve_gb,
+        cuda_overhead_gb=cuda_overhead_gb,
         verbose=verbose,
     )
 
