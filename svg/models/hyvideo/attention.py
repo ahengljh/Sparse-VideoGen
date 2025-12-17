@@ -311,24 +311,21 @@ except ImportError:
             cos_chunk = cos[..., start:end, :]
             sin_chunk = sin[..., start:end, :]
 
-            # Clone chunk to avoid potential aliasing issues with in-place ops
-            x_chunk_input = x_chunk.clone()
-
             # Optionally upcast to FP32 for better numerical precision
             if _ROPE_FORCE_FP32 and original_dtype != torch.float32:
-                x_chunk_input = x_chunk_input.float()
+                # Clone and upcast when FP32 is forced
+                x_chunk_input = x_chunk.clone().float()
                 cos_chunk = cos_chunk.float()
                 sin_chunk = sin_chunk.float()
+                result = apply_rotary_emb(x_chunk_input, (cos_chunk, sin_chunk))
+                x_chunk.copy_(result.to(original_dtype))
+                del x_chunk_input
+            else:
+                # No clone needed - apply_rotary_emb returns a new tensor
+                result = apply_rotary_emb(x_chunk, (cos_chunk, sin_chunk))
+                x_chunk.copy_(result)
 
-            result = apply_rotary_emb(x_chunk_input, (cos_chunk, sin_chunk))
-
-            # Cast back to original dtype if needed
-            if _ROPE_FORCE_FP32 and original_dtype != torch.float32:
-                result = result.to(original_dtype)
-
-            x_chunk.copy_(result)
-
-            del x_chunk, x_chunk_input, cos_chunk, sin_chunk, result
+            del x_chunk, cos_chunk, sin_chunk, result
 
         return x
 
