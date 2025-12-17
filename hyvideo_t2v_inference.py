@@ -58,12 +58,12 @@ if __name__ == "__main__":
     parser.add_argument("--sparsity", type=float, default=0.25, help="The sparsity of the striped attention pattern. Accepts one or two float values.")
 
     # SVG2 (SAP) specific
-    parser.add_argument("--num_q_centroids", "--qc", type=int, default=50, help="Number of query centroids for SAP.")
-    parser.add_argument("--num_k_centroids", "--kc", type=int, default=200, help="Number of key centroids for SAP.")
+    parser.add_argument("--num_q_centroids", "--qc", type=int, default=400, help="Number of query centroids for SAP.")
+    parser.add_argument("--num_k_centroids", "--kc", type=int, default=1000, help="Number of key centroids for SAP.")
     parser.add_argument("--top_p_kmeans", type=float, default=0.9, help="Top-p threshold for block selection in SAP.")
-    parser.add_argument("--min_kc_ratio", type=float, default=0, help="At least this proportion of key blocks to keep per query block in SAP.")
-    parser.add_argument("--kmeans_iter_init", type=int, default=0, help="Number of KMeans iterations for initialization in SAP.")
-    parser.add_argument("--kmeans_iter_step", type=int, default=0, help="Number of KMeans iterations for other diffusion steps in SAP.")
+    parser.add_argument("--min_kc_ratio", type=float, default=0.10, help="At least this proportion of key blocks to keep per query block in SAP.")
+    parser.add_argument("--kmeans_iter_init", type=int, default=50, help="Number of KMeans iterations for initialization in SAP.")
+    parser.add_argument("--kmeans_iter_step", type=int, default=2, help="Number of KMeans iterations for other diffusion steps in SAP.")
     parser.add_argument("--zero_step_kmeans_init", action="store_true", help="Initialize the centroids for the first step in SAP, not after warmup.")
 
     # CTCA (Cross-Timestep Cluster Amortization) specific - only for SAP_CTCA pattern

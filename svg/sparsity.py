@@ -154,6 +154,11 @@ class OutlierSplit2of4Linear(nn.Module):
         self._sparse_weight_ss = None
         self._sparse_weight_ss_device = None
 
+        # Cache for GPU indices (lazily populated on first forward on GPU)
+        self._sparse_idx_gpu = None
+        self._outlier_idx_gpu = None
+        self._indices_device = None
+
         if config.verbose:
             logger.info(
                 f"[2:4] Wrapped Linear({self.in_features}->{self.out_features}) "
@@ -169,24 +174,33 @@ class OutlierSplit2of4Linear(nn.Module):
         return int(self._sparse_idx_cpu.numel())
 
     def clear_sparse_cache(self):
-        """Free cached GPU semi-structured weights (must be called before offloading to CPU)."""
+        """Free cached GPU semi-structured weights and indices (must be called before offloading to CPU)."""
         self._sparse_weight_ss = None
         self._sparse_weight_ss_device = None
+        self._sparse_idx_gpu = None
+        self._outlier_idx_gpu = None
+        self._indices_device = None
 
     def prepare_sparse_cache(self):
         """
-        Prepare semi-structured sparse weights on GPU if supported.
+        Prepare semi-structured sparse weights and GPU indices.
 
         Safe to call repeatedly; will re-use cache when possible.
         """
+        dev = self.sparse_weight.device if self.sparse_weight.device.type == "cuda" else None
+
+        # Prepare GPU indices if on CUDA
+        if dev is not None:
+            self._ensure_gpu_indices(dev)
+
+        # Skip semi-structured prep if not supported or not on CUDA
         if not self.config.use_semi_structured or not _semi_structured_supported():
             return
-        if self.sparse_weight.device.type != "cuda":
+        if dev is None:
             return
         if self.sparse_weight.dtype not in (torch.float16, torch.bfloat16):
             return
 
-        dev = self.sparse_weight.device
         if self._sparse_weight_ss is not None and self._sparse_weight_ss_device == dev:
             return
 
@@ -198,9 +212,13 @@ class OutlierSplit2of4Linear(nn.Module):
                 # Keep it pinned when possible for faster future transfers.
                 cpu_tensor = self.sparse_weight.detach().to("cpu")
                 if not cpu_tensor.is_pinned():
-                    pinned = torch.empty_like(cpu_tensor, pin_memory=True)
-                    pinned.copy_(cpu_tensor)
-                    cpu_tensor = pinned
+                    try:
+                        pinned = torch.empty_like(cpu_tensor, pin_memory=True)
+                        pinned.copy_(cpu_tensor)
+                        cpu_tensor = pinned
+                    except RuntimeError:
+                        # Pinned memory allocation can fail on some systems
+                        pass
                 self.sparse_weight = nn.Parameter(cpu_tensor, requires_grad=False)
         except Exception as e:
             # Fall back to dense pruned weights.
@@ -214,10 +232,23 @@ class OutlierSplit2of4Linear(nn.Module):
             return self._sparse_weight_ss
         return self.sparse_weight
 
+    def _ensure_gpu_indices(self, device: torch.device) -> None:
+        """Ensure indices are cached on the correct GPU device."""
+        if self._indices_device == device:
+            return
+        # Cache indices on GPU for faster scatter operations
+        self._sparse_idx_gpu = self._sparse_idx_cpu.to(device)
+        self._outlier_idx_gpu = self._outlier_idx_cpu.to(device) if self.outlier_count > 0 else None
+        self._indices_device = device
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Prepare cache lazily if possible.
         if self._sparse_weight_ss is None:
             self.prepare_sparse_cache()
+
+        # Ensure GPU indices are ready on the correct device
+        if x.device.type == "cuda":
+            self._ensure_gpu_indices(x.device)
 
         y_sparse = F.linear(x, self._get_sparse_weight(), self.sparse_bias)
         if self.outlier_count > 0:
@@ -227,12 +258,17 @@ class OutlierSplit2of4Linear(nn.Module):
 
         # Reassemble in original output channel order.
         out_shape = (*y_sparse.shape[:-1], self.out_features)
-        y = x.new_empty(out_shape)
+        # Use zeros instead of empty to avoid uninitialized memory issues
+        y = x.new_zeros(out_shape)
+
+        # Use GPU indices for faster scatter if available
+        sparse_idx = self._sparse_idx_gpu if self._sparse_idx_gpu is not None else self._sparse_idx_cpu
+        outlier_idx = self._outlier_idx_gpu if self._outlier_idx_gpu is not None else self._outlier_idx_cpu
 
         if self.sparse_count > 0:
-            y[..., self._sparse_idx_cpu] = y_sparse
+            y[..., sparse_idx] = y_sparse
         if y_out is not None:
-            y[..., self._outlier_idx_cpu] = y_out
+            y[..., outlier_idx] = y_out
         return y
 
 
