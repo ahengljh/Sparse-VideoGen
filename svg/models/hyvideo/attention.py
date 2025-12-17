@@ -268,6 +268,7 @@ except ImportError:
     ENABLE_FAST_KERNEL = False
 
     _ROPE_CHUNK_SIZE = int(os.environ.get("SVG_ROPE_CHUNK_SIZE", "4096"))
+    _ROPE_FORCE_FP32 = os.environ.get("SVG_ROPE_FORCE_FP32", "0") == "1"
 
     def _apply_rotary_emb_inplace_chunked(x: torch.Tensor, freqs_cis: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
         """
@@ -277,16 +278,18 @@ except ImportError:
         To preserve exact behavior and quality, we call diffusers' apply_rotary_emb on
         smaller sequence chunks and write back in-place to cap peak memory.
 
-        Environment knob:
-        - SVG_ROPE_CHUNK_SIZE (default: 4096)
+        Environment knobs:
+        - SVG_ROPE_CHUNK_SIZE (default: 4096): Chunk size for sequence processing
+        - SVG_ROPE_FORCE_FP32 (default: 0): Force FP32 precision for RoPE (set to 1 for quality)
         """
         if freqs_cis is None:
             return x
 
         cos, sin = freqs_cis[0], freqs_cis[1]
         if cos.device != x.device:
-            cos = cos.to(x.device, non_blocking=True)
-            sin = sin.to(x.device, non_blocking=True)
+            # Use blocking transfer to ensure data is ready before processing
+            cos = cos.to(x.device, non_blocking=False)
+            sin = sin.to(x.device, non_blocking=False)
 
         seq_len = x.shape[-2]
 
@@ -300,15 +303,32 @@ except ImportError:
                 raise ValueError(f"RoPE freqs shorter than x: freqs={cos.shape[-2]} x={seq_len}")
 
         chunk = max(256, int(_ROPE_CHUNK_SIZE))
+        original_dtype = x.dtype
 
         for start in range(0, seq_len, chunk):
             end = min(start + chunk, seq_len)
             x_chunk = x[..., start:end, :]
             cos_chunk = cos[..., start:end, :]
             sin_chunk = sin[..., start:end, :]
-            x_chunk.copy_(apply_rotary_emb(x_chunk, (cos_chunk, sin_chunk)))
 
-            del x_chunk, cos_chunk, sin_chunk
+            # Clone chunk to avoid potential aliasing issues with in-place ops
+            x_chunk_input = x_chunk.clone()
+
+            # Optionally upcast to FP32 for better numerical precision
+            if _ROPE_FORCE_FP32 and original_dtype != torch.float32:
+                x_chunk_input = x_chunk_input.float()
+                cos_chunk = cos_chunk.float()
+                sin_chunk = sin_chunk.float()
+
+            result = apply_rotary_emb(x_chunk_input, (cos_chunk, sin_chunk))
+
+            # Cast back to original dtype if needed
+            if _ROPE_FORCE_FP32 and original_dtype != torch.float32:
+                result = result.to(original_dtype)
+
+            x_chunk.copy_(result)
+
+            del x_chunk, x_chunk_input, cos_chunk, sin_chunk, result
 
         return x
 
