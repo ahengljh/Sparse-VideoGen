@@ -355,6 +355,53 @@ class BlockOffloadSimulator:
         return self.blocks[block_idx](x)
 
 
+def create_memory_pressure(target_used_gb: float, device: int = 0) -> List[torch.Tensor]:
+    """
+    Fill GPU memory to create realistic memory pressure.
+    Returns list of tensors that should be kept alive during the test.
+    """
+    tensors = []
+    props = torch.cuda.get_device_properties(device)
+    total_gb = props.total_memory / (1024**3)
+
+    # Reserve some space for operations
+    target_gb = min(target_used_gb, total_gb - 2.0)
+
+    current_gb = torch.cuda.memory_allocated(device) / (1024**3)
+    needed_gb = target_gb - current_gb
+
+    if needed_gb <= 0:
+        print(f"Memory already at {current_gb:.2f} GB, no pressure needed")
+        return tensors
+
+    print(f"Creating memory pressure: filling {needed_gb:.2f} GB...")
+
+    # Allocate in 1GB chunks
+    chunk_size = 1024 * 1024 * 1024 // 2  # 1GB in bf16 elements
+    while needed_gb > 0.5:
+        try:
+            t = torch.zeros(chunk_size, dtype=torch.bfloat16, device=f'cuda:{device}')
+            tensors.append(t)
+            needed_gb -= 1.0
+        except RuntimeError:
+            break
+
+    # Fill remaining with smaller chunks
+    small_chunk = 256 * 1024 * 1024 // 2  # 256MB
+    while needed_gb > 0.1:
+        try:
+            t = torch.zeros(small_chunk, dtype=torch.bfloat16, device=f'cuda:{device}')
+            tensors.append(t)
+            needed_gb -= 0.25
+        except RuntimeError:
+            break
+
+    final_gb = torch.cuda.memory_allocated(device) / (1024**3)
+    print(f"Memory pressure created: {final_gb:.2f} GB used")
+
+    return tensors
+
+
 def run_stress_trial(
     num_blocks: int,
     num_steps: int,
@@ -363,6 +410,7 @@ def run_stress_trial(
     block_size_mb: int,
     batch_size: int = 1,
     seq_len: int = 256,  # Reduced to minimize activation memory
+    memory_pressure_gb: float = 0.0,  # How much memory to pre-fill
 ) -> TrialResult:
     """Run a single stress test trial"""
 
@@ -370,12 +418,19 @@ def run_stress_trial(
     print(f"STRESS TEST: {strategy.value}")
     print(f"Blocks: {num_blocks}, Steps: {num_steps}")
     print(f"Working set: {working_set_size}, Block size: {block_size_mb} MB")
+    if memory_pressure_gb > 0:
+        print(f"Memory pressure: {memory_pressure_gb:.1f} GB")
     print(f"{'='*60}")
 
     # Reset memory
     torch.cuda.reset_peak_memory_stats()
     torch.cuda.empty_cache()
     gc.collect()
+
+    # Create memory pressure if requested
+    pressure_tensors = []
+    if memory_pressure_gb > 0:
+        pressure_tensors = create_memory_pressure(memory_pressure_gb)
 
     # Create simulator
     sim = BlockOffloadSimulator(
@@ -435,6 +490,8 @@ def run_stress_trial(
     # Clean up
     del sim
     del x
+    if pressure_tensors:
+        del pressure_tensors
     torch.cuda.empty_cache()
     gc.collect()
 
@@ -459,6 +516,7 @@ def run_comparison(
     block_size_mb: int = 400,  # Smaller for testing on limited GPUs
     num_trials: int = 3,
     output_dir: str = "./results",
+    memory_pressure_gb: float = 0.0,
 ) -> Dict:
     """Run comparison across strategies with multiple trials"""
 
@@ -467,6 +525,8 @@ def run_comparison(
     print(f"{'='*80}")
     print(f"Blocks: {num_blocks}, Steps: {num_steps}")
     print(f"Working set: {working_set_size}, Block size: {block_size_mb} MB")
+    if memory_pressure_gb > 0:
+        print(f"Memory pressure: {memory_pressure_gb:.1f} GB")
     print(f"Trials per strategy: {num_trials}")
     print(f"Strategies: {[s.value for s in strategies]}")
 
@@ -484,6 +544,7 @@ def run_comparison(
                 working_set_size=working_set_size,
                 strategy=strategy,
                 block_size_mb=block_size_mb,
+                memory_pressure_gb=memory_pressure_gb,
             )
 
             strategy_results.append(asdict(result))
@@ -515,6 +576,7 @@ def run_comparison(
                 "working_set_size": working_set_size,
                 "block_size_mb": block_size_mb,
                 "num_trials": num_trials,
+                "memory_pressure_gb": memory_pressure_gb,
             },
             "results": results,
             "summary": summary,
@@ -611,6 +673,8 @@ def main():
     parser.add_argument("--working-set-size", type=int, default=5, help="Working set size")
     parser.add_argument("--block-size-mb", type=int, default=0, help="Block size in MB (0=auto)")
     parser.add_argument("--num-trials", type=int, default=3, help="Trials per strategy")
+    parser.add_argument("--memory-pressure", type=float, default=0.0,
+                        help="GB of memory to pre-fill for pressure testing (e.g., 20.0 for 20GB)")
     parser.add_argument("--output-dir", type=str, default="./results/stress_test", help="Output directory")
 
     args = parser.parse_args()
@@ -653,6 +717,7 @@ def main():
         block_size_mb=args.block_size_mb,
         num_trials=args.num_trials,
         output_dir=args.output_dir,
+        memory_pressure_gb=args.memory_pressure,
     )
 
 
