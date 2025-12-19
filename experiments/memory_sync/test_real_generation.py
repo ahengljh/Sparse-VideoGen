@@ -216,13 +216,19 @@ class BlockOffloadManager:
         return self.load_block(block_idx)
 
     def initialize(self):
-        """Move blocks beyond working set to CPU"""
-        print(f"Initializing offloading: keeping {self.working_set_size} blocks on GPU")
+        """Initialize offloading - move working set to GPU, keep rest on CPU"""
+        print(f"Initializing offloading: moving {self.working_set_size} blocks to GPU")
 
-        for i in range(self.working_set_size, self.num_blocks):
-            self.offload_block(i, force_sync=True)
+        # All blocks start on CPU
+        self.block_on_gpu = [False] * self.num_blocks
 
-        torch.cuda.synchronize(self.device_id)
+        # Move working set to GPU
+        for i in range(min(self.working_set_size, self.num_blocks)):
+            print(f"  Loading block {i} to GPU...")
+            self.blocks[i].to(self.device)
+            self.block_on_gpu[i] = True
+            torch.cuda.synchronize(self.device_id)
+
         torch.cuda.empty_cache()
 
         gpu_count = sum(self.block_on_gpu)
@@ -243,11 +249,13 @@ class BlockOffloadManager:
                 block.forward = self._original_forwards[idx]
         self._original_forwards.clear()
 
-        # Move all blocks back to GPU
+        # Move all blocks back to CPU to free GPU memory
         for idx in range(self.num_blocks):
-            if not self.block_on_gpu[idx]:
-                self.blocks[idx].to(self.device)
-                self.block_on_gpu[idx] = True
+            if self.block_on_gpu[idx]:
+                self.blocks[idx].to('cpu')
+                self.block_on_gpu[idx] = False
+
+        torch.cuda.empty_cache()
 
     def _make_wrapped_forward(self, block_idx: int, original_forward: Callable) -> Callable:
         """Create wrapped forward function"""
@@ -267,7 +275,7 @@ class BlockOffloadManager:
 
 
 def load_hunyuan_model(model_path: str):
-    """Load HunyuanVideo model"""
+    """Load HunyuanVideo model with transformer kept on CPU for offloading"""
     from diffusers import (
         HunyuanVideoPipeline,
         HunyuanVideoTransformer3DModel,
@@ -276,6 +284,7 @@ def load_hunyuan_model(model_path: str):
 
     print(f"Loading HunyuanVideo from {model_path}...")
 
+    # Load transformer to CPU first (will be managed by offloading)
     transformer = HunyuanVideoTransformer3DModel.from_pretrained(
         model_path,
         subfolder="transformer",
@@ -284,6 +293,7 @@ def load_hunyuan_model(model_path: str):
 
     scheduler = FlowMatchEulerDiscreteScheduler(shift=7.0)
 
+    # Load pipeline but don't move to CUDA yet
     pipe = HunyuanVideoPipeline.from_pretrained(
         model_path,
         transformer=transformer,
@@ -292,12 +302,18 @@ def load_hunyuan_model(model_path: str):
     )
 
     pipe.vae.enable_tiling()
-    pipe.to("cuda")
+
+    # Move only non-transformer components to CUDA
+    # Keep transformer on CPU - it will be managed by offloading
+    pipe.text_encoder.to("cuda")
+    pipe.text_encoder_2.to("cuda")
+    pipe.vae.to("cuda")
 
     # Get block counts
     num_double = len(list(pipe.transformer.transformer_blocks))
     num_single = len(list(pipe.transformer.single_transformer_blocks))
     print(f"Loaded: {num_double} double-stream + {num_single} single-stream = {num_double + num_single} total blocks")
+    print(f"Transformer kept on CPU for block-level offloading")
 
     return pipe
 
