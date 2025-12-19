@@ -1,18 +1,18 @@
 """
-Offload Strategies for Video DiT Block-Level Memory Management
+Offload Strategies for Video DiT Block-Level Memory Management (v2)
 
-This module implements three transfer strategies:
+This module implements three transfer strategies with proper memory pressure:
 1. Pure Async (baseline) - cudaMemcpyAsync without synchronization
 2. Pure Sync - Full synchronization after each transfer
 3. Conditional Sync - Adaptive synchronization based on memory state
 
-These strategies are designed to validate the paper's claims about
-synchronization necessity in Video DiT inference.
+KEY FIX: Added memory pressure simulation to create realistic OOM scenarios.
 """
 
 import torch
 import torch.nn as nn
 import time
+import gc
 from typing import Dict, List, Optional, Tuple, Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -57,28 +57,84 @@ class StrategyStats:
     total_time_s: float
 
 
+class ActivationSimulator:
+    """
+    Simulates activation memory pressure during Video DiT inference.
+
+    In real inference:
+    - Activations take 12-15GB for video generation
+    - This leaves only 8-12GB for model weights on 24GB GPU
+    - Block offloading must work within this constraint
+    """
+
+    def __init__(self, device: int = 0):
+        self.device = device
+        self.activation_tensors: List[torch.Tensor] = []
+
+    def get_allocated_gb(self) -> float:
+        return torch.cuda.memory_allocated(self.device) / (1024**3)
+
+    def get_free_gb(self) -> float:
+        props = torch.cuda.get_device_properties(self.device)
+        reserved = torch.cuda.memory_reserved(self.device)
+        return (props.total_memory - reserved) / (1024**3)
+
+    def allocate_activation_pressure(self, target_free_gb: float) -> float:
+        """
+        Allocate tensors to leave only target_free_gb available.
+
+        This simulates the activation memory that would be present
+        during real Video DiT inference.
+        """
+        self.clear()
+        torch.cuda.empty_cache()
+
+        chunk_size = 256 * 1024 * 1024  # 256MB chunks
+        chunk_elements = chunk_size // 4
+
+        while self.get_free_gb() > target_free_gb + 0.3:
+            try:
+                tensor = torch.randn(chunk_elements, dtype=torch.float32, device=self.device)
+                self.activation_tensors.append(tensor)
+            except RuntimeError:
+                break
+
+        # Fine tune with smaller chunks
+        small_chunk = 64 * 1024 * 1024 // 4
+        while self.get_free_gb() > target_free_gb + 0.1:
+            try:
+                tensor = torch.randn(small_chunk, dtype=torch.float32, device=self.device)
+                self.activation_tensors.append(tensor)
+            except RuntimeError:
+                break
+
+        return self.get_free_gb()
+
+    def clear(self):
+        """Release all activation tensors"""
+        self.activation_tensors.clear()
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
 class BlockOffloader:
     """
     Manages block-level offloading between GPU and CPU.
-
-    This class simulates the offloading behavior of Video DiT models
-    where transformer blocks are swapped between GPU and CPU memory.
     """
 
     def __init__(
         self,
         device: int = 0,
         cpu_pin_memory: bool = True,
-        num_streams: int = 2,
     ):
         self.device = torch.device(f'cuda:{device}')
+        self.device_id = device
         self.cpu_device = torch.device('cpu')
         self.cpu_pin_memory = cpu_pin_memory
 
-        # Create CUDA streams for async transfers
+        # CUDA streams
         self.load_stream = torch.cuda.Stream(device=device)
         self.offload_stream = torch.cuda.Stream(device=device)
-        self.compute_stream = torch.cuda.default_stream(device=device)
 
         # Block storage
         self.cpu_blocks: Dict[int, torch.Tensor] = {}
@@ -90,13 +146,13 @@ class BlockOffloader:
         self.oom_count = 0
 
         # Conditional sync parameters
-        self.safety_margin_gb = 2.0  # Buffer for safe operation
-        self.recent_failure_window = 10
+        self.safety_margin_gb = 1.5
         self.recent_failures: List[float] = []
+        self.recent_failure_window = 5.0
 
     def create_block(self, block_id: int, size_mb: float = 650) -> torch.Tensor:
         """Create a simulated block on CPU"""
-        num_elements = int(size_mb * 1024 * 1024 / 4)  # float32
+        num_elements = int(size_mb * 1024 * 1024 / 4)
         tensor = torch.randn(num_elements, dtype=torch.float32)
         if self.cpu_pin_memory:
             tensor = tensor.pin_memory()
@@ -104,64 +160,41 @@ class BlockOffloader:
         return tensor
 
     def _get_free_memory_gb(self) -> float:
-        """Get current free GPU memory in GB"""
-        torch.cuda.synchronize(self.device)
-        props = torch.cuda.get_device_properties(self.device)
-        reserved = torch.cuda.memory_reserved(self.device)
+        props = torch.cuda.get_device_properties(self.device_id)
+        reserved = torch.cuda.memory_reserved(self.device_id)
         return (props.total_memory - reserved) / (1024**3)
 
     def _get_allocated_memory_gb(self) -> float:
-        """Get current allocated GPU memory in GB"""
-        return torch.cuda.memory_allocated(self.device) / (1024**3)
+        return torch.cuda.memory_allocated(self.device_id) / (1024**3)
 
-    def _should_sync_conditional(
-        self,
-        block_size_mb: float,
-        operation: str
-    ) -> Tuple[bool, str]:
-        """
-        Determine if synchronization is needed based on current state.
-
-        Implements the conditional sync decision logic from the paper:
-        1. Memory margin insufficient
-        2. Recent allocation failures
-        3. Phase transition detected (not implemented in simulation)
-
-        Returns: (should_sync, reason)
-        """
+    def _should_sync_conditional(self, block_size_mb: float) -> Tuple[bool, str]:
+        """Determine if sync is needed based on current state"""
         block_size_gb = block_size_mb / 1024
         free_memory_gb = self._get_free_memory_gb()
 
         # Condition 1: Memory margin insufficient
         if free_memory_gb < block_size_gb + self.safety_margin_gb:
-            return True, "memory_margin_insufficient"
+            return True, "memory_margin"
 
         # Condition 2: Recent failures
         current_time = time.time()
-        # Clean old failures
         self.recent_failures = [
             t for t in self.recent_failures
             if current_time - t < self.recent_failure_window
         ]
-        if len(self.recent_failures) > 0:
+        if self.recent_failures:
             return True, "recent_failures"
 
-        # Condition 3: High fragmentation (estimated)
-        allocated = self._get_allocated_memory_gb()
-        reserved = torch.cuda.memory_reserved(self.device) / (1024**3)
-        if reserved > 0 and (reserved - allocated) / reserved > 0.3:
-            return True, "high_fragmentation"
+        return False, ""
 
-        return False, "no_sync_needed"
-
-    def load_block_async(
+    def load_block(
         self,
         block_id: int,
-        strategy: TransferStrategy = TransferStrategy.PURE_ASYNC
+        strategy: TransferStrategy
     ) -> TransferStats:
         """Load a block from CPU to GPU using specified strategy"""
         if block_id not in self.cpu_blocks:
-            raise ValueError(f"Block {block_id} not found in CPU storage")
+            raise ValueError(f"Block {block_id} not found")
 
         cpu_tensor = self.cpu_blocks[block_id]
         size_mb = cpu_tensor.numel() * 4 / (1024 * 1024)
@@ -174,44 +207,37 @@ class BlockOffloader:
 
         try:
             if strategy == TransferStrategy.PURE_ASYNC:
-                # Pure async: no synchronization
                 with torch.cuda.stream(self.load_stream):
                     gpu_tensor = cpu_tensor.to(self.device, non_blocking=True)
                 self.gpu_blocks[block_id] = gpu_tensor
 
             elif strategy == TransferStrategy.PURE_SYNC:
-                # Pure sync: synchronize after transfer
-                with torch.cuda.stream(self.load_stream):
-                    gpu_tensor = cpu_tensor.to(self.device, non_blocking=True)
-                torch.cuda.synchronize(self.device)
+                gpu_tensor = cpu_tensor.to(self.device, non_blocking=False)
+                torch.cuda.synchronize(self.device_id)
                 self.gpu_blocks[block_id] = gpu_tensor
                 sync_triggered = True
                 self.sync_count += 1
 
             elif strategy == TransferStrategy.CONDITIONAL_SYNC:
-                # Conditional sync: check if sync needed
-                should_sync, reason = self._should_sync_conditional(size_mb, 'load')
+                should_sync, reason = self._should_sync_conditional(size_mb)
 
                 if should_sync:
-                    # Synchronize before to ensure previous offloads complete
-                    torch.cuda.synchronize(self.device)
-                    # Trigger memory cleanup
+                    torch.cuda.synchronize(self.device_id)
                     torch.cuda.empty_cache()
-
-                with torch.cuda.stream(self.load_stream):
-                    gpu_tensor = cpu_tensor.to(self.device, non_blocking=True)
-
-                if should_sync:
-                    torch.cuda.synchronize(self.device)
                     sync_triggered = True
                     self.sync_count += 1
+
+                gpu_tensor = cpu_tensor.to(self.device, non_blocking=not should_sync)
+
+                if should_sync:
+                    torch.cuda.synchronize(self.device_id)
 
                 self.gpu_blocks[block_id] = gpu_tensor
 
         except RuntimeError as e:
             if 'out of memory' in str(e).lower():
                 success = False
-                error_msg = str(e)
+                error_msg = "OOM"
                 self.oom_count += 1
                 self.recent_failures.append(time.time())
                 torch.cuda.empty_cache()
@@ -235,56 +261,42 @@ class BlockOffloader:
         self.transfer_stats.append(stats)
         return stats
 
-    def offload_block_async(
+    def offload_block(
         self,
         block_id: int,
-        strategy: TransferStrategy = TransferStrategy.PURE_ASYNC
+        strategy: TransferStrategy
     ) -> TransferStats:
-        """Offload a block from GPU to CPU using specified strategy"""
+        """Offload a block from GPU"""
         if block_id not in self.gpu_blocks:
-            raise ValueError(f"Block {block_id} not found in GPU storage")
+            raise ValueError(f"Block {block_id} not on GPU")
 
         gpu_tensor = self.gpu_blocks[block_id]
         size_mb = gpu_tensor.numel() * 4 / (1024 * 1024)
         memory_before = self._get_allocated_memory_gb()
         sync_triggered = False
-        success = True
-        error_msg = ""
 
         start_time = time.time()
 
-        try:
-            if strategy == TransferStrategy.PURE_ASYNC:
-                # Pure async: just mark for deletion
-                with torch.cuda.stream(self.offload_stream):
-                    # Copy back to CPU if needed (usually we already have it)
-                    pass
-                # Delete GPU tensor
-                del self.gpu_blocks[block_id]
-                # Note: actual memory release is deferred!
+        if strategy == TransferStrategy.PURE_ASYNC:
+            del self.gpu_blocks[block_id]
+            # No sync - memory release is deferred
 
-            elif strategy == TransferStrategy.PURE_SYNC:
-                # Pure sync: ensure completion
-                del self.gpu_blocks[block_id]
-                torch.cuda.synchronize(self.device)
+        elif strategy == TransferStrategy.PURE_SYNC:
+            del self.gpu_blocks[block_id]
+            torch.cuda.synchronize(self.device_id)
+            torch.cuda.empty_cache()
+            sync_triggered = True
+            self.sync_count += 1
+
+        elif strategy == TransferStrategy.CONDITIONAL_SYNC:
+            should_sync, _ = self._should_sync_conditional(size_mb)
+            del self.gpu_blocks[block_id]
+
+            if should_sync:
+                torch.cuda.synchronize(self.device_id)
                 torch.cuda.empty_cache()
                 sync_triggered = True
                 self.sync_count += 1
-
-            elif strategy == TransferStrategy.CONDITIONAL_SYNC:
-                should_sync, reason = self._should_sync_conditional(size_mb, 'offload')
-
-                del self.gpu_blocks[block_id]
-
-                if should_sync:
-                    torch.cuda.synchronize(self.device)
-                    torch.cuda.empty_cache()
-                    sync_triggered = True
-                    self.sync_count += 1
-
-        except RuntimeError as e:
-            success = False
-            error_msg = str(e)
 
         duration_ms = (time.time() - start_time) * 1000
         memory_after = self._get_allocated_memory_gb()
@@ -297,62 +309,53 @@ class BlockOffloader:
             sync_triggered=sync_triggered,
             memory_before_gb=memory_before,
             memory_after_gb=memory_after,
-            success=success,
-            error_msg=error_msg
+            success=True,
         )
         self.transfer_stats.append(stats)
         return stats
 
     def get_strategy_stats(self, strategy: TransferStrategy) -> StrategyStats:
-        """Compile statistics for a strategy run"""
+        """Compile statistics"""
         total = len(self.transfer_stats)
         successful = sum(1 for s in self.transfer_stats if s.success)
-        failed = total - successful
         total_sync = sum(1 for s in self.transfer_stats if s.sync_triggered)
-        sync_rate = total_sync / total if total > 0 else 0.0
-        avg_time = np.mean([s.duration_ms for s in self.transfer_stats]) if total > 0 else 0.0
 
-        peak_memory = max(s.memory_after_gb for s in self.transfer_stats) if total > 0 else 0.0
+        peak_memory = max((s.memory_after_gb for s in self.transfer_stats), default=0)
         memory_values = [s.memory_after_gb for s in self.transfer_stats]
-        peak_variance = np.var(memory_values) if memory_values else 0.0
-
-        total_time = sum(s.duration_ms for s in self.transfer_stats) / 1000
+        peak_variance = float(np.var(memory_values)) if memory_values else 0.0
+        avg_time = float(np.mean([s.duration_ms for s in self.transfer_stats])) if total > 0 else 0.0
 
         return StrategyStats(
             strategy=strategy,
             total_transfers=total,
             successful_transfers=successful,
-            failed_transfers=failed,
+            failed_transfers=total - successful,
             oom_count=self.oom_count,
             total_sync_count=total_sync,
-            sync_trigger_rate=sync_rate,
+            sync_trigger_rate=total_sync / total if total > 0 else 0.0,
             avg_transfer_time_ms=avg_time,
             peak_memory_gb=peak_memory,
             peak_variance_gb=peak_variance,
-            total_time_s=total_time
+            total_time_s=sum(s.duration_ms for s in self.transfer_stats) / 1000
         )
 
     def reset_stats(self):
-        """Reset all statistics"""
         self.transfer_stats = []
         self.sync_count = 0
         self.oom_count = 0
         self.recent_failures = []
 
     def clear_gpu_blocks(self):
-        """Clear all GPU blocks"""
         self.gpu_blocks.clear()
         torch.cuda.empty_cache()
 
 
 class VideoditBlockSimulator:
     """
-    Simulates Video DiT block execution patterns.
+    Simulates Video DiT block execution with memory pressure.
 
-    Models the execution pattern:
-    - T denoising steps (40-50)
-    - N transformer blocks per step (60)
-    - K blocks kept on GPU (working set)
+    Key change: Now simulates realistic activation memory pressure
+    to create actual OOM scenarios.
     """
 
     def __init__(
@@ -362,6 +365,7 @@ class VideoditBlockSimulator:
         block_size_mb: float = 650,
         working_set_size: int = 5,
         device: int = 0,
+        target_free_gb: float = None,  # NEW: target free memory
     ):
         self.num_blocks = num_blocks
         self.num_steps = num_steps
@@ -369,7 +373,15 @@ class VideoditBlockSimulator:
         self.working_set_size = working_set_size
         self.device = device
 
+        # Auto-detect target free if not specified
+        if target_free_gb is None:
+            # Leave enough for working_set + 1 block + small margin
+            target_free_gb = (working_set_size + 2) * block_size_mb / 1024
+
+        self.target_free_gb = target_free_gb
+
         self.offloader = BlockOffloader(device=device)
+        self.activation_sim = ActivationSimulator(device=device)
 
         # Initialize blocks on CPU
         for i in range(num_blocks):
@@ -379,91 +391,84 @@ class VideoditBlockSimulator:
         self,
         strategy: TransferStrategy,
         monitor: Optional[MemoryMonitor] = None,
-        compute_time_ms: float = 10.0,  # Simulated compute time per block
+        compute_time_ms: float = 1.0,
     ) -> StrategyStats:
         """
-        Simulate Video DiT inference with given strategy.
-
-        Execution pattern:
-        for t in range(T):  # denoising steps
-            for i in range(N):  # transformer blocks
-                load_block(i) if not on GPU
-                compute(block_i)
-                offload if needed to maintain working set
+        Simulate Video DiT inference with memory pressure.
         """
         self.offloader.reset_stats()
         self.offloader.clear_gpu_blocks()
+        self.activation_sim.clear()
         torch.cuda.empty_cache()
 
-        # Track which blocks are on GPU
-        gpu_block_ids: List[int] = []
+        # Create memory pressure to simulate activations
+        actual_free = self.activation_sim.allocate_activation_pressure(self.target_free_gb)
+        print(f"    Activation pressure set: {actual_free:.2f}GB free (target: {self.target_free_gb:.2f}GB)")
 
+        gpu_block_ids: List[int] = []
         total_block_accesses = 0
         start_time = time.time()
 
         try:
             for step in range(self.num_steps):
                 if monitor:
-                    monitor.record_event(f"step_{step}_start")
+                    monitor.record_event(f"step_{step}")
 
                 for block_id in range(self.num_blocks):
                     total_block_accesses += 1
 
                     # Load block if not on GPU
                     if block_id not in gpu_block_ids:
-                        # If working set is full, offload oldest block
+                        # Offload oldest if working set full
                         while len(gpu_block_ids) >= self.working_set_size:
                             oldest_id = gpu_block_ids.pop(0)
-                            self.offloader.offload_block_async(oldest_id, strategy)
+                            if oldest_id in self.offloader.gpu_blocks:
+                                self.offloader.offload_block(oldest_id, strategy)
 
                         # Load new block
-                        stats = self.offloader.load_block_async(block_id, strategy)
+                        stats = self.offloader.load_block(block_id, strategy)
                         if stats.success:
                             gpu_block_ids.append(block_id)
                         else:
-                            # OOM occurred
                             if monitor:
                                 monitor.record_oom()
-                            # Try to recover
                             torch.cuda.empty_cache()
 
                     # Simulate computation
                     if compute_time_ms > 0:
                         time.sleep(compute_time_ms / 1000)
 
-                if monitor:
-                    monitor.record_event(f"step_{step}_end")
-
         except Exception as e:
-            print(f"Simulation failed: {e}")
+            print(f"Simulation error: {e}")
+
+        # Cleanup
+        self.activation_sim.clear()
+        self.offloader.clear_gpu_blocks()
+        torch.cuda.empty_cache()
 
         total_time = time.time() - start_time
-
         stats = self.offloader.get_strategy_stats(strategy)
         stats.total_time_s = total_time
 
-        print(f"\n[{strategy.value}] Simulation completed:")
-        print(f"  Total block accesses: {total_block_accesses}")
+        print(f"\n[{strategy.value}] Completed:")
+        print(f"  Block accesses: {total_block_accesses}")
         print(f"  OOM count: {stats.oom_count}")
-        print(f"  Sync trigger rate: {stats.sync_trigger_rate:.2%}")
+        print(f"  Sync rate: {stats.sync_trigger_rate:.1%}")
         print(f"  Peak memory: {stats.peak_memory_gb:.2f} GB")
-        print(f"  Peak variance: {stats.peak_variance_gb:.4f} GB²")
-        print(f"  Total time: {stats.total_time_s:.2f}s")
 
         return stats
 
 
 def run_strategy_comparison(
-    num_blocks: int = 60,
-    num_steps: int = 10,  # Reduced for testing
-    block_size_mb: float = 200,  # Reduced for testing
-    working_set_size: int = 5,
+    num_blocks: int = 30,
+    num_steps: int = 5,
+    block_size_mb: float = 500,
+    working_set_size: int = 4,
+    target_free_gb: float = None,
     num_trials: int = 3,
 ) -> Dict[str, List[StrategyStats]]:
     """
-    Run comparison of all three strategies.
-
-    Returns statistics for each strategy across multiple trials.
+    Run comparison of all three strategies with memory pressure.
     """
     results = {
         TransferStrategy.PURE_ASYNC.value: [],
@@ -471,70 +476,92 @@ def run_strategy_comparison(
         TransferStrategy.CONDITIONAL_SYNC.value: [],
     }
 
+    # Auto-detect target_free if not specified
+    if target_free_gb is None:
+        # Tight constraint: working set + 1.5 blocks
+        target_free_gb = (working_set_size + 1.5) * block_size_mb / 1024
+
+    print(f"\n{'='*60}")
+    print("STRATEGY COMPARISON (with memory pressure)")
+    print(f"{'='*60}")
+    print(f"Blocks: {num_blocks}, Steps: {num_steps}")
+    print(f"Block size: {block_size_mb} MB, Working set: {working_set_size}")
+    print(f"Target free memory: {target_free_gb:.2f} GB")
+
     for strategy in [TransferStrategy.PURE_ASYNC, TransferStrategy.PURE_SYNC, TransferStrategy.CONDITIONAL_SYNC]:
-        print(f"\n{'='*60}")
-        print(f"Testing strategy: {strategy.value}")
-        print(f"{'='*60}")
+        print(f"\n--- {strategy.value} ---")
 
         for trial in range(num_trials):
-            print(f"\n  Trial {trial + 1}/{num_trials}")
+            print(f"  Trial {trial + 1}/{num_trials}")
 
             simulator = VideoditBlockSimulator(
                 num_blocks=num_blocks,
                 num_steps=num_steps,
                 block_size_mb=block_size_mb,
                 working_set_size=working_set_size,
+                target_free_gb=target_free_gb,
             )
 
             monitor = MemoryMonitor(interval_ms=50)
             monitor.start()
 
             try:
-                stats = simulator.simulate_inference(strategy, monitor)
+                stats = simulator.simulate_inference(strategy, monitor, compute_time_ms=0.5)
                 results[strategy.value].append(stats)
             finally:
                 monitor.stop()
 
-            # Cleanup between trials
             torch.cuda.empty_cache()
-            time.sleep(1)
+            time.sleep(0.5)
 
     return results
 
 
 def print_comparison_table(results: Dict[str, List[StrategyStats]]):
-    """Print comparison table in paper format"""
-    print("\n" + "="*80)
-    print("QUANTITATIVE COMPARISON RESULTS")
-    print("="*80)
-    print(f"{'Strategy':<20} {'OOM Rate':<12} {'Peak Memory':<15} {'Peak Variance':<15} {'Sync Rate':<12}")
+    """Print results in paper format"""
+    print(f"\n{'='*80}")
+    print("RESULTS TABLE")
+    print(f"{'='*80}")
+    print(f"{'Strategy':<20} {'OOM Rate':<12} {'Peak Memory':<15} {'Peak Var':<12} {'Sync Rate':<12}")
     print("-"*80)
 
     for strategy_name, stats_list in results.items():
         if not stats_list:
             continue
 
-        # Calculate averages
-        oom_rate = np.mean([s.oom_count > 0 for s in stats_list]) * 100
+        oom_rate = np.mean([1 if s.oom_count > 0 else 0 for s in stats_list]) * 100
         peak_memory = np.mean([s.peak_memory_gb for s in stats_list])
-        peak_variance = np.mean([s.peak_variance_gb for s in stats_list])
+        peak_var = np.std([s.peak_memory_gb for s in stats_list])
         sync_rate = np.mean([s.sync_trigger_rate for s in stats_list]) * 100
 
-        print(f"{strategy_name:<20} {oom_rate:>8.1f}% {peak_memory:>12.2f} GB {peak_variance:>11.4f} GB² {sync_rate:>8.1f}%")
+        print(f"{strategy_name:<20} {oom_rate:>8.1f}%    {peak_memory:>10.2f} GB  ±{peak_var:>6.2f} GB  {sync_rate:>8.1f}%")
 
     print("="*80)
 
 
 if __name__ == "__main__":
-    print("Offload Strategy Comparison Test")
-    print("="*50)
+    # Get GPU info
+    summary = get_memory_summary()
+    print("GPU Info:")
+    for k, v in summary.items():
+        print(f"  {k}: {v}")
 
-    # Run quick test
+    # Run with tight memory constraints
+    total_gb = summary['total_memory_gb']
+
+    # Use ~3% of GPU as block size (realistic)
+    block_size_mb = max(300, min(700, total_gb * 1024 * 0.03))
+
+    # Target: leave room for working_set + 1 block
+    working_set = 4
+    target_free = (working_set + 1.2) * block_size_mb / 1024
+
     results = run_strategy_comparison(
         num_blocks=20,
-        num_steps=5,
-        block_size_mb=100,
-        working_set_size=3,
+        num_steps=3,
+        block_size_mb=block_size_mb,
+        working_set_size=working_set,
+        target_free_gb=target_free,
         num_trials=2,
     )
 
