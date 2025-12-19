@@ -167,7 +167,7 @@ class BlockOffloadSimulator:
         # Conditional sync state
         self.recent_failures: List[float] = []
         self.failure_window = 5.0
-        self.safety_margin_gb = 2.0
+        self.safety_margin_gb = 1.0  # Reduced for tighter memory scenarios
 
     def initialize(self):
         """Create and place blocks according to working set"""
@@ -179,29 +179,37 @@ class BlockOffloadSimulator:
         torch.cuda.empty_cache()
         gc.collect()
 
-        # Create blocks on GPU first, then move excess to CPU
+        mem_before = torch.cuda.memory_allocated(self.device_id) / (1024**3)
+        print(f"  Memory before init: {mem_before:.2f} GB")
+
+        # Create blocks - always create on CPU first to avoid OOM during init
         for i in range(self.num_blocks):
+            # Create on CPU first
             block = SimulatedBlock(
                 hidden_size=self.hidden_size,
                 intermediate_size=self.hidden_size * 4
-            ).to(dtype=torch.bfloat16)
-
-            if i < self.working_set_size:
-                block = block.to(self.device)
-                self.block_locations.append('gpu')
-            else:
-                block = block.to('cpu')
-                self.block_locations.append('cpu')
+            ).to(dtype=torch.bfloat16, device='cpu')
 
             self.blocks.append(block)
+            self.block_locations.append('cpu')
 
-            if (i + 1) % 10 == 0:
-                print(f"  Created {i + 1}/{self.num_blocks} blocks")
+            if (i + 1) % 20 == 0:
+                print(f"  Created {i + 1}/{self.num_blocks} blocks on CPU")
+
+        # Now move working set to GPU
+        print(f"  Moving working set ({self.working_set_size} blocks) to GPU...")
+        for i in range(self.working_set_size):
+            self.blocks[i] = self.blocks[i].to(self.device)
+            self.block_locations[i] = 'gpu'
+            torch.cuda.synchronize(self.device_id)
 
         # Report memory
         block_size = self.blocks[0].get_memory_size_gb()
-        print(f"Block size: {block_size * 1024:.1f} MB")
-        print(f"Working set on GPU: {self.working_set_size} blocks = {block_size * self.working_set_size:.2f} GB")
+        mem_after = torch.cuda.memory_allocated(self.device_id) / (1024**3)
+        print(f"  Block size: {block_size * 1024:.1f} MB")
+        print(f"  Working set on GPU: {self.working_set_size} blocks = {block_size * self.working_set_size:.2f} GB")
+        print(f"  Memory after init: {mem_after:.2f} GB")
+        print(f"  Free memory: {self._get_free_memory_gb():.2f} GB")
 
         torch.cuda.synchronize()
 
@@ -415,9 +423,17 @@ def run_stress_trial(
     total_time = time.time() - start_time
     peak_memory_gb = torch.cuda.max_memory_allocated() / (1024**3)
 
-    # Calculate sync trigger rate
+    # Calculate sync trigger rate and save stats BEFORE cleanup
     total_transfers = sim.stats.load_count + sim.stats.offload_count
     sync_trigger_rate = sim.stats.sync_count / max(1, total_transfers)
+
+    # Save stats before cleanup
+    saved_stats = {
+        "load_count": sim.stats.load_count,
+        "offload_count": sim.stats.offload_count,
+        "sync_count": sim.stats.sync_count,
+        "oom_count": sim.stats.oom_count,
+    }
 
     # Clean up
     del sim
@@ -434,12 +450,7 @@ def run_stress_trial(
         peak_memory_gb=peak_memory_gb,
         total_time_s=total_time,
         sync_trigger_rate=sync_trigger_rate,
-        stats={
-            "load_count": sim.stats.load_count if 'sim' in dir() else 0,
-            "offload_count": sim.stats.offload_count if 'sim' in dir() else 0,
-            "sync_count": sim.stats.sync_count if 'sim' in dir() else 0,
-            "oom_count": sim.stats.oom_count if 'sim' in dir() else 0,
-        }
+        stats=saved_stats,
     )
 
 
@@ -571,18 +582,20 @@ def generate_comparison(results: Dict) -> Dict:
 def auto_detect_block_size() -> int:
     """Auto-detect appropriate block size based on GPU memory"""
     if not torch.cuda.is_available():
-        return 200
+        return 100
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
 
+    # Use smaller blocks to allow room for activations and ensure
+    # sync strategies can make a difference
     if total_mem_gb >= 40:  # A100-40GB, A6000
-        return 650  # Full HunyuanVideo block size
+        return 400  # Smaller than HunyuanVideo for testing
     elif total_mem_gb >= 24:  # RTX 4090, A5000
-        return 400
+        return 200  # More conservative
     elif total_mem_gb >= 16:  # RTX 4070, V100-16GB
-        return 250
-    else:  # 8GB cards
         return 150
+    else:  # 8GB cards
+        return 80
 
 
 def main():
