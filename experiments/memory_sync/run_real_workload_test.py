@@ -86,7 +86,7 @@ def get_gpu_memory_info() -> Dict[str, float]:
     }
 
 
-def load_hunyuan_pipeline(model_id: str = "tencent/HunyuanVideo"):
+def load_hunyuan_pipeline(model_id: str = None):
     """Load HunyuanVideo pipeline"""
     from diffusers import (
         HunyuanVideoPipeline,
@@ -94,25 +94,51 @@ def load_hunyuan_pipeline(model_id: str = "tencent/HunyuanVideo"):
         FlowMatchEulerDiscreteScheduler
     )
 
+    # Default to local path, fallback to HuggingFace
+    if model_id is None:
+        local_path = os.path.join(os.path.dirname(__file__), "../../models/HunyuanVideo")
+        if os.path.exists(local_path):
+            model_id = local_path
+        else:
+            model_id = "tencent/HunyuanVideo"
+
     print(f"Loading HunyuanVideo model from {model_id}...")
 
-    transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-        model_id,
-        subfolder="transformer",
-        torch_dtype=torch.bfloat16,
-        revision='refs/pr/18'
-    )
+    # Check if loading from local path (no revision needed)
+    is_local = os.path.exists(model_id)
+
+    if is_local:
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(
+            model_id,
+            subfolder="transformer",
+            torch_dtype=torch.bfloat16,
+        )
+    else:
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(
+            model_id,
+            subfolder="transformer",
+            torch_dtype=torch.bfloat16,
+            revision='refs/pr/18'
+        )
 
     flow_shift = 7.0
     scheduler = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
 
-    pipe = HunyuanVideoPipeline.from_pretrained(
-        model_id,
-        transformer=transformer,
-        scheduler=scheduler,
-        revision='refs/pr/18',
-        torch_dtype=torch.bfloat16
-    )
+    if is_local:
+        pipe = HunyuanVideoPipeline.from_pretrained(
+            model_id,
+            transformer=transformer,
+            scheduler=scheduler,
+            torch_dtype=torch.bfloat16
+        )
+    else:
+        pipe = HunyuanVideoPipeline.from_pretrained(
+            model_id,
+            transformer=transformer,
+            scheduler=scheduler,
+            revision='refs/pr/18',
+            torch_dtype=torch.bfloat16
+        )
 
     pipe.vae.enable_tiling()
     pipe.to("cuda")
@@ -125,10 +151,18 @@ def load_hunyuan_pipeline(model_id: str = "tencent/HunyuanVideo"):
     return pipe
 
 
-def load_wan_pipeline(model_id: str = "Wan-AI/Wan2.1-T2V-14B-Diffusers"):
+def load_wan_pipeline(model_id: str = None):
     """Load Wan pipeline"""
     from diffusers import AutoencoderKLWan, WanPipeline
     from diffusers.schedulers.scheduling_unipc_multistep import UniPCMultistepScheduler
+
+    # Default to local path, fallback to HuggingFace
+    if model_id is None:
+        local_path = os.path.join(os.path.dirname(__file__), "../../models/Wan2.1-T2V-14B")
+        if os.path.exists(local_path):
+            model_id = local_path
+        else:
+            model_id = "Wan-AI/Wan2.1-T2V-14B-Diffusers"
 
     print(f"Loading Wan model from {model_id}...")
 
@@ -291,6 +325,7 @@ def run_strategy_comparison(
     num_frames: int = 49,
     prompt: str = "A cat walking in the garden, realistic",
     output_dir: str = "./results",
+    model_path: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Run comparison across multiple sync strategies"""
 
@@ -298,6 +333,8 @@ def run_strategy_comparison(
     print("MEMORY SYNC STRATEGY COMPARISON - REAL WORKLOAD TEST")
     print(f"{'='*80}")
     print(f"Model: {model_type}")
+    if model_path:
+        print(f"Model path: {model_path}")
     print(f"Resolution: {height}x{width}, {num_frames} frames")
     print(f"Inference steps: {num_inference_steps}")
     print(f"Working set size: {working_set_size} blocks")
@@ -305,9 +342,9 @@ def run_strategy_comparison(
 
     # Load model
     if model_type == "hunyuan":
-        pipe = load_hunyuan_pipeline()
+        pipe = load_hunyuan_pipeline(model_path)
     elif model_type == "wan":
-        pipe = load_wan_pipeline()
+        pipe = load_wan_pipeline(model_path)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
@@ -420,6 +457,13 @@ def main():
     )
 
     parser.add_argument(
+        "--model-path",
+        type=str,
+        default=None,
+        help="Path to local model directory (e.g., models/HunyuanVideo)"
+    )
+
+    parser.add_argument(
         "--strategy",
         type=str,
         default="all",
@@ -513,6 +557,7 @@ def main():
         num_frames=args.num_frames,
         prompt=args.prompt,
         output_dir=args.output_dir,
+        model_path=args.model_path,
     )
 
 
