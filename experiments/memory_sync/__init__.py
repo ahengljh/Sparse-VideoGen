@@ -11,17 +11,19 @@ Modules:
     execution_pattern_analysis: VDM vs LLM pattern comparison
     quantitative_comparison: Main results table generation
     conditional_sync_experiment: Sync strategy validation
-    real_model_experiment: Integration with actual Video DiT models
+    real_block_offload: Real model block offloading integration
+    run_real_workload_test: Full inference testing with sync protocols
+    memory_stress_test: Lightweight stress testing for memory patterns
 
 Quick Start:
-    # Run all experiments
+    # Run stress test (no model download required)
+    python memory_stress_test.py --strategy all
+
+    # Run with real model inference
+    python run_real_workload_test.py --model hunyuan --strategy all
+
+    # Run all simulated experiments
     python run_all_experiments.py --all
-
-    # Run specific experiment
-    python run_all_experiments.py --quantitative
-
-    # Run with custom parameters
-    python run_all_experiments.py --quantitative --num-trials 10
 """
 
 from .memory_monitor import (
@@ -42,7 +44,16 @@ from .offload_strategies import (
     run_strategy_comparison,
 )
 
+from .real_block_offload import (
+    SyncStrategy,
+    BlockOffloadManager,
+    OffloadingTransformerWrapper,
+    BlockStats,
+    OffloadStats,
+)
+
 __all__ = [
+    # Memory monitoring
     'MemoryMonitor',
     'MemorySnapshot',
     'MemoryExperimentResult',
@@ -50,9 +61,16 @@ __all__ = [
     'get_memory_summary',
     'estimate_largest_free_block',
     'save_experiment_results',
+    # Simulated offload strategies
     'TransferStrategy',
     'BlockOffloader',
     'VideoditBlockSimulator',
     'StrategyStats',
     'run_strategy_comparison',
+    # Real model offloading
+    'SyncStrategy',
+    'BlockOffloadManager',
+    'OffloadingTransformerWrapper',
+    'BlockStats',
+    'OffloadStats',
 ]

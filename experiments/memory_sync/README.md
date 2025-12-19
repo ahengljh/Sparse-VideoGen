@@ -16,29 +16,61 @@ This experiment suite validates the claims made in the paper about the necessity
 
 ```
 experiments/memory_sync/
-├── memory_monitor.py          # GPU memory monitoring utilities
-├── offload_strategies.py      # Async/Sync/Conditional transfer implementations
-├── failure_experiments.py     # Three failure mechanism experiments
-├── execution_pattern_analysis.py  # VDM vs LLM pattern comparison
-├── quantitative_comparison.py # Main results table generation
+├── memory_monitor.py            # GPU memory monitoring utilities
+├── offload_strategies.py        # Async/Sync/Conditional transfer implementations
+├── failure_experiments.py       # Three failure mechanism experiments
+├── execution_pattern_analysis.py # VDM vs LLM pattern comparison
+├── quantitative_comparison.py   # Main results table generation
 ├── conditional_sync_experiment.py # Sync strategy validation
-├── real_model_experiment.py   # Integration with actual Video DiT models
-├── run_all_experiments.py     # Main experiment runner
-└── README.md                  # This file
+├── real_block_offload.py        # Real transformer block offloading wrapper
+├── run_real_workload_test.py    # Full inference testing with sync protocols
+├── memory_stress_test.py        # Lightweight stress test (no model required)
+├── run_all_experiments.py       # Main experiment runner (simulated)
+└── README.md                    # This file
 ```
 
 ## Quick Start
 
-### Run All Experiments
+### Option 1: Memory Stress Test (No Model Download Required)
+
+The stress test creates realistic memory pressure patterns using simulated blocks
+that match Video DiT memory footprint. This is the fastest way to validate sync protocols:
 
 ```bash
 cd experiments/memory_sync
-python run_all_experiments.py --all
+
+# Run all strategies
+python memory_stress_test.py --strategy all
+
+# Single strategy with more trials
+python memory_stress_test.py --strategy conditional_sync --num-trials 5
+
+# Custom configuration
+python memory_stress_test.py --num-blocks 60 --num-steps 20 --working-set-size 5
 ```
 
-### Run Specific Experiments
+### Option 2: Real Model Inference Test
+
+For full validation with actual HunyuanVideo or Wan model inference:
 
 ```bash
+# Test with HunyuanVideo
+python run_real_workload_test.py --model hunyuan --strategy all
+
+# Test with Wan
+python run_real_workload_test.py --model wan --strategy all
+
+# Single strategy with custom resolution
+python run_real_workload_test.py --model hunyuan --strategy conditional_sync \
+    --height 480 --width 848 --num-frames 49
+```
+
+### Option 3: Simulated Experiments (Original)
+
+```bash
+# Run all simulated experiments
+python run_all_experiments.py --all
+
 # Execution pattern analysis (VDM vs LLM)
 python run_all_experiments.py --execution-pattern
 
