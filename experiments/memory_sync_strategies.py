@@ -209,21 +209,27 @@ class AsyncMemoryStrategy(BaseSyncStrategy):
 
     This strategy demonstrates the issues with PyTorch's default async memory management
     for Video DiT workloads:
-    - Deferred reclamation: cudaFreeAsync is non-blocking
+    - Deferred reclamation: cudaFreeAsync is non-blocking, memory not immediately available
     - Fragmentation accumulation: Different sized allocations interleave
-    - Peak overlap: Async operations can overlap causing memory spikes
+    - Peak overlap: Async offload and load operations can overlap causing memory spikes
+
+    Note: We still wait for load to complete before forward (otherwise we get device errors),
+    but we DON'T wait for offload to complete or clean up memory - this is where the
+    async issues manifest.
     """
 
     def __init__(self, device: int = 0, **kwargs):
         super().__init__(device, **kwargs)
 
     def load_block(self, block: torch.nn.Module, block_size_mb: float) -> bool:
-        """Load block asynchronously without waiting"""
+        """Load block asynchronously"""
         try:
             self.load_count += 1
-            # Use non_blocking transfer for async behavior
+            # Use non_blocking transfer on load stream
             with torch.cuda.stream(self.load_stream):
                 block.to(device=f'cuda:{self.device}', non_blocking=True)
+            # Note: We'll synchronize the load stream in pre_forward_sync
+            # to ensure block is on GPU before forward
             return True
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -232,12 +238,20 @@ class AsyncMemoryStrategy(BaseSyncStrategy):
             raise
 
     def offload_block(self, block: torch.nn.Module) -> bool:
-        """Offload block asynchronously without waiting"""
+        """Offload block asynchronously WITHOUT waiting for completion.
+
+        This is where async issues manifest - we don't wait for the memory
+        to be actually freed, which can cause:
+        1. Deferred reclamation: memory still occupied when we need it
+        2. Peak overlap: old and new blocks both in GPU memory briefly
+        """
         try:
             self.offload_count += 1
-            # Use non_blocking transfer
+            # Use non_blocking transfer - DON'T wait for completion
             with torch.cuda.stream(self.offload_stream):
                 block.to(device='cpu', non_blocking=True)
+            # No synchronization here - this is the key async behavior
+            # The memory may not be freed yet when we return
             return True
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -245,11 +259,15 @@ class AsyncMemoryStrategy(BaseSyncStrategy):
             raise
 
     def pre_forward_sync(self, block_idx: int, total_blocks: int):
-        """No synchronization in async mode"""
-        pass
+        """Wait for load stream to ensure block is on GPU before forward.
+
+        We must do this minimal sync to avoid device mismatch errors.
+        But we still don't clean up memory or wait for offloads.
+        """
+        self.load_stream.synchronize()
 
     def post_forward_sync(self, block_idx: int, total_blocks: int):
-        """No synchronization in async mode"""
+        """No synchronization after forward - don't wait for offloads or clean memory"""
         pass
 
 
