@@ -564,11 +564,26 @@ class BlockOffloadManager:
 
 def create_strategy(strategy_type: SyncStrategy, device: int = 0, **kwargs) -> BaseSyncStrategy:
     """Factory function to create sync strategy instances"""
+    # Common kwargs for base class
+    base_kwargs = {
+        'safety_margin_mb': kwargs.get('safety_margin_mb', 1000.0),
+    }
+
     if strategy_type == SyncStrategy.PURE_ASYNC:
-        return AsyncMemoryStrategy(device=device, **kwargs)
+        return AsyncMemoryStrategy(device=device, **base_kwargs)
     elif strategy_type == SyncStrategy.PURE_SYNC:
-        return SyncMemoryStrategy(device=device, **kwargs)
+        sync_kwargs = {
+            **base_kwargs,
+            'aggressive_gc': kwargs.get('aggressive_gc', True),
+        }
+        return SyncMemoryStrategy(device=device, **sync_kwargs)
     elif strategy_type == SyncStrategy.CONDITIONAL_SYNC:
-        return ConditionalSyncMemoryStrategy(device=device, **kwargs)
+        conditional_kwargs = {
+            **base_kwargs,
+            'memory_threshold_ratio': kwargs.get('memory_threshold_ratio', 0.15),
+            'failure_window': kwargs.get('failure_window', 3),
+            'phase_sync_interval': kwargs.get('phase_sync_interval', 10),
+        }
+        return ConditionalSyncMemoryStrategy(device=device, **conditional_kwargs)
     else:
         raise ValueError(f"Unknown strategy type: {strategy_type}")
