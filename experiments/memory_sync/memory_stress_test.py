@@ -94,21 +94,18 @@ class SimulatedBlock(nn.Module):
         self.norm1 = nn.LayerNorm(hidden_size)
         self.norm2 = nn.LayerNorm(hidden_size)
 
+    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Simplified forward for testing
+        # Simplified forward for testing - use no_grad to avoid storing activations
         residual = x
         x = self.norm1(x)
-        q = self.q_proj(x)
-        k = self.k_proj(x)
-        v = self.v_proj(x)
         # Simplified attention (just for memory patterns)
-        x = self.o_proj(v)
+        x = self.o_proj(self.v_proj(x))
         x = residual + x
 
         residual = x
         x = self.norm2(x)
-        x = self.gate_proj(x) * self.up_proj(x)
-        x = self.down_proj(x)
+        x = self.down_proj(self.gate_proj(x) * self.up_proj(x))
         x = residual + x
 
         return x
@@ -365,7 +362,7 @@ def run_stress_trial(
     strategy: SyncStrategy,
     block_size_mb: int,
     batch_size: int = 1,
-    seq_len: int = 1024,
+    seq_len: int = 256,  # Reduced to minimize activation memory
 ) -> TrialResult:
     """Run a single stress test trial"""
 
