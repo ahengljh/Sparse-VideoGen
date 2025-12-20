@@ -519,6 +519,8 @@ def run_real_workload(
             pipe.text_encoder_2.to(cuda_device)
 
         # Step 2: Encode prompts
+        # HunyuanVideoPipeline handles classifier-free guidance automatically
+        # when negative_prompt is provided
         with torch.no_grad():
             prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = pipe.encode_prompt(
                 prompt=config.prompt,
@@ -526,7 +528,6 @@ def run_real_workload(
                 device=cuda_device,
                 dtype=torch.bfloat16,
                 num_videos_per_prompt=1,
-                do_classifier_free_guidance=config.guidance_scale > 1.0,
                 negative_prompt=config.negative_prompt,
                 negative_prompt_2=None,
             )
