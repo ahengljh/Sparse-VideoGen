@@ -547,8 +547,16 @@ def run_real_workload(
         if hasattr(pipe, 'text_encoder_2') and pipe.text_encoder_2 is not None:
             pipe.text_encoder_2.to('cpu')
 
+        # Delete text encoder references to allow memory to be freed
+        del pipe.text_encoder
+        if hasattr(pipe, 'text_encoder_2'):
+            del pipe.text_encoder_2
+        pipe.text_encoder = None
+        pipe.text_encoder_2 = None
+
         gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.synchronize(config.device)
 
         mem_after_offload = torch.cuda.memory_allocated(config.device) / (1024 ** 3)
         print(f"  GPU memory after text encoder offload: {mem_after_offload:.2f} GB")
@@ -556,13 +564,23 @@ def run_real_workload(
         # Step 4: Move VAE to GPU
         pipe.vae.to(cuda_device)
 
-        # Step 5: Move ENTIRE transformer to GPU first, then offload blocks to CPU
-        # This ensures all embedding layers and non-block components are on GPU
-        print("  Moving transformer to GPU...")
-        transformer.to(cuda_device)
+        # Step 5: Move ONLY the embedding layers to GPU (NOT the entire transformer!)
+        # The transformer is ~24GB (60 blocks × 396MB), way too large for GPU.
+        # We only move the non-block components that need to be on GPU.
+        print("  Moving transformer embedding layers to GPU...")
 
-        # Initialize offload state - this will move blocks to CPU but leave
-        # embedding layers (rope, time_text_embed, x_embedder, etc.) on GPU
+        # Move each embedding layer explicitly and verify
+        for name in ['rope', 'time_text_embed', 'x_embedder', 'context_embedder', 'norm_out', 'proj_out']:
+            module = getattr(transformer, name, None)
+            if module is not None:
+                module.to(cuda_device)
+                # Verify it moved
+                first_param = next(module.parameters(), None)
+                if first_param is not None:
+                    assert first_param.device.type == 'cuda', f"{name} failed to move to GPU"
+                print(f"    {name}: moved to GPU")
+
+        # Initialize offload state - moves blocks to CPU, loads working set
         wrapper.initialize_offload_state()
 
         # Replace transformer forward with our offloading version
@@ -646,10 +664,14 @@ def run_real_workload(
         # Restore original forward
         transformer.forward = original_forward
 
-        # Cleanup
+        # Aggressive cleanup to free GPU memory for next trial
+        print("  Cleaning up GPU memory...")
         del pipe, transformer, wrapper
+        del prompt_embeds, pooled_prompt_embeds, prompt_attention_mask
+        del negative_prompt_embeds, negative_pooled_prompt_embeds, negative_prompt_attention_mask
         gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.synchronize(config.device)
 
     except Exception as e:
         error_msg = str(e).lower()
@@ -672,6 +694,12 @@ def run_real_workload(
 
         gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.synchronize(config.device)
+
+    # Final cleanup - ensure GPU memory is released before next trial
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(config.device)
 
     # Print summary
     print(f"\n  {'='*50}")
