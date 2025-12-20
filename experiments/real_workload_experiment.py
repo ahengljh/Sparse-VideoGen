@@ -57,7 +57,7 @@ class RealWorkloadConfig:
     prompt: str = "A cat walks on the grass, realistic style, high quality"
     negative_prompt: str = "low quality, blurry, distorted"
 
-    working_set_size: int = 5
+    working_set_size: int = 3  # Reduced for 720p to fit in 24GB GPU
     device: int = 0
     seed: int = 42
 
@@ -508,20 +508,53 @@ def run_real_workload(
         )
         pipe.vae.enable_tiling()
 
-        # Move non-transformer components to GPU
-        # HunyuanVideo has two text encoders: text_encoder (LLaVA) and text_encoder_2 (CLIP)
-        pipe.text_encoder.to(f'cuda:{config.device}')
+        # CRITICAL: Encode prompts first, then offload text encoders to free ~14GB
+        # Text encoders (LLaVA ~13GB + CLIP ~1GB) consume most of the memory
+        cuda_device = f'cuda:{config.device}'
+
+        # Step 1: Move text encoders to GPU for encoding
+        print("  Encoding prompts (text encoders on GPU)...")
+        pipe.text_encoder.to(cuda_device)
         if hasattr(pipe, 'text_encoder_2') and pipe.text_encoder_2 is not None:
-            pipe.text_encoder_2.to(f'cuda:{config.device}')
-        pipe.vae.to(f'cuda:{config.device}')
+            pipe.text_encoder_2.to(cuda_device)
+
+        # Step 2: Encode prompts
+        with torch.no_grad():
+            prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = pipe.encode_prompt(
+                prompt=config.prompt,
+                prompt_2=None,
+                device=cuda_device,
+                dtype=torch.bfloat16,
+                num_videos_per_prompt=1,
+                do_classifier_free_guidance=config.guidance_scale > 1.0,
+                negative_prompt=config.negative_prompt,
+                negative_prompt_2=None,
+            )
+
+        print(f"  Prompt embeddings shape: {prompt_embeds.shape}")
+
+        # Step 3: Offload text encoders to CPU to free ~14GB
+        print("  Offloading text encoders to CPU to free memory...")
+        pipe.text_encoder.to('cpu')
+        if hasattr(pipe, 'text_encoder_2') and pipe.text_encoder_2 is not None:
+            pipe.text_encoder_2.to('cpu')
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        mem_after_offload = torch.cuda.memory_allocated(config.device) / (1024 ** 3)
+        print(f"  GPU memory after text encoder offload: {mem_after_offload:.2f} GB")
+
+        # Step 4: Move VAE and transformer embeddings to GPU
+        pipe.vae.to(cuda_device)
 
         # Keep transformer embedding layers on GPU
-        transformer.rope.to(f'cuda:{config.device}')
-        transformer.time_text_embed.to(f'cuda:{config.device}')
-        transformer.x_embedder.to(f'cuda:{config.device}')
-        transformer.context_embedder.to(f'cuda:{config.device}')
-        transformer.norm_out.to(f'cuda:{config.device}')
-        transformer.proj_out.to(f'cuda:{config.device}')
+        transformer.rope.to(cuda_device)
+        transformer.time_text_embed.to(cuda_device)
+        transformer.x_embedder.to(cuda_device)
+        transformer.context_embedder.to(cuda_device)
+        transformer.norm_out.to(cuda_device)
+        transformer.proj_out.to(cuda_device)
 
         # Initialize offload state
         wrapper.initialize_offload_state()
@@ -549,9 +582,11 @@ def run_real_workload(
         profiler.reset_peak_stats()
 
         try:
+            # Use pre-encoded prompts instead of raw text
             output = pipe(
-                prompt=config.prompt,
-                negative_prompt=config.negative_prompt,
+                prompt_embeds=prompt_embeds,
+                pooled_prompt_embeds=pooled_prompt_embeds,
+                prompt_attention_mask=prompt_attention_mask,
                 height=config.height,
                 width=config.width,
                 num_frames=config.num_frames,
@@ -725,8 +760,8 @@ def main():
                        help="Strategy to test")
     parser.add_argument("--num_trials", type=int, default=3,
                        help="Number of trials per strategy")
-    parser.add_argument("--working_set_size", type=int, default=5,
-                       help="Number of blocks to keep on GPU")
+    parser.add_argument("--working_set_size", type=int, default=3,
+                       help="Number of blocks to keep on GPU (default: 3 for 720p on 24GB GPU)")
     parser.add_argument("--num_steps", type=int, default=50,
                        help="Number of inference steps (default: 50 for standard HunyuanVideo)")
     parser.add_argument("--height", type=int, default=720,
