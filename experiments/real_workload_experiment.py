@@ -518,18 +518,25 @@ def run_real_workload(
         if hasattr(pipe, 'text_encoder_2') and pipe.text_encoder_2 is not None:
             pipe.text_encoder_2.to(cuda_device)
 
-        # Step 2: Encode prompts
-        # HunyuanVideoPipeline handles classifier-free guidance automatically
-        # when negative_prompt is provided
+        # Step 2: Encode prompts (positive and negative separately)
+        # HunyuanVideoPipeline requires separate encoding for classifier-free guidance
         with torch.no_grad():
+            # Encode positive prompt
             prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = pipe.encode_prompt(
                 prompt=config.prompt,
                 prompt_2=None,
+                num_videos_per_prompt=1,
                 device=cuda_device,
                 dtype=torch.bfloat16,
+            )
+
+            # Encode negative prompt for classifier-free guidance
+            negative_prompt_embeds, negative_pooled_prompt_embeds, negative_prompt_attention_mask = pipe.encode_prompt(
+                prompt=config.negative_prompt,
+                prompt_2=None,
                 num_videos_per_prompt=1,
-                negative_prompt=config.negative_prompt,
-                negative_prompt_2=None,
+                device=cuda_device,
+                dtype=torch.bfloat16,
             )
 
         print(f"  Prompt embeddings shape: {prompt_embeds.shape}")
@@ -588,6 +595,9 @@ def run_real_workload(
                 prompt_embeds=prompt_embeds,
                 pooled_prompt_embeds=pooled_prompt_embeds,
                 prompt_attention_mask=prompt_attention_mask,
+                negative_prompt_embeds=negative_prompt_embeds,
+                negative_pooled_prompt_embeds=negative_pooled_prompt_embeds,
+                negative_prompt_attention_mask=negative_prompt_attention_mask,
                 height=config.height,
                 width=config.width,
                 num_frames=config.num_frames,
