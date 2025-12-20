@@ -493,7 +493,10 @@ def run_real_workload(
         pipe.vae.enable_tiling()
 
         # Move non-transformer components to GPU
+        # HunyuanVideo has two text encoders: text_encoder (LLaVA) and text_encoder_2 (CLIP)
         pipe.text_encoder.to(f'cuda:{config.device}')
+        if hasattr(pipe, 'text_encoder_2') and pipe.text_encoder_2 is not None:
+            pipe.text_encoder_2.to(f'cuda:{config.device}')
         pipe.vae.to(f'cuda:{config.device}')
 
         # Keep transformer embedding layers on GPU
