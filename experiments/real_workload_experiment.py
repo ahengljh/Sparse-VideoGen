@@ -47,10 +47,11 @@ from experiments.memory_sync_strategies import (
 class RealWorkloadConfig:
     """Configuration for real workload experiments"""
     model_id: str = "tencent/HunyuanVideo"
-    height: int = 544
-    width: int = 960
-    num_frames: int = 61
-    num_inference_steps: int = 30
+    # Standard 720p resolution for fair comparison
+    height: int = 720
+    width: int = 1280
+    num_frames: int = 129  # Standard frame count for HunyuanVideo
+    num_inference_steps: int = 50  # Standard inference steps
     guidance_scale: float = 6.0
 
     prompt: str = "A cat walks on the grass, realistic style, high quality"
@@ -726,14 +727,14 @@ def main():
                        help="Number of trials per strategy")
     parser.add_argument("--working_set_size", type=int, default=5,
                        help="Number of blocks to keep on GPU")
-    parser.add_argument("--num_steps", type=int, default=30,
-                       help="Number of inference steps")
-    parser.add_argument("--height", type=int, default=544,
-                       help="Video height")
-    parser.add_argument("--width", type=int, default=960,
-                       help="Video width")
-    parser.add_argument("--num_frames", type=int, default=61,
-                       help="Number of frames")
+    parser.add_argument("--num_steps", type=int, default=50,
+                       help="Number of inference steps (default: 50 for standard HunyuanVideo)")
+    parser.add_argument("--height", type=int, default=720,
+                       help="Video height (default: 720 for 720p)")
+    parser.add_argument("--width", type=int, default=1280,
+                       help="Video width (default: 1280 for 720p)")
+    parser.add_argument("--num_frames", type=int, default=129,
+                       help="Number of frames (default: 129 for standard HunyuanVideo)")
     parser.add_argument("--output_dir", type=str, default="outputs/memory_sync_experiments",
                        help="Output directory for videos")
     parser.add_argument("--output_json", type=str, default=None,

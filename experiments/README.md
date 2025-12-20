@@ -7,7 +7,7 @@ This directory contains experiments to compare different memory synchronization 
 Video DiT has unique execution patterns that differ from LLMs:
 - **Deterministic Sequential Access**: Blocks execute in order B₁→B₂→...→B_N
 - **No Cross-Step Reuse**: Each diffusion step requires fresh forward pass
-- **High-Frequency Model Traversal**: 40 steps × 60 blocks = 2400 block accesses
+- **High-Frequency Model Traversal**: 50 steps × 60 blocks = 3000 block accesses
 
 PyTorch's async memory management can fail in this scenario due to:
 1. **Deferred Reclamation**: `cudaFreeAsync` is non-blocking
@@ -42,7 +42,7 @@ python experiments/real_workload_experiment.py --strategy all --num_trials 3
 # Test a specific strategy
 python experiments/real_workload_experiment.py --strategy conditional_sync --num_trials 5
 
-# Custom configuration
+# Custom configuration (lower resolution for quick testing)
 python experiments/real_workload_experiment.py \
     --strategy all \
     --num_trials 3 \
@@ -53,6 +53,12 @@ python experiments/real_workload_experiment.py \
     --working_set_size 5 \
     --output_dir outputs/memory_experiments \
     --output_json results.json
+
+# Default 720p configuration (standard HunyuanVideo settings)
+python experiments/real_workload_experiment.py \
+    --strategy all \
+    --num_trials 3 \
+    --output_json results_720p.json
 ```
 
 **What happens:**
@@ -79,14 +85,14 @@ python experiments/stress_test_memory_sync.py --mode peak_overlap --num_trials 5
 ### Configuration Options
 
 ```bash
-# Real workload options
+# Real workload options (720p defaults for standard HunyuanVideo)
 --strategy {pure_async,pure_sync,conditional_sync,all}
 --num_trials 3           # Trials per strategy
 --working_set_size 5     # Blocks to keep on GPU (K)
---num_steps 30           # Diffusion steps (T)
---height 544             # Video height
---width 960              # Video width
---num_frames 61          # Number of frames
+--num_steps 50           # Diffusion steps (default: 50)
+--height 720             # Video height (default: 720p)
+--width 1280             # Video width (default: 1280)
+--num_frames 129         # Number of frames (default: 129)
 --output_dir PATH        # Where to save videos
 --output_json PATH       # Where to save results JSON
 
