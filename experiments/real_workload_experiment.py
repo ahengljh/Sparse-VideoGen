@@ -62,6 +62,10 @@ class RealWorkloadConfig:
 
     output_dir: str = "outputs/memory_sync_experiments"
 
+    # Use local model path if available (avoids network errors)
+    use_local_model: bool = True
+    local_model_path: str = "models/HunyuanVideo"
+
 
 @dataclass
 class WorkloadResult:
@@ -450,14 +454,24 @@ def run_real_workload(
         )
         from diffusers.utils import export_to_video
 
-        print(f"Loading model: {config.model_id}")
+        # Determine model path (local or HuggingFace)
+        import os
+        if config.use_local_model and os.path.exists(config.local_model_path):
+            model_path = config.local_model_path
+            revision = None
+            print(f"Loading model from local path: {model_path}")
+        else:
+            model_path = config.model_id
+            revision = 'refs/pr/18'
+            print(f"Loading model from HuggingFace: {model_path}")
 
         # Load transformer
         transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-            config.model_id,
+            model_path,
             subfolder="transformer",
             torch_dtype=torch.bfloat16,
-            revision='refs/pr/18'
+            revision=revision,
+            local_files_only=config.use_local_model and os.path.exists(config.local_model_path),
         )
 
         # Create sync strategy
@@ -484,11 +498,12 @@ def run_real_workload(
         # Load pipeline
         scheduler = FlowMatchEulerDiscreteScheduler(shift=7.0)
         pipe = HunyuanVideoPipeline.from_pretrained(
-            config.model_id,
+            model_path,
             transformer=transformer,
             scheduler=scheduler,
-            revision='refs/pr/18',
-            torch_dtype=torch.bfloat16
+            revision=revision,
+            torch_dtype=torch.bfloat16,
+            local_files_only=config.use_local_model and os.path.exists(config.local_model_path),
         )
         pipe.vae.enable_tiling()
 
@@ -592,8 +607,20 @@ def run_real_workload(
         torch.cuda.empty_cache()
 
     except Exception as e:
-        result.oom_occurred = True
-        result.oom_message = str(e)
+        error_msg = str(e).lower()
+        # Distinguish between OOM errors and other errors (like network issues)
+        if "out of memory" in error_msg or "cuda" in error_msg:
+            result.oom_occurred = True
+            result.oom_message = f"OOM: {e}"
+        elif "connection" in error_msg or "protocol" in error_msg or "network" in error_msg:
+            # Network error - don't count as OOM
+            result.oom_occurred = False
+            result.oom_message = f"Network error (not OOM): {e}"
+        else:
+            # Unknown error - be conservative and don't count as OOM
+            result.oom_occurred = False
+            result.oom_message = f"Error (not OOM): {e}"
+
         print(colored(f"Error: {e}", "red"))
         import traceback
         traceback.print_exc()
@@ -714,7 +741,11 @@ def main():
     parser.add_argument("--seed", type=int, default=42,
                        help="Random seed")
     parser.add_argument("--model_id", type=str, default="tencent/HunyuanVideo",
-                       help="Model ID")
+                       help="Model ID (HuggingFace)")
+    parser.add_argument("--local_model_path", type=str, default="models/HunyuanVideo",
+                       help="Local model path (used if exists)")
+    parser.add_argument("--no_local_model", action="store_true",
+                       help="Force download from HuggingFace instead of using local model")
 
     args = parser.parse_args()
 
@@ -738,6 +769,8 @@ def main():
         working_set_size=args.working_set_size,
         seed=args.seed,
         output_dir=args.output_dir,
+        use_local_model=not args.no_local_model,
+        local_model_path=args.local_model_path,
     )
 
     # Determine strategies
