@@ -553,18 +553,16 @@ def run_real_workload(
         mem_after_offload = torch.cuda.memory_allocated(config.device) / (1024 ** 3)
         print(f"  GPU memory after text encoder offload: {mem_after_offload:.2f} GB")
 
-        # Step 4: Move VAE and transformer embeddings to GPU
+        # Step 4: Move VAE to GPU
         pipe.vae.to(cuda_device)
 
-        # Keep transformer embedding layers on GPU
-        transformer.rope.to(cuda_device)
-        transformer.time_text_embed.to(cuda_device)
-        transformer.x_embedder.to(cuda_device)
-        transformer.context_embedder.to(cuda_device)
-        transformer.norm_out.to(cuda_device)
-        transformer.proj_out.to(cuda_device)
+        # Step 5: Move ENTIRE transformer to GPU first, then offload blocks to CPU
+        # This ensures all embedding layers and non-block components are on GPU
+        print("  Moving transformer to GPU...")
+        transformer.to(cuda_device)
 
-        # Initialize offload state
+        # Initialize offload state - this will move blocks to CPU but leave
+        # embedding layers (rope, time_text_embed, x_embedder, etc.) on GPU
         wrapper.initialize_offload_state()
 
         # Replace transformer forward with our offloading version
