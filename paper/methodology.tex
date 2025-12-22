@@ -1,10 +1,14 @@
-% Methodology Section for CTCA/CTAA Paper
-% Compile with: pdflatex methodology.tex
-
 \section{Methodology}
 \label{sec:methodology}
 
-We present \textbf{Cross-Timestep Amortization} (CTA), a suite of techniques that exploit temporal coherence in diffusion models to accelerate sparse attention computation. Our approach consists of two complementary components: \textbf{Cross-Timestep Cluster Amortization} (CTCA) for reducing K-means clustering overhead, and \textbf{Cross-Timestep Attention Amortization} (CTAA) for hierarchical sparse attention computation. Figure~\ref{fig:overview} illustrates the overall architecture.
+We present \textbf{RabbitVideo}, which exploits temporal coherence in diffusion models to accelerate sparse attention computation. The system comprises two complementary components: \textbf{Reuse-Across-Blocks} (RAB) for reducing K-means clustering overhead, and \textbf{Block-Importance Tiers} (BIT) for hierarchical sparse attention computation. Figure~\ref{fig:overview} illustrates the overall architecture.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{Figures/architecture.png}
+    \caption{RabbitVideo overview. RabbitVideo amortizes semantic sparse attention across diffusion timesteps via a CPU-resident cluster cache (RAB), allocates attention computation using block-importance tiers (BIT), and fits within memory budgets by streaming transformer blocks with a sliding-window offloading runtime.}
+    \label{fig:overview}
+\end{figure}
 
 \subsection{Preliminaries}
 \label{sec:preliminaries}
@@ -17,7 +21,7 @@ Video diffusion models generate videos by iteratively denoising a latent represe
 where $\mathbf{Q}, \mathbf{K}, \mathbf{V} \in \mathbb{R}^{N \times d}$ are query, key, and value matrices with sequence length $N$ and head dimension $d$. For video generation, $N$ can exceed 100,000 tokens, making full attention with $\mathcal{O}(N^2)$ complexity prohibitively expensive.
 
 \paragraph{Semantic-Aware Permutation (SAP).}
-SAP~\cite{sap} addresses this by clustering tokens using K-means and permuting them to achieve block-diagonal sparsity:
+SAP~\cite{xi2025sparse,yang2025sparse} addresses this by clustering tokens using K-means and permuting them to achieve block-diagonal sparsity:
 \begin{equation}
     \mathbf{Q}' = \mathbf{P}_Q \mathbf{Q}, \quad \mathbf{K}' = \mathbf{P}_K \mathbf{K}, \quad \mathbf{V}' = \mathbf{P}_K \mathbf{V}
 \end{equation}
@@ -46,10 +50,10 @@ This coherence has two important implications:
 
 We exploit both properties to amortize computation across timesteps, achieving substantial speedup without quality degradation.
 
-\subsection{Cross-Timestep Cluster Amortization (CTCA)}
+\subsection{RAB: Reuse-Across-Blocks Cluster Cache}
 \label{sec:ctca}
 
-CTCA reduces K-means overhead by intelligently reusing cluster assignments across timesteps. Instead of performing full clustering at every step, we maintain a cluster cache and selectively update it based on quality metrics.
+RAB reduces K-means overhead by reusing cluster assignments across timesteps. Instead of performing full clustering at every step, we maintain a cluster cache and selectively update it based on quality metrics.
 
 \paragraph{Cluster Cache.}
 For each attention layer $\ell$, we maintain a cache $\mathcal{C}^\ell$ containing:
@@ -76,10 +80,10 @@ When reusing assignments, we efficiently update centroids without full clusterin
 \end{equation}
 where $S_k = \{i : a_i = k\}$ is the set of tokens assigned to cluster $k$. This reduces complexity from $\mathcal{O}(NCI)$ to $\mathcal{O}(NC)$.
 
-The complete CTCA algorithm is presented in Algorithm~\ref{alg:ctca}.
+The complete RAB algorithm is presented in Algorithm~\ref{alg:ctca}.
 
 \begin{algorithm}[t]
-\caption{Cross-Timestep Cluster Amortization (CTCA)}
+\caption{RAB: Reuse-Across-Blocks}
 \label{alg:ctca}
 \begin{algorithmic}[1]
 \REQUIRE Tokens $\mathbf{X}$, cache $\mathcal{C}$, quality threshold $\tau_q$, max interval $\Delta_{\max}$
@@ -103,13 +107,13 @@ The complete CTCA algorithm is presented in Algorithm~\ref{alg:ctca}.
 \end{algorithmic}
 \end{algorithm}
 
-\subsection{Cross-Timestep Attention Amortization (CTAA)}
+\subsection{BIT: Block-Importance Tiers}
 \label{sec:ctaa}
 
-While CTCA accelerates clustering, the dominant cost in sparse attention is still the attention computation itself. CTAA introduces a hierarchical attention mechanism that further exploits temporal coherence in attention patterns.
+While RAB accelerates clustering, the dominant cost in sparse attention is still the attention computation itself. BIT introduces a hierarchical attention mechanism that further exploits stability in block importance across timesteps.
 
 \paragraph{Hierarchical Attention Tiers.}
-We partition cluster pairs into three tiers based on their attention importance (Figure~\ref{fig:ctaa_tiers}):
+We partition cluster pairs into three tiers based on their attention importance (Figure~\ref{fig:overview}):
 
 \begin{enumerate}
     \item \textbf{Full Attention} ($\mathcal{F}$): High-importance pairs receive standard token-level attention.
@@ -143,10 +147,10 @@ The final output combines contributions from all tiers:
     \mathbf{O}^{(i)} = \mathbf{O}_{\text{full}}^{(i)} + \mathbf{O}_{\text{centroid}}^{(i)}
 \end{equation}
 
-The complete CTAA procedure is detailed in Algorithm~\ref{alg:ctaa}.
+The complete BIT procedure is detailed in Algorithm~\ref{alg:ctaa}.
 
 \begin{algorithm}[t]
-\caption{Cross-Timestep Attention Amortization (CTAA)}
+\caption{BIT: Block-Importance Tiers}
 \label{alg:ctaa}
 \begin{algorithmic}[1]
 \REQUIRE $\mathbf{Q}, \mathbf{K}, \mathbf{V}$, assignments $\mathbf{a}_Q, \mathbf{a}_K$, thresholds $p_{\text{full}}, p_{\text{total}}$
@@ -189,37 +193,43 @@ Attention (centroid) & - & $\mathcal{O}(C_Q \cdot C_K)$ \\
 \end{tabular}
 \end{table}
 
-where $R$ is the CTCA reuse ratio (typically $\sim$7$\times$), $B$ is the average block size, and $p_{\text{full}}$ is the full attention threshold (typically 0.7).
+where $R$ is the measured RAB reuse ratio, $B$ is the average block size, and $p_{\text{full}}$ is a tunable threshold controlling the speed--quality trade-off.
 
-\paragraph{Theoretical Speedup.}
-The combined speedup from CTCA and CTAA can be estimated as:
+\paragraph{Speedup Intuition.}
+The combined speedup from RAB and BIT depends on the reuse ratio and the tier distribution. A simple estimate is:
 \begin{equation}
     S_{\text{total}} = \frac{1}{p_{\text{full}} + p_{\text{centroid}} \cdot \epsilon + p_{\text{skip}} \cdot 0}
 \end{equation}
-where $\epsilon \ll 1$ is the relative cost of centroid attention. With typical parameters ($p_{\text{full}}=0.7$, $p_{\text{total}}=0.95$), this yields $S_{\text{total}} \approx 1.4\times$ on attention computation, combined with $7\times$ K-means speedup from CTCA.
+where $\epsilon \ll 1$ is the relative cost of centroid attention. In practice we tune $(p_{\text{full}}, p_{\text{total}})$ to trace a speed--quality Pareto frontier and report the resulting runtime/quality trade-offs in Section~\ref{sec:evaluation}.
 
 \subsection{Memory-Efficient Implementation}
 \label{sec:memory}
 
-To enable video generation on consumer GPUs (24GB), we implement dynamic layer offloading:
+RabbitVideo is paired with a practical offloading runtime whose goal is to keep peak usage within a user-specified VRAM budget while sustaining throughput.
 
-\paragraph{Layer Windowing.}
-We maintain a sliding window of $W$ transformer layers on GPU (typically $W=8$), with remaining layers on CPU. As inference progresses, we prefetch the next layer asynchronously:
-\begin{equation}
-    \text{GPU}_t = \{\ell : t \leq \ell < t + W\}, \quad \text{Prefetch: } \ell_{t+W}
-\end{equation}
+\paragraph{Sliding window offload.}
+We keep a window of $W$ transformer blocks on GPU (default $W{=}6$ in the library, $W{=}8$ in experiments), with the remaining blocks on CPU. Because block execution is strictly sequential, evictions follow FIFO: as block $B_t$ finishes, block $B_{t+W}$ is prefetched to overlap transfer and compute.
 
-\paragraph{CPU Cluster Cache.}
-CTCA caches are stored on CPU memory to minimize GPU memory pressure. The cache size scales as $\mathcal{O}(L \cdot C \cdot d)$ where $L$ is the number of layers, resulting in approximately 3GB of CPU memory usage.
+\paragraph{Async prefetch with pinned memory.}
+OffloadConfig enables pinned host buffers and dedicated CUDA streams to reduce transfer latency. Prefetch depth is configurable (default 2), and an empty-cache hook fires every few layers to tame allocator fragmentation.
+
+\paragraph{Memory budget autotuning.}
+If a max GPU memory budget is provided, the runtime estimates per-layer footprint and lowers $W$ automatically to fit within the budget while reserving headroom for activations and VAE/text encoders.
+
+\paragraph{CPU-resident RAB state.}
+RAB centroids and assignments live on CPU to avoid occupying VRAM. Only the current layer's clusters are staged to GPU when needed.
+
+\paragraph{Zero-copy where possible.}
+Components marked to stay on GPU (e.g., text encoder, VAE) can be pinned via configuration, reducing transfers for frequently reused modules.
 
 \subsection{Implementation Details}
 \label{sec:implementation}
 
-We implement CTCA and CTAA as drop-in replacements for standard attention in the HunyuanVideo~\cite{hunyuanvideo} pipeline using PyTorch and Triton. Key implementation choices:
+We implement RAB and BIT as drop-in replacements for standard attention in the HunyuanVideo pipeline using PyTorch and Triton. Key implementation choices:
 
 \begin{itemize}
-    \item \textbf{CTCA Parameters}: Quality threshold $\tau_q = 0.8$, max interval $\Delta_{\max} = 10$ timesteps, adaptive interval based on quality trends.
-    \item \textbf{CTAA Parameters}: $p_{\text{full}} = 0.7$, $p_{\text{total}} = 0.95$, configurable for quality-speed tradeoff.
+    \item \textbf{RAB Parameters}: Quality threshold $\tau_q = 0.8$, max interval $\Delta_{\max} = 10$ timesteps, adaptive interval based on quality trends.
+    \item \textbf{BIT Parameters}: $p_{\text{full}} = 0.7$, $p_{\text{total}} = 0.95$, configurable for quality-speed tradeoff.
     \item \textbf{Warmup}: First 7.5\% of timesteps and 2.5\% of layers use full precision attention to ensure generation quality.
-    \item \textbf{Hardware}: Tested on NVIDIA RTX 4090 (24GB) with dynamic offloading enabled.
+    \item \textbf{Hardware}: Evaluated on a representative consumer GPU; details are provided in Section~\ref{sec:evaluation}.
 \end{itemize}
