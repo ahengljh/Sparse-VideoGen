@@ -1,7 +1,7 @@
 \section{Methodology}
 \label{sec:methodology}
 
-We present \textbf{RabbitVideo}, which exploits temporal coherence in diffusion models to accelerate sparse attention computation. The system comprises two complementary components: \textbf{Reuse-Across-Blocks} (RAB) for reducing K-means clustering overhead, and \textbf{Block-Importance Tiers} (BIT) for hierarchical sparse attention computation. Figure~\ref{fig:overview} illustrates the overall architecture.
+We present \textbf{RabbitVideo}, which exploits temporal coherence in diffusion models to accelerate sparse attention computation and enable memory-efficient inference on consumer GPUs. The system comprises three synergistic components: \textbf{Reuse-Across-Blocks} (RAB) for reducing K-means clustering overhead, \textbf{Block-Importance Tiers} (BIT) for hierarchical sparse attention computation, and \textbf{Attention-Informed Offloading} (AIO) for intelligent GPU memory management. Figure~\ref{fig:overview} illustrates the overall architecture.
 
 \begin{figure}[t]
     \centering
@@ -42,13 +42,14 @@ Our key observation is that latent representations in diffusion models exhibit s
     \|\mathbf{z}_t - \mathbf{z}_{t-1}\|_2 \ll \|\mathbf{z}_t\|_2
 \end{equation}
 
-This coherence has two important implications:
+This coherence manifests in three exploitable properties:
 \begin{enumerate}
-    \item \textbf{Cluster Stability}: Token cluster assignments remain largely stable across timesteps, with only boundary tokens shifting between clusters.
-    \item \textbf{Attention Pattern Stability}: The importance distribution across cluster pairs changes gradually, allowing for hierarchical approximation.
+    \item \textbf{Cluster Stability}: Token cluster assignments remain largely stable across timesteps, with only boundary tokens shifting between clusters (exploited by RAB).
+    \item \textbf{Attention Pattern Stability}: The importance distribution across cluster pairs changes gradually, allowing for hierarchical approximation (exploited by BIT).
+    \item \textbf{Compute Cost Predictability}: Layer compute costs at timestep $t$ are predictive of costs at timestep $t+1$, enabling intelligent prefetching decisions (exploited by AIO).
 \end{enumerate}
 
-We exploit both properties to amortize computation across timesteps, achieving substantial speedup without quality degradation.
+We exploit all three properties to amortize computation across timesteps, achieving substantial speedup without quality degradation.
 
 \subsection{RAB: Reuse-Across-Blocks Cluster Cache}
 \label{sec:ctca}
@@ -184,11 +185,12 @@ Table~\ref{tab:complexity} summarizes the computational complexity of each compo
 \label{tab:complexity}
 \begin{tabular}{lcc}
 \toprule
-\textbf{Operation} & \textbf{Baseline} & \textbf{Ours} \\
+\textbf{Operation} & \textbf{Baseline} & \textbf{RabbitVideo} \\
 \midrule
 K-means per layer & $\mathcal{O}(NCI)$ & $\mathcal{O}(NC/R)$ \\
 Attention (full) & $\mathcal{O}(N^2)$ & $\mathcal{O}(p_{\text{full}} \cdot N \cdot B)$ \\
-Attention (centroid) & - & $\mathcal{O}(C_Q \cdot C_K)$ \\
+Attention (centroid) & --- & $\mathcal{O}(C_Q \cdot C_K)$ \\
+Memory transfer & Sequential & Overlapped (AIO) \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -202,34 +204,79 @@ The combined speedup from RAB and BIT depends on the reuse ratio and the tier di
 \end{equation}
 where $\epsilon \ll 1$ is the relative cost of centroid attention. In practice we tune $(p_{\text{full}}, p_{\text{total}})$ to trace a speed--quality Pareto frontier and report the resulting runtime/quality trade-offs in Section~\ref{sec:evaluation}.
 
-\subsection{Memory-Efficient Implementation}
-\label{sec:memory}
+\subsection{AIO: Attention-Informed Offloading}
+\label{sec:offloading}
 
-RabbitVideo is paired with a practical offloading runtime whose goal is to keep peak usage within a user-specified VRAM budget while sustaining throughput.
+To enable inference on memory-constrained GPUs (24GB), we introduce Attention-Informed Offloading (AIO), which uses signals from RAB and BIT to make intelligent prefetching and eviction decisions---going beyond naive FIFO scheduling.
 
-\paragraph{Sliding window offload.}
-We keep a window of $W$ transformer blocks on GPU (default $W{=}6$ in the library, $W{=}8$ in experiments), with the remaining blocks on CPU. Because block execution is strictly sequential, evictions follow FIFO: as block $B_t$ finishes, block $B_{t+W}$ is prefetched to overlap transfer and compute.
+\paragraph{Compute Cost Prediction.}
+We predict the compute cost for layer $\ell$ at timestep $t$ using a weighted combination of signals:
+\begin{equation}
+    \hat{C}^{(\ell, t)} = w_\rho \cdot \rho^{(\ell, t-1)} + w_s \cdot s_{\text{rab}}^{(\ell, t-1)} + w_\tau \cdot \tau^{(\ell, t-1)}
+\end{equation}
+where $\rho$ is attention density from BIT (fraction of full-attention pairs), $s_{\text{rab}}$ is the RAB decision signal (1.0 for full recluster, 0.1 for reuse), and $\tau$ is normalized historical timing. Default weights are $(w_\rho, w_s, w_\tau) = (0.4, 0.3, 0.3)$.
 
-\paragraph{Async prefetch with pinned memory.}
-OffloadConfig enables pinned host buffers and dedicated CUDA streams to reduce transfer latency. Prefetch depth is configurable (default 2), and an empty-cache hook fires every few layers to tame allocator fragmentation.
+\paragraph{Priority-Based Prefetching.}
+Instead of sequential prefetching, we prioritize layers by predicted compute time:
+\begin{equation}
+    \text{Priority}(\ell) = \frac{1}{\text{dist}(\ell, \ell_{\text{current}})} \cdot (1 + 2\hat{C}^{(\ell)})
+\end{equation}
+Expensive layers are prefetched earlier, overlapping transfer with compute of current layers. This ensures high-cost layers are ready when needed.
 
-\paragraph{Memory budget autotuning.}
-If a max GPU memory budget is provided, the runtime estimates per-layer footprint and lowers $W$ automatically to fit within the budget while reserving headroom for activations and VAE/text encoders.
+\paragraph{Priority-Based Eviction.}
+When GPU memory is full, we evict layers based on eviction score (lower = evict first):
+\begin{equation}
+    \text{EvictScore}(\ell) = 0.4 \cdot \text{Recency}(\ell) + 0.3 \cdot \hat{C}^{(\ell)} + 0.3 \cdot \text{Criticality}(\ell)
+\end{equation}
+This keeps expensive and soon-to-be-used layers on GPU, unlike FIFO which ignores compute cost.
 
-\paragraph{CPU-resident RAB state.}
-RAB centroids and assignments live on CPU to avoid occupying VRAM. Only the current layer's clusters are staged to GPU when needed.
+\paragraph{Async Transfer with Pinned Memory.}
+We use CUDA streams for asynchronous CPU-to-GPU transfer with pinned (page-locked) memory, achieving $\sim$2$\times$ faster transfers than pageable memory.
 
-\paragraph{Zero-copy where possible.}
-Components marked to stay on GPU (e.g., text encoder, VAE) can be pinned via configuration, reducing transfers for frequently reused modules.
+\begin{algorithm}[t]
+\caption{AIO: Attention-Informed Offloading}
+\label{alg:offload}
+\begin{algorithmic}[1]
+\REQUIRE Layer index $\ell$, GPU window size $W$, predictor $\mathcal{P}$
+\ENSURE Layer $\ell$ ready on GPU
+
+\IF{Layer $\ell$ not on GPU}
+    \IF{Prefetch in progress for $\ell$}
+        \STATE WaitForPrefetch($\ell$) \COMMENT{Prefetch hit}
+    \ELSE
+        \STATE SyncLoadToGPU($\ell$) \COMMENT{Prefetch miss}
+    \ENDIF
+\ENDIF
+
+\STATE \COMMENT{Evict if GPU window full}
+\IF{$|\text{LayersOnGPU}| \geq W$}
+    \STATE $\text{victim} \gets \arg\min_{\ell'} \text{EvictScore}(\ell')$
+    \STATE OffloadToCPU($\text{victim}$)
+\ENDIF
+
+\STATE \COMMENT{Priority-based prefetching}
+\STATE $\text{targets} \gets \text{TopK}(\text{Priority}, k=2)$
+\FOR{$t \in \text{targets}$}
+    \STATE AsyncPrefetch($t$) \COMMENT{On prefetch stream}
+\ENDFOR
+\end{algorithmic}
+\end{algorithm}
+
+\paragraph{Signal Bridge.}
+A lightweight signal bridge connects RAB and BIT to AIO: after each layer completes, the bridge records $(s_{\text{rab}}, \rho, \tau)$ for the predictor. This enables AIO to anticipate compute patterns without additional profiling passes.
+
+\paragraph{Memory Configuration.}
+We keep a sliding window of $W$ transformer blocks on GPU (default $W{=}6$ for 24GB), with remaining blocks on CPU in pinned memory. RAB centroids and assignments reside on CPU to minimize VRAM usage.
 
 \subsection{Implementation Details}
 \label{sec:implementation}
 
-We implement RAB and BIT as drop-in replacements for standard attention in the HunyuanVideo pipeline using PyTorch and Triton. Key implementation choices:
+We implement RabbitVideo as drop-in replacements for standard attention in the HunyuanVideo pipeline using PyTorch and Triton. Key implementation choices:
 
 \begin{itemize}
-    \item \textbf{RAB Parameters}: Quality threshold $\tau_q = 0.8$, max interval $\Delta_{\max} = 10$ timesteps, adaptive interval based on quality trends.
-    \item \textbf{BIT Parameters}: $p_{\text{full}} = 0.7$, $p_{\text{total}} = 0.95$, configurable for quality-speed tradeoff.
+    \item \textbf{RAB Parameters}: Quality threshold $\tau_q = 0.8$, recluster interval $[\Delta_{\min}, \Delta_{\max}] = [2, 10]$ timesteps, adaptive mode enabled.
+    \item \textbf{BIT Parameters}: $p_{\text{full}} = 0.90$--$0.95$, $p_{\text{total}} = 0.98$--$0.99$, minimum KC ratio $0.05$--$0.10$ for quality-speed tradeoff.
+    \item \textbf{AIO Parameters}: GPU window $W = 6$ layers (24GB), prefetch count 2--4, prediction weights $(w_\rho, w_s, w_\tau) = (0.4, 0.3, 0.3)$, pinned memory enabled.
     \item \textbf{Warmup}: First 7.5\% of timesteps and 2.5\% of layers use full precision attention to ensure generation quality.
-    \item \textbf{Hardware}: Evaluated on a representative consumer GPU; details are provided in Section~\ref{sec:evaluation}.
+    \item \textbf{Hardware}: Tested on NVIDIA RTX 4090 (24GB) and A100 (40GB/80GB). RabbitVideo enables 720p, 5-second video generation on consumer GPUs that would otherwise require 40GB+ VRAM.
 \end{itemize}
