@@ -729,6 +729,7 @@ class AttentionInformedOffloadManager:
         }
 
         self._initialized = False
+        self._log_counter = 0  # For periodic logging
 
     def _estimate_layer_memory(self) -> float:
         """Estimate memory per layer in MB."""
@@ -759,7 +760,16 @@ class AttentionInformedOffloadManager:
         if self._initialized:
             return
 
-        logger.info(f"Preparing {self.num_layers} layers for attention-informed offloading...")
+        logger.info("=" * 60)
+        logger.info("[AI-OFFLOAD] Attention-Informed Offloading INITIALIZED")
+        logger.info("=" * 60)
+        logger.info(f"[AI-OFFLOAD] Total layers: {self.num_layers}")
+        logger.info(f"[AI-OFFLOAD] Layers on GPU: {self.config.num_layers_on_gpu}")
+        logger.info(f"[AI-OFFLOAD] Per-layer memory: ~{self._layer_memory_mb:.1f}MB")
+        logger.info(f"[AI-OFFLOAD] Prefetch enabled: {self.config.enable_prefetch}")
+        logger.info(f"[AI-OFFLOAD] Priority eviction: {self.config.use_priority_eviction}")
+        logger.info(f"[AI-OFFLOAD] Pinned memory: {self.config.use_pinned_memory}")
+        logger.info("=" * 60)
 
         # Create CUDA streams
         if self.config.enable_prefetch:
@@ -963,6 +973,13 @@ class AttentionInformedOffloadManager:
 
         # Start timing for this layer
         self._layer_start_time.record()
+
+        # Periodic logging to show offloading is working
+        self._log_counter += 1
+        if self._log_counter <= 3 or self._log_counter % 50 == 0:
+            on_gpu = len(self._layers_on_gpu_set)
+            prefetch_count = len([k for k, v in self._prefetch_in_progress.items() if v])
+            logger.info(f"[AI-OFFLOAD] Layer {layer_idx} ready | GPU: {on_gpu} layers | Prefetching: {prefetch_count}")
 
     @time_logging_decorator("Level 3 - Layer forward complete (AI)")
     def layer_forward_complete(

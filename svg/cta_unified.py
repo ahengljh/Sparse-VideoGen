@@ -497,9 +497,7 @@ class CTAManager:
             num_q_centroids=self.config.num_q_centroids,
             num_k_centroids=self.config.num_k_centroids,
         )
-
-        logger.info(f"CTCA initialized: Q={self.config.num_q_centroids}, "
-                   f"K={self.config.num_k_centroids}")
+        # Note: CTCA logs its own initialization banner
 
     def _init_offload(self):
         """Initialize Attention-Informed Offload Manager."""
@@ -524,9 +522,7 @@ class CTAManager:
         self.offload_manager.predictor.weight_density = self.config.prediction_weight_density
         self.offload_manager.predictor.weight_ctca = self.config.prediction_weight_ctca
         self.offload_manager.predictor.weight_timing = self.config.prediction_weight_timing
-
-        logger.info(f"Attention-Informed Offloading initialized: "
-                   f"{self.config.num_layers_on_gpu} layers on GPU")
+        # Note: Offload manager logs its own banner in prepare_for_inference()
 
     def _init_signal_bridge(self):
         """Initialize signal bridge between components."""
@@ -543,14 +539,30 @@ class CTAManager:
         # Connect CTCA to offload predictor
         self.offload_manager.set_ctca_manager(self.ctca_manager)
 
-        logger.info("Signal bridge connected: CTCA ↔ CTAA ↔ Offload")
+        # Log CTAA initialization
+        logger.info("=" * 60)
+        logger.info("[CTAA] Cross-Timestep Attention Amortization INITIALIZED")
+        logger.info("=" * 60)
+        logger.info(f"[CTAA] Full attention threshold (p_full): {self.config.ctaa_p_full}")
+        logger.info(f"[CTAA] Total threshold (p_total): {self.config.ctaa_p_total}")
+        logger.info(f"[CTAA] Min KC ratio: {self.config.ctaa_min_kc_ratio}")
+        logger.info("=" * 60)
+
+        # Log signal bridge
+        logger.info("[CTA] Signal bridge connected: CTCA -> CTAA -> Offload")
 
     def prepare_for_inference(self):
         """Prepare all components for inference."""
         if self._initialized:
             return
 
-        logger.info("Preparing CTA framework for inference...")
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("   CTA: Cross-Timestep Amortization Framework")
+        logger.info("   Unified CTCA + CTAA + Attention-Informed Offloading")
+        logger.info("=" * 70)
+        logger.info("")
+        logger.info("[CTA] Preparing framework for inference...")
 
         # Move transformer blocks to CPU for offloading
         if self.offload_manager is not None:
@@ -572,7 +584,13 @@ class CTAManager:
         gc.collect()
 
         self._initialized = True
-        logger.info("CTA framework ready")
+        self._ctaa_log_counter = 0  # For periodic CTAA logging
+
+        logger.info("")
+        logger.info("=" * 70)
+        logger.info("[CTA] Framework READY - All components initialized")
+        logger.info("=" * 70)
+        logger.info("")
 
     def _move_embedders_to_gpu(self):
         """Move embedder components to GPU (they're always needed)."""
@@ -589,6 +607,10 @@ class CTAManager:
     def on_timestep_begin(self, timestep: int):
         """Called at the start of each diffusion timestep."""
         self._current_timestep = timestep
+
+        # Log timestep progress
+        if timestep == self.config.num_timesteps - 1 or timestep % 10 == 0:
+            logger.info(f"[CTA] === Timestep {timestep}/{self.config.num_timesteps} ===")
 
         if self.offload_manager is not None:
             self.offload_manager.on_timestep_begin(timestep)
@@ -794,6 +816,16 @@ class CTAManager:
                 skip_ratio=skip_count / max(total_count, 1),
                 attention_time_ms=attn_time_ms,
             )
+
+        # Periodic CTAA logging
+        self._ctaa_log_counter += 1
+        if self._ctaa_log_counter <= 3 or self._ctaa_log_counter % 100 == 0:
+            full_pct = 100 * full_count / max(total_count, 1)
+            cent_pct = 100 * centroid_count / max(total_count, 1)
+            skip_pct = 100 * skip_count / max(total_count, 1)
+            logger.info(f"[CTAA] Layer {layer_idx} @ t={timestep}: "
+                       f"Full={full_pct:.0f}% | Centroid={cent_pct:.0f}% | Skip={skip_pct:.0f}% | "
+                       f"Density={attention_density:.2f}")
 
         return output
 

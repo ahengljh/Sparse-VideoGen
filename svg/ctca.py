@@ -19,6 +19,7 @@ import torch
 import torch.nn.functional as F
 
 from .timer import time_logging_decorator
+from .logger import logger
 from .kmeans_utils import (
     batch_kmeans_Euclid,
     triton_centroid_update_sorted_euclid,
@@ -174,6 +175,16 @@ class CrossTimestepClusterAmortization:
             'quality_triggered_recluster': 0,
             'interval_triggered_recluster': 0,
         }
+
+        # Log initialization
+        logger.info("=" * 60)
+        logger.info("[CTCA] Cross-Timestep Cluster Amortization INITIALIZED")
+        logger.info("=" * 60)
+        logger.info(f"[CTCA] Q centroids: {num_q_centroids}, K centroids: {num_k_centroids}")
+        logger.info(f"[CTCA] Quality threshold: {config.quality_threshold}")
+        logger.info(f"[CTCA] Recluster interval: [{config.min_recluster_interval}, {config.max_recluster_interval}]")
+        logger.info(f"[CTCA] Adaptive mode: {config.adaptive_recluster}")
+        logger.info("=" * 60)
 
     def reset(self):
         """Reset all cached state. Call at the start of each video generation."""
@@ -551,12 +562,18 @@ class CrossTimestepClusterAmortization:
             elif reason == "max_interval":
                 self.stats['interval_triggered_recluster'] += 1
 
+            # Log full recluster decision
+            total_calls = self.stats['full_cluster_count'] + self.stats['update_only_count'] + 1
+            if total_calls <= 5 or total_calls % 100 == 0:
+                logger.info(f"[CTCA] Layer {layer_idx} @ t={timestep}: FULL RECLUSTER (reason: {reason})")
+
             return self._full_clustering(query, key, layer_idx, timestep)
         else:
-            # Note: reuse_count is tracked separately from update_only_count
-            # reuse_count = we decided to reuse (not recluster)
-            # update_only_count = we updated centroids without full reassignment
-            # These are different metrics: reuse is the decision, update_only is the action
+            # Log reuse decision (less frequently)
+            total_calls = self.stats['full_cluster_count'] + self.stats['update_only_count'] + 1
+            if total_calls <= 3:
+                logger.info(f"[CTCA] Layer {layer_idx} @ t={timestep}: REUSE clusters (centroid update only)")
+
             return self._update_centroids_only(query, key, layer_idx, timestep)
 
     def get_statistics(self) -> Dict[str, any]:
