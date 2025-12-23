@@ -221,7 +221,6 @@ if __name__ == "__main__":
                 use_pinned_memory=args.offload_pinned_memory,
                 enable_prefetch=args.offload_prefetch,
                 ffn_prefetch_count=2,
-                enable_component_prefetch=True,  # Enable FFN prefetch during attention
                 verbose=args.offload_verbose,
             )
         else:

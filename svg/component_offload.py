@@ -287,18 +287,21 @@ class HybridOffloadManager:
         """Move entire layer to CPU."""
         block = self._get_block(layer_idx)
 
+        # Always use standard .to() for moving - this ensures proper module tracking
+        block.to('cpu')
+
+        # If pinned memory is requested, pin the parameters after moving to CPU
+        # Note: Pinned memory helps with faster CPU->GPU transfers
         if use_pinned:
             for param in block.parameters():
-                if param.device.type != 'cpu':
-                    cpu_tensor = param.data.cpu()
-                    if not cpu_tensor.is_pinned():
-                        pinned = torch.empty_like(cpu_tensor, pin_memory=True)
-                        pinned.copy_(cpu_tensor)
+                if not param.data.is_pinned():
+                    try:
+                        pinned = torch.empty_like(param.data, pin_memory=True)
+                        pinned.copy_(param.data)
                         param.data = pinned
-                    else:
-                        param.data = cpu_tensor
-        else:
-            block.to('cpu')
+                    except Exception:
+                        # If pinning fails (e.g., not enough pinnable memory), continue without pinning
+                        pass
 
         self._layer_on_gpu[layer_idx] = False
         self._layers_on_gpu_set.discard(layer_idx)
@@ -416,14 +419,11 @@ class HybridOffloadManager:
     @time_logging_decorator("Level 3 - Ensure layer ready (hybrid)")
     def ensure_layer_on_gpu(self, layer_idx: int):
         """
-        Ensure layer is on GPU with smart component loading.
+        Ensure layer is on GPU.
 
-        If enable_component_prefetch is True:
-        1. Load attention+norm first (sync)
-        2. Start FFN prefetch in background
-        3. Return - attention can start computing while FFN transfers
-
-        This is called at the START of a layer's forward pass.
+        For now, we load the ENTIRE layer at once (like standard AIO).
+        The component-level optimization (attention first, FFN prefetch)
+        can be enabled later once the basic flow is stable.
         """
         if not self._initialized:
             self.prepare_for_inference()
@@ -438,16 +438,12 @@ class HybridOffloadManager:
             if self._layer_prefetch_in_progress.get(layer_idx, False):
                 # Prefetch was started - wait for it
                 self._wait_for_layer_prefetch(layer_idx)
-            elif self.config.enable_component_prefetch:
-                # Component-level loading: attention first, then prefetch FFN
-                self._move_attention_to_gpu(layer_idx, non_blocking=False)
-                self._start_ffn_prefetch(layer_idx)
-                self._layer_on_gpu[layer_idx] = True  # Mark as on GPU (partially)
-                self._layers_on_gpu_set.add(layer_idx)
             else:
                 # Load entire layer synchronously
                 self._move_layer_to_gpu(layer_idx, non_blocking=False)
                 self.stats['prefetch_misses'] += 1
+
+            self._layers_on_gpu_set.add(layer_idx)
 
         # Evict old layers
         self._evict_layers_outside_window(layer_idx)
@@ -531,10 +527,9 @@ def create_hybrid_offload_hooks(
     """
     Create forward hooks for hybrid offloading.
 
-    Hooks:
-    - Pre-hook on block: ensure_layer_on_gpu() (loads attention, starts FFN prefetch)
-    - Pre-hook on FFN: ensure_ffn_ready() (waits for FFN prefetch if needed)
-    - Post-hook on block: layer_forward_complete()
+    Simplified hooks (like standard AIO):
+    - Pre-hook on block: ensure_layer_on_gpu() - loads entire layer
+    - Post-hook on block: layer_forward_complete() - cleanup
     """
     hooks = {}
 
@@ -548,28 +543,17 @@ def create_hybrid_offload_hooks(
                 return inputs
             return hook
 
-        def make_ffn_pre_hook(layer_idx: int):
-            def hook(module, inputs):
-                manager.ensure_ffn_ready(layer_idx)
-                return inputs
-            return hook
-
         def make_post_hook(layer_idx: int):
             def hook(module, inputs, outputs):
                 manager.layer_forward_complete(layer_idx)
                 return outputs
             return hook
 
-        # Block pre-hook
+        # Block pre-hook - ensures layer is on GPU before forward
         h = block.register_forward_pre_hook(make_block_pre_hook(layer_idx))
         hooks[f'double_{idx}_block_pre'] = h
 
-        # FFN pre-hook (wait for FFN if it was being prefetched)
-        if hasattr(block, 'ff'):
-            h = block.ff.register_forward_pre_hook(make_ffn_pre_hook(layer_idx))
-            hooks[f'double_{idx}_ffn_pre'] = h
-
-        # Post-hook
+        # Post-hook - cleanup after forward
         h = block.register_forward_hook(make_post_hook(layer_idx))
         hooks[f'double_{idx}_post'] = h
 
@@ -583,12 +567,6 @@ def create_hybrid_offload_hooks(
                 return inputs
             return hook
 
-        def make_ffn_pre_hook(layer_idx: int):
-            def hook(module, inputs):
-                manager.ensure_ffn_ready(layer_idx)
-                return inputs
-            return hook
-
         def make_post_hook(layer_idx: int):
             def hook(module, inputs, outputs):
                 manager.layer_forward_complete(layer_idx)
@@ -598,11 +576,6 @@ def create_hybrid_offload_hooks(
         # Block pre-hook
         h = block.register_forward_pre_hook(make_block_pre_hook(layer_idx))
         hooks[f'single_{idx}_block_pre'] = h
-
-        # FFN pre-hook
-        if hasattr(block, 'proj_out'):
-            h = block.proj_out.register_forward_pre_hook(make_ffn_pre_hook(layer_idx))
-            hooks[f'single_{idx}_ffn_pre'] = h
 
         # Post-hook
         h = block.register_forward_hook(make_post_hook(layer_idx))
@@ -618,16 +591,16 @@ def enable_component_offloading(
     use_pinned_memory: bool = True,
     enable_prefetch: bool = True,
     ffn_prefetch_count: int = 2,
-    enable_component_prefetch: bool = True,
+    enable_component_prefetch: bool = False,  # Disabled for now - causes device issues
     verbose: bool = False,
 ) -> Tuple[HybridOffloadManager, Dict]:
     """
     Enable hybrid component offloading for a HunyuanVideo pipeline.
 
-    This uses a smart hybrid strategy:
-    1. Sliding window of full layers (like standard AIO)
-    2. Within each layer, loads attention first, prefetches FFN
-    3. Achieves compute-transfer overlap for FFN
+    This uses a sliding window approach similar to standard AIO:
+    1. Keep N layers on GPU at a time (sliding window)
+    2. Prefetch next layers while current layer computes
+    3. Use pinned memory for faster CPU->GPU transfers
 
     Args:
         pipe: HunyuanVideoPipeline
@@ -635,7 +608,7 @@ def enable_component_offloading(
         use_pinned_memory: Use pinned CPU memory for faster transfers
         enable_prefetch: Enable async layer prefetching
         ffn_prefetch_count: Number of layers to prefetch ahead
-        enable_component_prefetch: Enable FFN prefetch during attention compute
+        enable_component_prefetch: (Experimental) Enable FFN prefetch during attention
         verbose: Enable verbose logging
 
     Returns:
@@ -646,7 +619,7 @@ def enable_component_offloading(
         use_pinned_memory=use_pinned_memory,
         enable_prefetch=enable_prefetch,
         prefetch_count=ffn_prefetch_count,
-        enable_component_prefetch=enable_component_prefetch,
+        enable_component_prefetch=False,  # Force disabled for stability
         verbose=verbose,
     )
 
