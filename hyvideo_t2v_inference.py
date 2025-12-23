@@ -201,20 +201,19 @@ if __name__ == "__main__":
 
         # Choose offloading strategy
         if args.offload_strategy == "component":
-            # Fine-grained component offloading: Pin Attention, Offload FFN
-            # This pins all attention weights on GPU (~30% of model) and dynamically
-            # loads FFN weights (~70% of model), achieving better memory efficiency
-            logger.info("Setting up fine-grained component offloading (Pin Attention, Offload FFN)...")
+            # Hybrid component offloading: Sliding window with FFN prefetch overlap
+            # Uses same memory as layer-level but achieves compute-transfer overlap
+            logger.info("Setting up hybrid component offloading (sliding window + FFN prefetch)...")
 
-            # Show memory savings estimate
+            # Show memory analysis
             savings = estimate_memory_savings(pipe)
             logger.info(f"Memory analysis:")
             logger.info(f"  Full model: {savings['full_model_gb']:.2f}GB")
-            logger.info(f"  Attention (pinned): {savings['attention_pinned_gb']:.2f}GB")
-            logger.info(f"  FFN (offloadable): {savings['ffn_total_gb']:.2f}GB")
-            logger.info(f"  Layer-level offload (6 layers): {savings['layer_offload_6layers_gb']:.2f}GB")
-            logger.info(f"  Component-level offload (6 layers): {savings['component_offload_6layers_gb']:.2f}GB")
-            logger.info(f"  Savings vs layer-level: {savings['savings_vs_layer_offload_gb']:.2f}GB")
+            logger.info(f"  Attention: {savings['attention_total_gb']:.2f}GB")
+            logger.info(f"  FFN: {savings['ffn_total_gb']:.2f}GB")
+            logger.info(f"  Norm: {savings['norm_total_gb']:.2f}GB")
+            logger.info(f"  Per layer: {savings['avg_layer_gb']*1024:.1f}MB")
+            logger.info(f"  Window ({args.offload_num_layers} layers): {args.offload_num_layers * savings['avg_layer_gb']:.2f}GB")
 
             offload_manager, offload_hooks = enable_component_offloading(
                 pipe,
@@ -222,6 +221,7 @@ if __name__ == "__main__":
                 use_pinned_memory=args.offload_pinned_memory,
                 enable_prefetch=args.offload_prefetch,
                 ffn_prefetch_count=2,
+                enable_component_prefetch=True,  # Enable FFN prefetch during attention
                 verbose=args.offload_verbose,
             )
         else:

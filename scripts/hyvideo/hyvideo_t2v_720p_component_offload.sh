@@ -1,11 +1,15 @@
 #!/bin/bash
 #
-# Example script demonstrating fine-grained component-level offloading
+# Example script demonstrating hybrid component-level offloading
 #
-# Strategy: Pin Attention, Offload FFN
-# - Keeps attention weights (~30% of model) permanently on GPU
-# - Dynamically loads FFN weights (~70% of model)
-# - Achieves better memory efficiency than full-layer offloading
+# Strategy: Sliding Window with FFN Prefetch Overlap
+# - Uses sliding window of full layers (like standard AIO)
+# - Within each layer, loads attention first, prefetches FFN
+# - Achieves compute-transfer overlap for better performance
+#
+# Key optimization: While attention is computing (GPU-bound),
+# we prefetch FFN weights in the background (transfer-bound).
+# This hides the FFN transfer latency behind attention compute.
 #
 # This is especially useful for GPUs with limited VRAM (e.g., RTX 4090 24GB)
 # where we want to maximize GPU utilization while staying within memory limits.
