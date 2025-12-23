@@ -90,39 +90,38 @@ class LayerComponents:
     norm_memory_mb: float = 0.0
 
 
-# Component classification for Double Stream Blocks
+# Component classification for Double Stream Blocks (diffusers HunyuanVideoTransformerBlock)
+# These are the actual component names used in diffusers implementation
 DOUBLE_BLOCK_ATTENTION_COMPONENTS = [
-    'img_attn_qkv', 'img_attn_proj',
-    'img_attn_q_norm', 'img_attn_k_norm',
-    'txt_attn_qkv', 'txt_attn_proj',
-    'txt_attn_q_norm', 'txt_attn_k_norm',
+    'attn',  # The attention module
 ]
 
 DOUBLE_BLOCK_FFN_COMPONENTS = [
-    'img_mlp',  # Contains fc1, act, fc2
-    'txt_mlp',  # Contains fc1, act, fc2
+    'ff',         # Feed-forward network for hidden states
+    'ff_context', # Feed-forward network for context/text
 ]
 
 DOUBLE_BLOCK_NORM_COMPONENTS = [
-    'img_mod', 'txt_mod',
-    'img_norm1', 'img_norm2',
-    'txt_norm1', 'txt_norm2',
+    'norm1',          # AdaLayerNormContinuous (contains linear for modulation)
+    'norm1_context',  # AdaLayerNormContinuous for context
+    'norm2',          # LayerNorm
+    'norm2_context',  # LayerNorm for context
 ]
 
-# Single stream blocks have combined linear layers - treat as single unit
+# Single stream blocks (diffusers HunyuanVideoSingleTransformerBlock)
+# Note: Single stream has combined projections, harder to split
 SINGLE_BLOCK_ATTENTION_COMPONENTS = [
-    'linear1',  # Combined QKV + MLP up projection
-    'q_norm', 'k_norm',
+    'attn',     # Attention module
 ]
 
 SINGLE_BLOCK_MLP_COMPONENTS = [
-    'linear2',  # Combined attention out + MLP down projection
-    'mlp_act',
+    'proj_out',  # Output projection (combines attention and MLP output)
 ]
 
 SINGLE_BLOCK_NORM_COMPONENTS = [
-    'modulation',
-    'pre_norm',
+    'norm',      # AdaLayerNormContinuous
+    'proj_mlp',  # MLP up-projection (small, keep with norm)
+    'act_mlp',   # Activation (no parameters, but keep for consistency)
 ]
 
 
@@ -579,26 +578,26 @@ def create_component_offload_hooks(
     """
     Create forward hooks that intercept at attention/FFN boundaries.
 
-    For Double Stream Blocks:
-    - Pre-hook before img_attn_qkv: ensure_attention_ready()
-    - Pre-hook before img_mlp: ensure_ffn_ready()
+    For Double Stream Blocks (diffusers HunyuanVideoTransformerBlock):
+    - Pre-hook on block: ensure_attention_ready() (attention weights pinned)
+    - Pre-hook before ff: ensure_ffn_ready()
 
-    For Single Stream Blocks:
-    - Pre-hook before linear1: ensure_attention_ready()
-    - Pre-hook before linear2: ensure_ffn_ready()
+    For Single Stream Blocks (diffusers HunyuanVideoSingleTransformerBlock):
+    - Pre-hook on block: ensure_attention_ready()
+    - Pre-hook before proj_out: ensure_ffn_ready()
     """
     hooks = {}
 
     # Double stream blocks
     for idx, block in enumerate(manager.double_blocks):
-        # Hook for attention phase (actually just triggers FFN prefetch)
-        def make_attn_pre_hook(layer_idx: int):
+        # Hook for attention phase - runs at block start
+        def make_block_pre_hook(layer_idx: int):
             def hook(module, inputs):
                 manager.ensure_attention_ready(layer_idx)
                 return inputs
             return hook
 
-        # Hook for FFN phase
+        # Hook for FFN phase - runs before ff module
         def make_ffn_pre_hook(layer_idx: int):
             def hook(module, inputs):
                 manager.ensure_ffn_ready(layer_idx)
@@ -612,15 +611,13 @@ def create_component_offload_hooks(
                 return outputs
             return hook
 
-        # Register hooks
-        # We hook the attention QKV linear to catch the start of attention
-        if hasattr(block, 'img_attn_qkv'):
-            h = block.img_attn_qkv.register_forward_pre_hook(make_attn_pre_hook(idx))
-            hooks[f'double_{idx}_attn_pre'] = h
+        # Register pre-hook on the block itself for attention readiness
+        h = block.register_forward_pre_hook(make_block_pre_hook(idx))
+        hooks[f'double_{idx}_block_pre'] = h
 
-        # Hook the FFN to catch when we need FFN weights
-        if hasattr(block, 'img_mlp'):
-            h = block.img_mlp.register_forward_pre_hook(make_ffn_pre_hook(idx))
+        # Hook the FFN (ff) to catch when we need FFN weights
+        if hasattr(block, 'ff'):
+            h = block.ff.register_forward_pre_hook(make_ffn_pre_hook(idx))
             hooks[f'double_{idx}_ffn_pre'] = h
 
         # Post hook on the block itself
@@ -631,7 +628,7 @@ def create_component_offload_hooks(
     for idx, block in enumerate(manager.single_blocks):
         layer_idx = manager.num_double + idx
 
-        def make_attn_pre_hook(layer_idx: int):
+        def make_block_pre_hook(layer_idx: int):
             def hook(module, inputs):
                 manager.ensure_attention_ready(layer_idx)
                 return inputs
@@ -649,14 +646,13 @@ def create_component_offload_hooks(
                 return outputs
             return hook
 
-        # Hook linear1 for attention start
-        if hasattr(block, 'linear1'):
-            h = block.linear1.register_forward_pre_hook(make_attn_pre_hook(layer_idx))
-            hooks[f'single_{idx}_attn_pre'] = h
+        # Register pre-hook on the block for attention readiness
+        h = block.register_forward_pre_hook(make_block_pre_hook(layer_idx))
+        hooks[f'single_{idx}_block_pre'] = h
 
-        # Hook linear2 for FFN/MLP
-        if hasattr(block, 'linear2'):
-            h = block.linear2.register_forward_pre_hook(make_ffn_pre_hook(layer_idx))
+        # Hook proj_out for FFN/MLP phase
+        if hasattr(block, 'proj_out'):
+            h = block.proj_out.register_forward_pre_hook(make_ffn_pre_hook(layer_idx))
             hooks[f'single_{idx}_ffn_pre'] = h
 
         # Post hook
@@ -754,37 +750,52 @@ def estimate_memory_savings(
     single_blocks = list(transformer.single_transformer_blocks)
 
     def get_param_memory(module):
+        if module is None:
+            return 0.0
         return sum(p.numel() * p.element_size() for p in module.parameters()) / (1024**3)
 
     # Full model memory
     full_model_gb = get_param_memory(transformer)
 
-    # Attention memory (will be pinned on GPU)
-    attention_gb = 0.0
+    # Pinned memory (attention + norms - will stay on GPU)
+    pinned_gb = 0.0
     for block in double_blocks:
         for name in DOUBLE_BLOCK_ATTENTION_COMPONENTS + DOUBLE_BLOCK_NORM_COMPONENTS:
             if hasattr(block, name):
-                attention_gb += get_param_memory(getattr(block, name))
+                pinned_gb += get_param_memory(getattr(block, name))
     for block in single_blocks:
         for name in SINGLE_BLOCK_ATTENTION_COMPONENTS + SINGLE_BLOCK_NORM_COMPONENTS:
             if hasattr(block, name):
-                attention_gb += get_param_memory(getattr(block, name))
+                pinned_gb += get_param_memory(getattr(block, name))
 
-    # FFN memory
-    ffn_gb = full_model_gb - attention_gb
+    # FFN memory (will be offloaded)
+    ffn_gb = 0.0
+    for block in double_blocks:
+        for name in DOUBLE_BLOCK_FFN_COMPONENTS:
+            if hasattr(block, name):
+                ffn_gb += get_param_memory(getattr(block, name))
+    for block in single_blocks:
+        for name in SINGLE_BLOCK_MLP_COMPONENTS:
+            if hasattr(block, name):
+                ffn_gb += get_param_memory(getattr(block, name))
 
     # Layer-level: 6 layers on GPU
     layer_count = len(double_blocks) + len(single_blocks)
-    avg_layer_gb = full_model_gb / layer_count
-    layer_offload_gb = 6 * avg_layer_gb
+    if layer_count > 0:
+        avg_layer_gb = full_model_gb / layer_count
+        layer_offload_gb = 6 * avg_layer_gb
+        avg_ffn_gb = ffn_gb / layer_count
+    else:
+        avg_layer_gb = 0
+        layer_offload_gb = 0
+        avg_ffn_gb = 0
 
     # Component-level: Attention pinned + 6 layers of FFN
-    avg_ffn_gb = ffn_gb / layer_count
-    component_offload_gb = attention_gb + 6 * avg_ffn_gb
+    component_offload_gb = pinned_gb + 6 * avg_ffn_gb
 
     return {
         'full_model_gb': full_model_gb,
-        'attention_pinned_gb': attention_gb,
+        'attention_pinned_gb': pinned_gb,
         'ffn_total_gb': ffn_gb,
         'layer_offload_6layers_gb': layer_offload_gb,
         'component_offload_6layers_gb': component_offload_gb,
