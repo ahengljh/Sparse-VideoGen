@@ -713,6 +713,15 @@ def batch_kmeans_Euclid(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=N
 
     centroids = centroids.view(B, n_clusters, D)
 
+    # Initialize variables in case max_iters is 0 or loop doesn't execute
+    cluster_ids = None
+    cluster_sizes = None
+    it = 0
+
+    # Ensure at least one iteration runs
+    if max_iters < 1:
+        max_iters = 1
+
     for it in range(max_iters):
         # ---- compiled single iteration ----
         centroids_new, center_shift, cluster_ids, cluster_sizes = _euclid_iter_compiled(x, x_sq, centroids)
@@ -768,6 +777,14 @@ def batch_kmeans_Cosine(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=N
     centroids = centroids.view(B, n_clusters, D)
     centroids = F.normalize(centroids, p=2, dim=-1)  # Ensure centroids are normalized
 
+    # Initialize variables in case max_iters is 0 or loop doesn't execute
+    cluster_ids = None
+    it = 0
+
+    # Ensure at least one iteration runs
+    if max_iters < 1:
+        max_iters = 1
+
     for it in range(max_iters):
         # ---- compiled single iteration ----
         centroids_new, center_shift, cluster_ids = _cosine_iter_compiled(x_norm, centroids)
@@ -802,6 +819,14 @@ def batch_kmeans_Dot(x, n_clusters, max_iters=100, tol=1e-4, init_centroids=None
         centroids = init_centroids
 
     centroids = centroids.view(B, n_clusters, D)
+
+    # Initialize variables in case max_iters is 0 or loop doesn't execute
+    cluster_ids = None
+    it = 0
+
+    # Ensure at least one iteration runs
+    if max_iters < 1:
+        max_iters = 1
 
     for it in range(max_iters):
         # ---- compiled single iteration ----
