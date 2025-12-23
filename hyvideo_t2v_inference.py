@@ -24,6 +24,7 @@ from svg.models.hyvideo.inference import (
 )
 from svg.models.hyvideo.utils import get_prompt_length
 from svg.offload import enable_offloading, pre_encode_and_offload, OffloadConfig
+from svg.component_offload import enable_component_offloading, estimate_memory_savings
 
 from svg.logger import logger
 
@@ -75,6 +76,8 @@ if __name__ == "__main__":
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
+    parser.add_argument("--offload_strategy", type=str, default="layer", choices=["layer", "component"],
+                        help="Offloading strategy: 'layer' (full layer offload) or 'component' (pin attention, offload FFN).")
     parser.add_argument("--offload_num_layers", type=int, default=6, help="Number of transformer layers to keep on GPU (sliding window size). Higher=faster but more VRAM. Recommended: 4-8 for 24GB, 10-15 for 40GB+.")
     parser.add_argument("--offload_max_memory_gb", type=float, default=None, help="Auto-tune num_layers based on memory budget (e.g., 20.0 for 24GB GPU).")
     parser.add_argument("--offload_pinned_memory", action="store_true", default=True, help="Use pinned CPU memory for faster transfers.")
@@ -196,16 +199,42 @@ if __name__ == "__main__":
             dtype=torch.bfloat16,
         )
 
-        # Now enable transformer layer offloading (text encoders already on CPU)
-        logger.info("Setting up transformer layer offloading...")
-        offload_manager, offload_hooks = enable_offloading(
-            pipe,
-            use_pinned_memory=args.offload_pinned_memory,
-            enable_prefetch=args.offload_prefetch,
-            num_layers_on_gpu=args.offload_num_layers,
-            max_memory_gb=args.offload_max_memory_gb,
-            verbose=args.offload_verbose,
-        )
+        # Choose offloading strategy
+        if args.offload_strategy == "component":
+            # Fine-grained component offloading: Pin Attention, Offload FFN
+            # This pins all attention weights on GPU (~30% of model) and dynamically
+            # loads FFN weights (~70% of model), achieving better memory efficiency
+            logger.info("Setting up fine-grained component offloading (Pin Attention, Offload FFN)...")
+
+            # Show memory savings estimate
+            savings = estimate_memory_savings(pipe)
+            logger.info(f"Memory analysis:")
+            logger.info(f"  Full model: {savings['full_model_gb']:.2f}GB")
+            logger.info(f"  Attention (pinned): {savings['attention_pinned_gb']:.2f}GB")
+            logger.info(f"  FFN (offloadable): {savings['ffn_total_gb']:.2f}GB")
+            logger.info(f"  Layer-level offload (6 layers): {savings['layer_offload_6layers_gb']:.2f}GB")
+            logger.info(f"  Component-level offload (6 layers): {savings['component_offload_6layers_gb']:.2f}GB")
+            logger.info(f"  Savings vs layer-level: {savings['savings_vs_layer_offload_gb']:.2f}GB")
+
+            offload_manager, offload_hooks = enable_component_offloading(
+                pipe,
+                ffn_layers_on_gpu=args.offload_num_layers,
+                use_pinned_memory=args.offload_pinned_memory,
+                enable_prefetch=args.offload_prefetch,
+                ffn_prefetch_count=2,
+                verbose=args.offload_verbose,
+            )
+        else:
+            # Standard layer-level offloading (text encoders already on CPU)
+            logger.info("Setting up transformer layer offloading...")
+            offload_manager, offload_hooks = enable_offloading(
+                pipe,
+                use_pinned_memory=args.offload_pinned_memory,
+                enable_prefetch=args.offload_prefetch,
+                num_layers_on_gpu=args.offload_num_layers,
+                max_memory_gb=args.offload_max_memory_gb,
+                verbose=args.offload_verbose,
+            )
 
     #########################################################
     # Replace the attention
