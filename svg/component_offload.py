@@ -551,67 +551,59 @@ class HybridOffloadManager:
 
 
 def create_hybrid_offload_hooks(
+    pipe,
     manager: HybridOffloadManager,
 ) -> Dict[str, Any]:
     """
     Create forward hooks for hybrid offloading.
 
-    Simplified hooks (like standard AIO):
-    - Pre-hook on block: ensure_layer_on_gpu() - loads entire layer
-    - Post-hook on block: layer_forward_complete() - cleanup
+    This matches the pattern from offload.py:
+    - Iterate directly over pipe.transformer.transformer_blocks (the ModuleList)
+    - Use explicit factory functions for hook creation
+
+    Args:
+        pipe: The HunyuanVideoPipeline
+        manager: The HybridOffloadManager
+
+    Returns:
+        Dict of hook handles
     """
-    hooks = {}
+    handles = {}
 
-    # Double stream blocks
-    for idx, block in enumerate(manager.double_blocks):
-        layer_idx = idx
+    def create_pre_hook(offload_manager: HybridOffloadManager, layer_idx: int):
+        """Factory function for pre-hooks (matches offload.py pattern)."""
+        def hook(module, args):
+            offload_manager.ensure_layer_on_gpu(layer_idx)
+            return args
+        return hook
 
-        def make_block_pre_hook(layer_idx: int):
-            def hook(module, inputs):
-                manager.ensure_layer_on_gpu(layer_idx)
-                return inputs
-            return hook
+    def create_post_hook(offload_manager: HybridOffloadManager, layer_idx: int):
+        """Factory function for post-hooks."""
+        def hook(module, args, output):
+            offload_manager.layer_forward_complete(layer_idx)
+            return output
+        return hook
 
-        def make_post_hook(layer_idx: int):
-            def hook(module, inputs, outputs):
-                manager.layer_forward_complete(layer_idx)
-                return outputs
-            return hook
+    # Install hooks on double stream blocks - iterate over the actual ModuleList
+    for idx, block in enumerate(pipe.transformer.transformer_blocks):
+        pre_hook = create_pre_hook(manager, idx)
+        post_hook = create_post_hook(manager, idx)
 
-        # Block pre-hook - ensures layer is on GPU before forward
-        h = block.register_forward_pre_hook(make_block_pre_hook(layer_idx))
-        hooks[f'double_{idx}_block_pre'] = h
+        handles[f'double_{idx}_pre'] = block.register_forward_pre_hook(pre_hook)
+        handles[f'double_{idx}_post'] = block.register_forward_hook(post_hook)
 
-        # Post-hook - cleanup after forward
-        h = block.register_forward_hook(make_post_hook(layer_idx))
-        hooks[f'double_{idx}_post'] = h
+    # Install hooks on single stream blocks
+    num_double = len(pipe.transformer.transformer_blocks)
+    for idx, block in enumerate(pipe.transformer.single_transformer_blocks):
+        layer_idx = num_double + idx
+        pre_hook = create_pre_hook(manager, layer_idx)
+        post_hook = create_post_hook(manager, layer_idx)
 
-    # Single stream blocks
-    for idx, block in enumerate(manager.single_blocks):
-        layer_idx = manager.num_double + idx
+        handles[f'single_{idx}_pre'] = block.register_forward_pre_hook(pre_hook)
+        handles[f'single_{idx}_post'] = block.register_forward_hook(post_hook)
 
-        def make_block_pre_hook(layer_idx: int):
-            def hook(module, inputs):
-                manager.ensure_layer_on_gpu(layer_idx)
-                return inputs
-            return hook
-
-        def make_post_hook(layer_idx: int):
-            def hook(module, inputs, outputs):
-                manager.layer_forward_complete(layer_idx)
-                return outputs
-            return hook
-
-        # Block pre-hook
-        h = block.register_forward_pre_hook(make_block_pre_hook(layer_idx))
-        hooks[f'single_{idx}_block_pre'] = h
-
-        # Post-hook
-        h = block.register_forward_hook(make_post_hook(layer_idx))
-        hooks[f'single_{idx}_post'] = h
-
-    logger.info(f"Created {len(hooks)} hybrid offload hooks")
-    return hooks
+    logger.info(f"Installed {len(handles)} hybrid offload hooks")
+    return handles
 
 
 def enable_component_offloading(
@@ -682,8 +674,8 @@ def enable_component_offloading(
     # Prepare for inference - converts to pinned memory if enabled
     manager.prepare_for_inference()
 
-    # Create and install hooks on blocks
-    hooks = create_hybrid_offload_hooks(manager)
+    # Create and install hooks on blocks - pass pipe to iterate over actual ModuleList
+    hooks = create_hybrid_offload_hooks(pipe, manager)
 
     # CRITICAL: Register a safety hook on the transformer to ensure embedders
     # are on GPU before every forward pass. This prevents device mismatches
