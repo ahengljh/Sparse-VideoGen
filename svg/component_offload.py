@@ -252,8 +252,27 @@ class HybridOffloadManager:
         """Check if layer is a double stream block."""
         return layer_idx < self.num_double
 
+    def _ensure_pinned_memory(self, layer_idx: int):
+        """Convert a CPU layer to use pinned memory for faster GPU transfers."""
+        block = self._get_block(layer_idx)
+
+        for param in block.parameters():
+            if param.device.type == 'cpu' and not param.data.is_pinned():
+                try:
+                    pinned_tensor = torch.empty_like(param.data, pin_memory=True)
+                    pinned_tensor.copy_(param.data)
+                    param.data = pinned_tensor
+                except Exception:
+                    # Pinning can fail if not enough pinnable memory
+                    pass
+
     def prepare_for_inference(self):
-        """Prepare for inference - move all layers to CPU initially."""
+        """
+        Prepare the model for offloaded inference.
+
+        This sets up CUDA streams, tracking for layers, and pinned memory.
+        Layers should already be on CPU (moved by enable_component_offloading).
+        """
         if self._initialized:
             return
 
@@ -272,16 +291,26 @@ class HybridOffloadManager:
         if self.config.enable_component_prefetch:
             self._ffn_stream = torch.cuda.Stream()
 
-        # Move all blocks to CPU with pinned memory
-        for layer_idx in range(self.num_layers):
-            block = self._get_block(layer_idx)
-            self._move_layer_to_cpu(layer_idx, use_pinned=self.config.use_pinned_memory)
+        # Check layer locations and set up tracking
+        # Layers should already be on CPU from enable_component_offloading
+        for idx in range(self.num_layers):
+            block = self._get_block(idx)
+            first_param = next(block.parameters(), None)
+            if first_param is not None:
+                is_on_cpu = first_param.device.type == 'cpu'
+                self._layer_on_gpu[idx] = not is_on_cpu
+
+                # If on CPU and we want pinned memory, convert to pinned
+                if is_on_cpu and self.config.use_pinned_memory:
+                    self._ensure_pinned_memory(idx)
 
         torch.cuda.empty_cache()
         gc.collect()
 
         self._initialized = True
-        logger.info(f"[HYBRID-OFFLOAD] All {self.num_layers} layers on CPU with pinned memory")
+
+        num_on_cpu = sum(1 for v in self._layer_on_gpu.values() if not v)
+        logger.info(f"[HYBRID-OFFLOAD] {num_on_cpu}/{self.num_layers} layers on CPU with pinned memory")
 
     def _move_layer_to_cpu(self, layer_idx: int, use_pinned: bool = True):
         """Move entire layer to CPU."""
@@ -625,26 +654,65 @@ def enable_component_offloading(
 
     transformer = pipe.transformer
 
-    # Create manager
-    manager = HybridOffloadManager(transformer, config)
-
-    # Prepare for inference (moves layers to CPU)
-    manager.prepare_for_inference()
-
-    # Create and install hooks
-    hooks = create_hybrid_offload_hooks(manager)
-
-    # Keep other transformer components on GPU
+    # Keep other transformer components on GPU FIRST (before moving blocks to CPU)
+    # This follows the same order as offload.py
     components_to_keep = ['time_text_embed', 'x_embedder', 'context_embedder',
                           'norm_out', 'proj_out', 'rope']
+
+    logger.info("Moving transformer embedder components to GPU...")
     for name in components_to_keep:
         if hasattr(transformer, name):
             comp = getattr(transformer, name)
             if comp is not None:
                 comp.to(config.compute_device)
+                first_param = next(comp.parameters(), None)
+                if first_param is not None:
+                    size_mb = sum(p.numel() * p.element_size() for p in comp.parameters()) / 1024**2
+                    logger.info(f"  {name}: {size_mb:.1f}MB → {first_param.device}")
+
+    # Move transformer blocks to CPU using the ModuleList's .to() method
+    # This ensures proper PyTorch module tracking
+    logger.info("Moving transformer blocks to CPU...")
+    transformer.transformer_blocks.to('cpu')
+    transformer.single_transformer_blocks.to('cpu')
+
+    # Create manager (will set up tracking for the blocks)
+    manager = HybridOffloadManager(transformer, config)
+
+    # Prepare for inference - converts to pinned memory if enabled
+    manager.prepare_for_inference()
+
+    # Create and install hooks on blocks
+    hooks = create_hybrid_offload_hooks(manager)
+
+    # CRITICAL: Register a safety hook on the transformer to ensure embedders
+    # are on GPU before every forward pass. This prevents device mismatches
+    # when the pipeline or other code might move tensors around.
+    def ensure_embedders_on_gpu(module, args):
+        """Pre-hook to ensure embedders are on GPU before forward."""
+        for name in components_to_keep:
+            if hasattr(module, name):
+                comp = getattr(module, name)
+                if comp is not None:
+                    first_param = next(comp.parameters(), None)
+                    if first_param is not None and first_param.device.type != 'cuda':
+                        comp.to('cuda')
+                        if verbose:
+                            logger.info(f"[HYBRID-OFFLOAD] Safety hook moved {name} to GPU")
+        return args
+
+    hook_handle = transformer.register_forward_pre_hook(ensure_embedders_on_gpu)
+    hooks['transformer_embedder_safety'] = hook_handle
+    logger.info("Registered embedder safety hook on transformer")
 
     torch.cuda.empty_cache()
     gc.collect()
+
+    # Log memory status
+    if torch.cuda.is_available():
+        allocated = torch.cuda.memory_allocated() / 1024**3
+        reserved = torch.cuda.memory_reserved() / 1024**3
+        logger.info(f"GPU memory after setup: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
 
     return manager, hooks
 
