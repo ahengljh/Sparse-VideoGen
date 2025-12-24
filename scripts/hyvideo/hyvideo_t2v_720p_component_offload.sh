@@ -1,15 +1,11 @@
 #!/bin/bash
 #
-# Example script demonstrating hybrid component-level offloading
+# Example script demonstrating hybrid component-level offloading with SAP_CTCA
 #
-# Strategy: Sliding Window with FFN Prefetch Overlap
+# Strategy: Sliding Window with Cross-Timestep Cluster Amortization (CTCA)
 # - Uses sliding window of full layers (like standard AIO)
-# - Within each layer, loads attention first, prefetches FFN
-# - Achieves compute-transfer overlap for better performance
-#
-# Key optimization: While attention is computing (GPU-bound),
-# we prefetch FFN weights in the background (transfer-bound).
-# This hides the FFN transfer latency behind attention compute.
+# - SAP_CTCA reuses cluster assignments across timesteps for efficiency
+# - Tuned parameters for good quality-speed balance
 #
 # This is especially useful for GPUs with limited VRAM (e.g., RTX 4090 24GB)
 # where we want to maximize GPU utilization while staying within memory limits.
@@ -26,20 +22,20 @@ NUM_FRAMES="${NUM_FRAMES:-129}"
 SEED="${SEED:-42}"
 
 # Offloading parameters
-# FFN_LAYERS_ON_GPU: Number of layers to keep FFN on GPU (sliding window)
+# FFN_LAYERS_ON_GPU: Number of layers to keep on GPU (sliding window)
 # Higher = faster but more VRAM, Lower = slower but less VRAM
 # Recommended: 4-8 for 24GB GPU, 10-15 for 40GB+ GPU
 FFN_LAYERS_ON_GPU="${FFN_LAYERS_ON_GPU:-6}"
 
 echo "=============================================="
-echo "Fine-Grained Component Offloading Demo"
+echo "SAP_CTCA with Component Offloading"
 echo "=============================================="
-echo "Strategy: Pin Attention on GPU, Offload FFN"
+echo "Strategy: Cross-Timestep Cluster Amortization"
 echo ""
 echo "Model: $MODEL_ID"
 echo "Resolution: $RESOLUTION"
 echo "Frames: $NUM_FRAMES"
-echo "FFN layers on GPU: $FFN_LAYERS_ON_GPU"
+echo "Layers on GPU: $FFN_LAYERS_ON_GPU"
 echo "Output: $OUTPUT_FILE"
 echo "=============================================="
 
@@ -50,10 +46,18 @@ python hyvideo_t2v_inference.py \
     --num_frames "$NUM_FRAMES" \
     --output_file "$OUTPUT_FILE" \
     --seed "$SEED" \
-    --pattern SAP \
-    --num_q_centroids 50 \
-    --num_k_centroids 200 \
-    --top_p_kmeans 0.9 \
+    --pattern SAP_CTCA \
+    --num_q_centroids 100 \
+    --num_k_centroids 400 \
+    --top_p_kmeans 0.95 \
+    --min_kc_ratio 0.05 \
+    --first_layers_fp 0.1 \
+    --first_times_fp 0.15 \
+    --kmeans_iter_init 10 \
+    --kmeans_iter_step 3 \
+    --ctca_quality_threshold 0.88 \
+    --ctca_min_interval 1 \
+    --ctca_max_interval 5 \
     --enable_offload \
     --offload_strategy component \
     --offload_num_layers "$FFN_LAYERS_ON_GPU" \
