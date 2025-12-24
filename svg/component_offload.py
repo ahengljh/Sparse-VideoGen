@@ -684,11 +684,12 @@ def enable_component_offloading(
                     size_mb = sum(p.numel() * p.element_size() for p in comp.parameters()) / 1024**2
                     logger.info(f"  {name}: {size_mb:.1f}MB → {first_param.device}")
 
-    # Keep VAE on GPU for decoding (it's small ~300MB)
+    # Keep VAE on CPU during diffusion - will be moved to GPU for decode later
+    # This saves ~300MB GPU memory during the 50 diffusion steps
     if hasattr(pipe, 'vae') and pipe.vae is not None:
-        pipe.vae.to(config.compute_device)
+        pipe.vae.to('cpu')
         vae_size_mb = sum(p.numel() * p.element_size() for p in pipe.vae.parameters()) / 1024**2
-        logger.info(f"VAE kept on GPU: {vae_size_mb:.1f}MB")
+        logger.info(f"VAE on CPU ({vae_size_mb:.1f}MB) - will move to GPU for decode")
 
     # Move transformer blocks to CPU using the ModuleList's .to() method
     # This ensures proper PyTorch module tracking
@@ -724,6 +725,22 @@ def enable_component_offloading(
     hook_handle = transformer.register_forward_pre_hook(ensure_embedders_on_gpu)
     hooks['transformer_embedder_safety'] = hook_handle
     logger.info("Registered embedder safety hook on transformer")
+
+    # Register a hook to move VAE to GPU when decode is called
+    # This saves ~300MB during diffusion by keeping VAE on CPU until needed
+    if hasattr(pipe, 'vae') and pipe.vae is not None:
+        def vae_to_gpu_hook(module, args):
+            """Move VAE to GPU before decode."""
+            first_param = next(module.parameters(), None)
+            if first_param is not None and first_param.device.type != 'cuda':
+                logger.info("[HYBRID-OFFLOAD] Moving VAE to GPU for decode...")
+                module.to(config.compute_device)
+                torch.cuda.empty_cache()
+            return args
+
+        vae_hook = pipe.vae.register_forward_pre_hook(vae_to_gpu_hook)
+        hooks['vae_to_gpu'] = vae_hook
+        logger.info("Registered VAE lazy-load hook")
 
     torch.cuda.empty_cache()
     gc.collect()
