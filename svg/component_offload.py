@@ -454,10 +454,6 @@ class HybridOffloadManager:
         The component-level optimization (attention first, FFN prefetch)
         can be enabled later once the basic flow is stable.
         """
-        # Debug: confirm hook is firing
-        if self._log_counter < 5:
-            logger.info(f"[HYBRID-OFFLOAD] ensure_layer_on_gpu called for layer {layer_idx}")
-
         if not self._initialized:
             self.prepare_for_inference()
 
@@ -478,23 +474,12 @@ class HybridOffloadManager:
 
             self._layers_on_gpu_set.add(layer_idx)
 
-        # CRITICAL: Verify all parameters are actually on GPU after the move
-        # This is a safety net in case .to() doesn't work properly
+        # Safety net: Force-move any parameters still on CPU (silent)
         block = self._get_block(layer_idx)
         target_device = self.config.compute_device
-        for name, param in block.named_parameters():
+        for param in block.parameters():
             if param.device.type != 'cuda':
-                # Force move this parameter to GPU
-                logger.warning(f"[HYBRID-OFFLOAD] Parameter {name} still on {param.device}, forcing to {target_device}")
                 param.data = param.data.to(target_device)
-
-        # Also check buffers
-        for name, buf in block.named_buffers():
-            if buf is not None and buf.device.type != 'cuda':
-                logger.warning(f"[HYBRID-OFFLOAD] Buffer {name} still on {buf.device}, forcing to {target_device}")
-                # For buffers, we need to set them via setattr on the module
-                # This is trickier - just call .to() on submodules
-                pass
 
         # Evict old layers
         self._evict_layers_outside_window(layer_idx)
@@ -505,9 +490,9 @@ class HybridOffloadManager:
             if next_idx < self.num_layers:
                 self._start_layer_prefetch(next_idx)
 
-        # Periodic logging
+        # Periodic logging (reduced frequency)
         self._log_counter += 1
-        if self._log_counter <= 3 or self._log_counter % 50 == 0:
+        if self._log_counter == 1 or self._log_counter % 100 == 0:
             on_gpu = len(self._layers_on_gpu_set)
             logger.info(f"[HYBRID-OFFLOAD] Layer {layer_idx} ready | GPU: {on_gpu} layers")
 
