@@ -684,6 +684,12 @@ def enable_component_offloading(
                     size_mb = sum(p.numel() * p.element_size() for p in comp.parameters()) / 1024**2
                     logger.info(f"  {name}: {size_mb:.1f}MB → {first_param.device}")
 
+    # Keep VAE on GPU for decoding (it's small ~300MB)
+    if hasattr(pipe, 'vae') and pipe.vae is not None:
+        pipe.vae.to(config.compute_device)
+        vae_size_mb = sum(p.numel() * p.element_size() for p in pipe.vae.parameters()) / 1024**2
+        logger.info(f"VAE kept on GPU: {vae_size_mb:.1f}MB")
+
     # Move transformer blocks to CPU using the ModuleList's .to() method
     # This ensures proper PyTorch module tracking
     logger.info("Moving transformer blocks to CPU...")
