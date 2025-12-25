@@ -1184,23 +1184,24 @@ def setup_sadsa_attention(
     Hunyuan_SADSAAttn_Processor2_0.prompt_length = prompt_length
     Hunyuan_SADSAAttn_Processor2_0.logging_file = logging_file
 
-    # Create processor instances
-    attn_procs = {}
+    # Create and assign processor instances directly (not via set_attn_processor)
+    # This avoids issues with missing processor keys for non-transformer attention layers
     transformer = pipe.transformer
 
     # Double transformer blocks
+    num_double = len(transformer.transformer_blocks)
     for i, block in enumerate(transformer.transformer_blocks):
-        attn_procs[f"transformer_blocks.{i}.attn"] = Hunyuan_SADSAAttn_Processor2_0(layer_idx=i)
+        block.attn.processor = Hunyuan_SADSAAttn_Processor2_0(layer_idx=i)
+        if verbose:
+            logger.info(f"[SADSA] Configured double block {i}")
 
     # Single transformer blocks
-    num_double = len(transformer.transformer_blocks)
     for i, block in enumerate(transformer.single_transformer_blocks):
-        attn_procs[f"single_transformer_blocks.{i}.attn"] = Hunyuan_SADSAAttn_Processor2_0(layer_idx=num_double + i)
+        block.attn.processor = Hunyuan_SADSAAttn_Processor2_0(layer_idx=num_double + i)
+        if verbose:
+            logger.info(f"[SADSA] Configured single block {i}")
 
-    # Set processors
-    transformer.set_attn_processor(attn_procs)
-
-    total_layers = len(attn_procs)
+    total_layers = num_double + len(transformer.single_transformer_blocks)
     logger.info(f"[SADSA] Setup complete: {total_layers} attention processors configured")
 
     return transformer
