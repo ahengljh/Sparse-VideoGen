@@ -372,13 +372,15 @@ def setup_sadsa_with_offloading(
         logger.info("[SADSA+Offload]   - QGE: Quality-Gradient Eviction")
         logger.info("[SADSA+Offload]   - ADCP: Attention-Density Compute Prediction")
 
-        # Create SIAO manager with stage-aware budgets
+        # Create SIAO manager with ultra-aggressive budgets for 24GB GPU
+        # For 720p 129 frames, we need to be very conservative with memory
+        # Q/K/V tensors alone are ~9GB, hidden states ~3GB
         offload_manager = create_siao_manager(
             transformer=pipe.transformer,
-            budget_structure=1,   # Aggressive in structure stage
-            budget_semantic=2,    # Balanced in semantic stage
-            budget_detail=layers_on_gpu + 1,  # Conservative in detail stage
-            use_async_prefetch=async_prefetch,
+            budget_structure=1,   # Only 1 layer on GPU
+            budget_semantic=1,    # Only 1 layer on GPU
+            budget_detail=1,      # Only 1 layer on GPU
+            use_async_prefetch=False,  # Disable async to reduce memory
             use_pinned_memory=use_pinned_memory,
             verbose=verbose,
         )
@@ -408,6 +410,11 @@ def estimate_memory_requirements(
     Estimate GPU memory requirements for video generation.
 
     Returns a dict with memory estimates in GB.
+
+    IMPORTANT: 720p 129 frames requires ~20GB+ even with offloading due to
+    large Q/K/V tensors during attention computation. Consider using:
+    - 480p for 24GB GPUs
+    - 65 frames instead of 129 for lower memory
     """
     # HunyuanVideo model parameters
     model_params_gb = 26.0  # ~13B params in bf16
@@ -420,36 +427,58 @@ def estimate_memory_requirements(
     frame_size = height * width // 256
     seq_len = num_frame * frame_size + 256  # + context length
 
-    # Attention memory (Q, K, V per layer)
-    # [batch, heads, seq_len, head_dim] * 3 * bf16
-    batch_size = 1
+    # Hidden states memory: [batch, seq_len, hidden_dim] * bf16
+    # Hidden dim is 3072 for HunyuanVideo
+    hidden_dim = 3072
+    hidden_states_gb = (seq_len * hidden_dim * 2) / 1e9
+
+    # Q, K, V memory during attention (per layer)
+    # Each is [batch, heads, seq_len, head_dim]
+    # Plus QK normalization converts to float32 temporarily (2x memory)
     num_heads = 24
     head_dim = 128
-    attn_per_layer_gb = (batch_size * num_heads * seq_len * head_dim * 3 * 2) / 1e9
+    qkv_bf16_gb = (num_heads * seq_len * head_dim * 3 * 2) / 1e9  # Q, K, V in bf16
+    qkv_fp32_temp_gb = (num_heads * seq_len * head_dim * 4) / 1e9  # Q in fp32 during norm
 
-    # With SADSA, attention is sparse (~20-50% density on average)
-    sadsa_reduction = 0.35 if enable_sadsa else 1.0
+    # With SADSA, we still need full Q/K/V before sparsification
+    # Sparsification only helps with attention matrix, not Q/K/V
+    attn_memory = qkv_bf16_gb + qkv_fp32_temp_gb
+
+    # Text encoder and VAE (always on GPU)
+    fixed_components_gb = 3.0  # text encoder + vae
 
     # Compute total
     if enable_offload:
-        # Only 1-2 layers on GPU at a time
-        model_memory = per_layer_gb * 2  # 2 layers for prefetching
+        # Only 1 layer on GPU at a time
+        model_memory = per_layer_gb * 1
     else:
         model_memory = model_params_gb
 
-    attention_memory = attn_per_layer_gb * sadsa_reduction
+    # Peak memory is during attention computation
+    peak_memory = fixed_components_gb + model_memory + hidden_states_gb + attn_memory
 
-    # Activations and misc
-    activation_memory = 2.0 if enable_offload else 4.0
+    # Recommended resolution check
+    fits_24gb = peak_memory < 22  # Leave 2GB headroom
+    recommended_height = height
+    recommended_frames = num_frames
 
-    total = model_memory + attention_memory + activation_memory
+    if not fits_24gb:
+        # Calculate what would fit
+        if height == 720:
+            recommended_height = 480
+        if num_frames > 65:
+            recommended_frames = 65
 
     return {
         'model_memory_gb': model_memory,
-        'attention_memory_gb': attention_memory,
-        'activation_memory_gb': activation_memory,
-        'total_estimated_gb': total,
+        'hidden_states_gb': hidden_states_gb,
+        'attention_memory_gb': attn_memory,
+        'fixed_components_gb': fixed_components_gb,
+        'total_estimated_gb': peak_memory,
+        'sequence_length': seq_len,
         'offload_enabled': enable_offload,
         'sadsa_enabled': enable_sadsa,
-        'fits_24gb': total < 22,  # Leave 2GB headroom
+        'fits_24gb': fits_24gb,
+        'recommended_height': recommended_height,
+        'recommended_frames': recommended_frames,
     }

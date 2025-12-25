@@ -77,6 +77,14 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    # Translate resolution to height/width if using defaults
+    if args.resolution == "480p" and args.height == 720:
+        args.height = 480
+        args.width = 848  # 480p widescreen
+        logger.info(f"Using 480p resolution: {args.width}x{args.height}")
+    elif args.resolution == "720p":
+        logger.info(f"Using 720p resolution: {args.width}x{args.height}")
+
     seed_everything(args.seed)
 
     # In some cases it will raise RuntimeError: cusolver error: CUSOLVER_STATUS_INTERNAL_ERROR
@@ -219,11 +227,17 @@ if __name__ == "__main__":
         )
         logger.info("=" * 60)
         logger.info("Memory Estimation:")
+        logger.info(f"  Sequence length:   {mem_estimate['sequence_length']:,} tokens")
         logger.info(f"  Model memory:      {mem_estimate['model_memory_gb']:.2f} GB")
-        logger.info(f"  Attention memory:  {mem_estimate['attention_memory_gb']:.2f} GB")
-        logger.info(f"  Activation memory: {mem_estimate['activation_memory_gb']:.2f} GB")
+        logger.info(f"  Hidden states:     {mem_estimate['hidden_states_gb']:.2f} GB")
+        logger.info(f"  Attention (Q/K/V): {mem_estimate['attention_memory_gb']:.2f} GB")
+        logger.info(f"  Fixed components:  {mem_estimate['fixed_components_gb']:.2f} GB")
         logger.info(f"  Total estimated:   {mem_estimate['total_estimated_gb']:.2f} GB")
-        logger.info(f"  Fits in 24GB GPU:  {'Yes' if mem_estimate['fits_24gb'] else 'No - consider enabling offload'}")
+        if mem_estimate['fits_24gb']:
+            logger.info(f"  Fits in 24GB GPU:  Yes")
+        else:
+            logger.warning(f"  Fits in 24GB GPU:  NO - may OOM!")
+            logger.warning(f"  Recommended: --resolution 480p OR --num_frames {mem_estimate['recommended_frames']}")
         logger.info("=" * 60)
 
         # Use combined SADSA + offloading setup

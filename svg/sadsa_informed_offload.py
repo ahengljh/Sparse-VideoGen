@@ -839,8 +839,15 @@ class SADSAInformedOffloadManager:
 
         def make_pre_hook(layer_idx):
             def pre_hook(module, inputs):
+                # Aggressive memory cleanup before loading new layer
+                gc.collect()
+                torch.cuda.empty_cache()
+
                 # Move layer to GPU and manage prefetch/eviction
                 self.prepare_layer(layer_idx)
+
+                # Sync to ensure layer is fully loaded
+                torch.cuda.synchronize()
 
                 # Move inputs to CUDA if they're on CPU
                 def move_to_cuda(x):
