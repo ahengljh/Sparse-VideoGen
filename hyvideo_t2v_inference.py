@@ -103,13 +103,30 @@ if __name__ == "__main__":
     if not (args.pattern == "SADSA" and args.enable_offload):
         pipe.to("cuda")
     else:
-        # For offloading: keep transformer on CPU, move other components to CUDA
+        # For offloading: keep transformer blocks on CPU, move other components to CUDA
         pipe.text_encoder.to("cuda")
         if hasattr(pipe, 'text_encoder_2') and pipe.text_encoder_2 is not None:
             pipe.text_encoder_2.to("cuda")
         pipe.vae.to("cuda")
-        # Transformer stays on CPU - SIAO will manage layer-by-layer movement
-        logger.info("[Offload] Keeping transformer on CPU for layer-by-layer offloading")
+
+        # Move transformer's lightweight embedding layers to GPU
+        # These are needed for every forward pass and are small (<1GB total)
+        transformer = pipe.transformer
+        transformer.time_text_embed.to("cuda")
+        transformer.x_embedder.to("cuda")
+        transformer.context_embedder.to("cuda")
+        transformer.norm_out.to("cuda")
+        transformer.proj_out.to("cuda")
+        if hasattr(transformer, 'rope'):
+            transformer.rope.to("cuda")
+
+        # Keep heavy transformer blocks on CPU - SIAO will manage layer-by-layer movement
+        for block in transformer.transformer_blocks:
+            block.to("cpu")
+        for block in transformer.single_transformer_blocks:
+            block.to("cpu")
+
+        logger.info("[Offload] Moved embeddings to GPU, keeping transformer blocks on CPU")
     
     config = pipe.transformer.config
 

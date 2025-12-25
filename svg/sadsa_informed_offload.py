@@ -621,7 +621,8 @@ class SADSAInformedOffloadManager:
         # Current state
         self._current_timestep = 0
         self._current_motion = 0.0
-        self._current_budget = 1
+        # Start with semantic budget as reasonable default
+        self._current_budget = self.config.budget_semantic
 
         # Statistics
         self._stats = {
@@ -640,7 +641,7 @@ class SADSAInformedOffloadManager:
                    f"detail={self.config.budget_detail}")
 
     def initialize(self):
-        """Initialize: move all layers to CPU."""
+        """Initialize: move all layers to CPU and install hooks."""
         if self._initialized:
             return
 
@@ -656,6 +657,9 @@ class SADSAInformedOffloadManager:
             logger.info("[SIAO] Pinning memory for fast transfers...")
             for layer in self.layers:
                 self._pin_module(layer)
+
+        # Install forward hooks for automatic GPU/CPU movement
+        self.install_forward_hooks()
 
         gc.collect()
         if torch.cuda.is_available():
@@ -824,9 +828,55 @@ class SADSAInformedOffloadManager:
         if self.config.verbose and self._current_timestep % 10 == 0:
             self._log_stats()
 
+    def install_forward_hooks(self):
+        """
+        Install forward pre-hooks on all transformer blocks.
+
+        These hooks automatically move layers to GPU before execution
+        and manage memory budget through eviction.
+        """
+        self._hook_handles = []
+
+        def make_pre_hook(layer_idx):
+            def pre_hook(module, inputs):
+                # Move layer to GPU and manage prefetch/eviction
+                self.prepare_layer(layer_idx)
+
+                # Move inputs to CUDA if they're on CPU
+                def move_to_cuda(x):
+                    if isinstance(x, torch.Tensor) and x.device.type == 'cpu':
+                        return x.to('cuda', non_blocking=True)
+                    return x
+
+                if isinstance(inputs, tuple):
+                    inputs = tuple(move_to_cuda(x) for x in inputs)
+                elif isinstance(inputs, torch.Tensor):
+                    inputs = move_to_cuda(inputs)
+
+                return inputs
+            return pre_hook
+
+        for i, layer in enumerate(self.layers):
+            # Register pre-hook to move layer to GPU before execution
+            handle = layer.register_forward_pre_hook(make_pre_hook(i))
+            self._hook_handles.append(handle)
+
+        logger.info(f"[SIAO] Installed {len(self._hook_handles)} forward hooks")
+
+    def remove_hooks(self):
+        """Remove all installed forward hooks."""
+        if hasattr(self, '_hook_handles'):
+            for handle in self._hook_handles:
+                handle.remove()
+            self._hook_handles = []
+            logger.info("[SIAO] Removed forward hooks")
+
     def cleanup(self):
-        """Cleanup - move all layers to CPU."""
+        """Cleanup - move all layers to CPU and remove hooks."""
         logger.info("[SIAO] Cleaning up...")
+
+        # Remove hooks first
+        self.remove_hooks()
 
         for i in list(self._layers_on_gpu):
             self._unload_layer_to_cpu(i)
@@ -896,4 +946,7 @@ def create_siao_manager(
         verbose=verbose,
     )
 
-    return SADSAInformedOffloadManager(transformer, config)
+    manager = SADSAInformedOffloadManager(transformer, config)
+    # Initialize immediately to install hooks and prepare for inference
+    manager.initialize()
+    return manager
