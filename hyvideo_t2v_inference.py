@@ -39,7 +39,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0, help="Random seed for generation")
     parser.add_argument("--skip_existing", action="store_true", help="Skip generating existing output files")
 
-    parser.add_argument("--pattern", type=str, default="dense", choices=["SVG", "dense", "SAP"])
+    parser.add_argument("--pattern", type=str, default="dense", choices=["SVG", "dense", "SAP", "SADSA"])
     parser.add_argument("--first_layers_fp", type=float, default=0.025, help="Only works for best config. Leave the 0, 1, 2, 40, 41 layers in FP")
     parser.add_argument("--first_times_fp", type=float, default=0.075, help="Only works for best config. Leave the first 10% timestep in FP")
 
@@ -56,6 +56,13 @@ if __name__ == "__main__":
     parser.add_argument("--kmeans_iter_init", type=int, default=0, help="Number of KMeans iterations for initialization in SAP.")
     parser.add_argument("--kmeans_iter_step", type=int, default=0, help="Number of KMeans iterations for other diffusion steps in SAP.")
     parser.add_argument("--zero_step_kmeans_init", action="store_true", help="Initialize the centroids for the first step in SAP, not after warmup.")
+
+    # SADSA specific (Semantic-Aware Dynamic Sparse Attention)
+    parser.add_argument("--structure_p_full", type=float, default=0.50, help="p_full for structure stage (early timesteps, t>0.7)")
+    parser.add_argument("--semantic_p_full", type=float, default=0.70, help="p_full for semantic stage (middle timesteps, 0.3<t<0.7)")
+    parser.add_argument("--detail_p_full", type=float, default=0.85, help="p_full for detail stage (late timesteps, t<0.3)")
+    parser.add_argument("--motion_threshold_high", type=float, default=0.6, help="Motion level above which to force full attention")
+    parser.add_argument("--motion_threshold_low", type=float, default=0.15, help="Motion level below which to allow skipping")
 
     args = parser.parse_args()
 
@@ -156,6 +163,32 @@ if __name__ == "__main__":
             kmeans_iter_init=args.kmeans_iter_init,
             kmeans_iter_step=args.kmeans_iter_step,
             zero_step_kmeans_init=args.zero_step_kmeans_init,
+        )
+    elif args.pattern == "SADSA":
+        # SADSA: Semantic-Aware Dynamic Sparse Attention
+        # Uses stage-adaptive thresholds + motion-aware routing + quality preservation
+        replace_hyvideo_attention(
+            pipe,
+            args.height,
+            args.width,
+            args.num_frames,
+            prompt_length,
+            first_layers_fp=args.first_layers_fp,
+            first_times_fp=args.first_times_fp,
+            pattern=args.pattern,
+            # Clustering params (shared with SAP)
+            num_q_centroids=args.num_q_centroids,
+            num_k_centroids=args.num_k_centroids,
+            min_kc_ratio=args.min_kc_ratio,
+            logging_file=args.logging_file,
+            kmeans_iter_init=args.kmeans_iter_init if args.kmeans_iter_init > 0 else 50,
+            kmeans_iter_step=args.kmeans_iter_step if args.kmeans_iter_step > 0 else 2,
+            # SADSA specific
+            structure_p_full=args.structure_p_full,
+            semantic_p_full=args.semantic_p_full,
+            detail_p_full=args.detail_p_full,
+            motion_threshold_high=args.motion_threshold_high,
+            motion_threshold_low=args.motion_threshold_low,
         )
     else:
         assert args.pattern == "dense", f"Invalid pattern: {args.pattern}"

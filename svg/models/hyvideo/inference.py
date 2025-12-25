@@ -5,9 +5,11 @@ import torch
 from ...logger import logger
 from .attention import (
     Hunyuan_SAPAttn_Processor2_0,
+    Hunyuan_SADSAAttn_Processor2_0,
     Hunyuan_SVGAttn_Processor2_0,
     HunyuanVideoAttnProcessor2_0_FlashAttention,
     prepare_flexattention,
+    setup_sadsa_attention,
 )
 from .custom_models import replace_sparse_forward
 from .utils import get_attention_mask, sparsity_to_width
@@ -52,6 +54,12 @@ def replace_hyvideo_attention(
     kmeans_iter_init=0,
     kmeans_iter_step=0,
     zero_step_kmeans_init=False,
+    # SADSA specific args
+    structure_p_full=0.50,
+    semantic_p_full=0.70,
+    detail_p_full=0.85,
+    motion_threshold_high=0.6,
+    motion_threshold_low=0.15,
 ):
 
     cfg_size, num_head, head_dim, dtype, device = 1, 24, 128, torch.bfloat16, "cuda"
@@ -162,5 +170,44 @@ def replace_hyvideo_attention(
                 f"Replaced Semantic Aware Permutation block for Single Stream Transformer at layer {layer_idx + len(pipe.transformer.transformer_blocks)}"
             )
 
+    elif pattern == "SADSA":
+        # SADSA: Semantic-Aware Dynamic Sparse Attention
+        # Stage-adaptive thresholds + motion-aware routing + quality preservation
+        logger.info("=" * 60)
+        logger.info("[SADSA] Setting up Semantic-Aware Dynamic Sparse Attention")
+        logger.info("=" * 60)
+
+        # Make dir and clear the logging file
+        if logging_file is not None:
+            os.makedirs(os.path.dirname(logging_file), exist_ok=True)
+            with open(logging_file, "w") as f:
+                f.write("")
+
+        # Use the setup function which handles all configuration
+        setup_sadsa_attention(
+            pipe=pipe,
+            structure_p_full=structure_p_full,
+            semantic_p_full=semantic_p_full,
+            detail_p_full=detail_p_full,
+            motion_threshold_high=motion_threshold_high,
+            motion_threshold_low=motion_threshold_low,
+            num_q_centroids=num_q_centroids or 400,
+            num_k_centroids=num_k_centroids or 1000,
+            kmeans_iter_init=kmeans_iter_init or 50,
+            kmeans_iter_step=kmeans_iter_step or 2,
+            min_kc_ratio=min_kc_ratio,
+            first_layers_fp=first_layers_fp,
+            first_times_fp=first_times_fp,
+            num_frame=num_frame,
+            frame_size=frame_size,
+            context_length=context_length,
+            prompt_length=prompt_length,
+            max_timestep=1000,
+            logging_file=logging_file,
+            verbose=True,
+        )
+
+        replace_sparse_forward()
+
     else:
-        assert pattern == "dense", f"Invalid pattern: {pattern}"
+        assert pattern == "dense", f"Invalid pattern: {pattern}. Valid patterns: SVG, SAP, SADSA, dense"

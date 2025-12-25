@@ -18,6 +18,7 @@ from ...kmeans_utils import (
 )
 from ...logger import logger
 from ...timer import time_logging_decorator
+from ...sadsa import SADSAManager, SADSAConfig, create_sadsa_manager
 from ...utils.misc import Color
 from .placement import (
     hunyuan_hidden_states_placement,
@@ -873,3 +874,333 @@ def flashinfer_varlen_func(q, k, v, cu_seqlens_q, cu_seqlens_kv, max_seqlen_q, m
     o = wrapper.run(q, k, v)  # [num_qo_heads, qo_len, head_dim]
     o = o.reshape(B, H, S, D)
     return o
+
+
+# =============================================================================
+# SADSA: Semantic-Aware Dynamic Sparse Attention Processor
+# =============================================================================
+
+class Hunyuan_SADSAAttn_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
+    """
+    SADSA-integrated attention processor.
+
+    Key improvements over base SAP:
+    1. Stage-adaptive thresholds (DSAS): Different p_full/p_total per diffusion stage
+    2. Motion-aware routing (MCAR): High-motion regions get full attention
+    3. Quality preservation (QPTC): Detect and prevent quality degradation
+
+    Class attributes (set before use):
+        sadsa_manager: SADSAManager instance (shared across all layers)
+        max_timestep: Maximum timestep value for normalization
+    """
+
+    # SADSA manager (shared across all processors)
+    sadsa_manager: Optional[SADSAManager] = None
+    max_timestep: int = 1000
+
+    # Override base thresholds - these are now dynamic
+    # Base values used when SADSA is not initialized
+    base_p_full: float = 0.70
+    base_p_total: float = 0.95
+
+    def __init__(self, layer_idx):
+        super().__init__(layer_idx)
+        self._layer_call_count = 0
+
+    @classmethod
+    def initialize_sadsa(
+        cls,
+        structure_p_full: float = 0.50,
+        semantic_p_full: float = 0.70,
+        detail_p_full: float = 0.85,
+        motion_threshold_high: float = 0.6,
+        motion_threshold_low: float = 0.15,
+        num_q_centroids: int = 400,
+        num_k_centroids: int = 1000,
+        max_timestep: int = 1000,
+        verbose: bool = False,
+    ):
+        """Initialize shared SADSA manager for all processors."""
+        cls.sadsa_manager = create_sadsa_manager(
+            structure_p_full=structure_p_full,
+            semantic_p_full=semantic_p_full,
+            detail_p_full=detail_p_full,
+            motion_threshold_high=motion_threshold_high,
+            motion_threshold_low=motion_threshold_low,
+            num_q_centroids=num_q_centroids,
+            num_k_centroids=num_k_centroids,
+            verbose=verbose,
+        )
+        cls.max_timestep = max_timestep
+        cls.num_q_centroids = num_q_centroids
+        cls.num_k_centroids = num_k_centroids
+
+        logger.info("=" * 60)
+        logger.info("[SADSA] Semantic-Aware Dynamic Sparse Attention INITIALIZED")
+        logger.info("=" * 60)
+        logger.info(f"[SADSA] Structure stage p_full: {structure_p_full}")
+        logger.info(f"[SADSA] Semantic stage p_full:  {semantic_p_full}")
+        logger.info(f"[SADSA] Detail stage p_full:    {detail_p_full}")
+        logger.info(f"[SADSA] Motion thresholds: high={motion_threshold_high}, low={motion_threshold_low}")
+        logger.info("=" * 60)
+
+    @classmethod
+    def reset_sadsa(cls):
+        """Reset SADSA state for new video generation."""
+        if cls.sadsa_manager is not None:
+            cls.sadsa_manager.reset()
+
+    def get_adaptive_thresholds(self, timestep: int) -> Tuple[float, float]:
+        """Get stage-adaptive thresholds from SADSA."""
+        if self.sadsa_manager is None:
+            return self.base_p_full, self.base_p_total
+
+        return self.sadsa_manager.get_adaptive_thresholds(
+            layer_idx=self.layer_idx,
+            timestep=timestep,
+        )
+
+    @time_logging_decorator("Level 3 - SADSA semantic aware permutation")
+    def semantic_aware_permutation(self, query, key, value, timestep, layer_idx):
+        """
+        Enhanced semantic-aware permutation with SADSA adaptive thresholds.
+        """
+        cfg, num_heads, seq_len, dim = query.size()
+
+        # 1. Kmeans clustering (inherited from parent)
+        qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter = self.kmeans_clustering(
+            query, key, layer_idx
+        )
+
+        # 2. Get SADSA-adaptive thresholds
+        timestep_val = timestep[0].item() if isinstance(timestep, torch.Tensor) else timestep
+        p_full, p_total = self.get_adaptive_thresholds(timestep_val)
+
+        # 3. Identify dynamic map with adaptive thresholds
+        q_cluster_sizes = qcluster_sizes.view(cfg, num_heads, self.num_q_centroids)
+        k_cluster_sizes = kcluster_sizes.view(cfg, num_heads, self.num_k_centroids)
+
+        dynamic_map = identify_dynamic_map(
+            qcentroids.view(cfg, num_heads, self.num_q_centroids, dim),
+            kcentroids.view(cfg, num_heads, self.num_k_centroids, dim),
+            q_cluster_sizes,
+            k_cluster_sizes,
+            p_full,  # Use adaptive threshold instead of fixed
+            self.min_kc_ratio,
+        )
+
+        # 4. Permute the query, key, value
+        q_permuted, q_sorted_indices = permute_tensor_by_labels_triton(query, qlabels, dim=2)
+        k_permuted, k_sorted_indices = permute_tensor_by_labels_triton(key, klabels, dim=2)
+        v_permuted, _ = permute_tensor_by_labels_triton(value, klabels, dim=2, sorted_indices=k_sorted_indices)
+
+        return q_permuted, k_permuted, v_permuted, dynamic_map, q_cluster_sizes, k_cluster_sizes, q_sorted_indices
+
+    @time_logging_decorator("Level 2 - SADSA attention core logic")
+    def attention_core_logic(self, query, key, value, timestep, layer_idx, cu_max_seqlens):
+        """
+        Enhanced attention core with SADSA stage awareness.
+        """
+        cfg, num_heads, seq_len, dim = query.size()
+        assert cfg == 1, "Batch size must be 1 for SADSA attention"
+
+        prompt_length, context_length, num_frame, frame_size = (
+            self.prompt_length,
+            self.context_length,
+            self.num_frame,
+            self.frame_size,
+        )
+
+        assert (
+            seq_len == context_length + num_frame * frame_size
+        ), f"Query Shape: {seq_len} is not equivalent to {context_length} + {num_frame} * {frame_size}"
+
+        # Get timestep value
+        timestep_val = timestep[0].item() if isinstance(timestep, torch.Tensor) else timestep
+
+        # Determine if we use Full Attention
+        full_attention_flag = False
+
+        # Check base conditions
+        if self.layer_idx < self.first_layers_fp:
+            full_attention_flag = True
+        if timestep_val > self.first_times_fp:
+            full_attention_flag = True
+
+        # SADSA: Check if this layer should force full attention
+        if self.sadsa_manager is not None:
+            if self.sadsa_manager.should_force_full_attention(layer_idx):
+                full_attention_flag = True
+
+        if full_attention_flag:
+            # Initialize centroids if needed
+            if self.zero_step_kmeans_init:
+                video_length = self.num_frame * self.frame_size
+                query_video = query[:, :, :video_length, :].contiguous()
+                key_video = key[:, :, :video_length, :].contiguous()
+                self.kmeans_clustering(query_video, key_video, layer_idx)
+
+            output_hidden_states = self.flashinfer_attention(query, key, value, cu_max_seqlens)
+            return output_hidden_states.reshape(cfg, num_heads, seq_len, dim)
+        else:
+            # Sparse attention with SADSA-adaptive thresholds
+            video_length = num_frame * frame_size
+            unprompt_length = context_length - prompt_length
+
+            # 1. Video part
+            query_video, key_video, value_video, attn_output = self.prepare_video_part(query, key, value)
+
+            # 2. Core SADSA-enhanced permutation
+            q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, q_sorted_indices = self.semantic_aware_permutation(
+                query_video, key_video, value_video, timestep, layer_idx
+            )
+
+            # 3. Post-processing
+            q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, q_sorted_indices = self.dynamic_map_post_processing(
+                q_perm,
+                k_perm,
+                v_perm,
+                query,
+                key,
+                value,
+                dyn_map,
+                qc_sz_s,
+                kc_sz_s,
+                q_sorted_indices,
+                video_length,
+                context_length,
+                prompt_length,
+                unprompt_length,
+            )
+
+            # 4. Sparse attention
+            output_permuted = dynamic_block_sparse_fwd_flashinfer(
+                q_perm, k_perm, v_perm, dyn_map, qc_sz_s, kc_sz_s, is_cpu=False
+            )
+
+            # 5. Inverse permutation
+            attn_output = apply_inverse_permutation_triton(output_permuted, q_sorted_indices, dim=2)
+
+            # 6. Update SADSA quality tracking
+            if self.sadsa_manager is not None:
+                densities = density_calculation(dyn_map, qc_sz_s, kc_sz_s)
+                avg_density = densities.mean().item()
+                self.sadsa_manager.on_layer_complete(layer_idx, avg_density)
+
+            # 7. Logging
+            if self.logging_file is not None:
+                densities = density_calculation(dyn_map, qc_sz_s, kc_sz_s)
+                avg_density = densities.mean().item()
+
+                # Get SADSA stage info
+                stage_name = "unknown"
+                if self.sadsa_manager is not None:
+                    stage = self.sadsa_manager.get_stage_config(timestep_val)
+                    stage_name = stage.stage.value
+
+                log_entry = {
+                    "timestep": timestep_val,
+                    "layer": layer_idx,
+                    "avg_density": avg_density,
+                    "density": densities.tolist(),
+                    "sadsa_stage": stage_name,
+                }
+
+                with open(self.logging_file, "a") as f:
+                    f.write(json.dumps(log_entry) + "\n")
+
+            return attn_output.reshape(cfg, num_heads, seq_len, dim)
+
+
+def setup_sadsa_attention(
+    pipe,
+    structure_p_full: float = 0.50,
+    semantic_p_full: float = 0.70,
+    detail_p_full: float = 0.85,
+    motion_threshold_high: float = 0.6,
+    motion_threshold_low: float = 0.15,
+    num_q_centroids: int = 400,
+    num_k_centroids: int = 1000,
+    kmeans_iter_init: int = 50,
+    kmeans_iter_step: int = 2,
+    min_kc_ratio: float = 0.1,
+    first_layers_fp: int = 0,
+    first_times_fp: int = 1000,
+    num_frame: int = 33,
+    frame_size: int = 3600,
+    context_length: int = 256,
+    prompt_length: int = 0,
+    max_timestep: int = 1000,
+    logging_file: Optional[str] = None,
+    verbose: bool = False,
+):
+    """
+    Setup SADSA attention processors for a HunyuanVideo pipeline.
+
+    Args:
+        pipe: HunyuanVideo pipeline
+        structure_p_full: p_full for structure stage (early timesteps)
+        semantic_p_full: p_full for semantic stage (middle timesteps)
+        detail_p_full: p_full for detail stage (late timesteps)
+        motion_threshold_high: Motion level above which to force full attention
+        motion_threshold_low: Motion level below which to allow skipping
+        num_q_centroids: Number of query clusters
+        num_k_centroids: Number of key clusters
+        kmeans_iter_init: K-means iterations for initialization
+        kmeans_iter_step: K-means iterations for updates
+        min_kc_ratio: Minimum key cluster ratio
+        first_layers_fp: First N layers always use full attention
+        first_times_fp: Timesteps above this use full attention
+        num_frame: Number of video frames
+        frame_size: Tokens per frame
+        context_length: Context/prompt token length
+        prompt_length: Actual prompt length
+        max_timestep: Maximum timestep value
+        logging_file: Optional file for density logging
+        verbose: Enable verbose logging
+    """
+    # Initialize shared SADSA manager
+    Hunyuan_SADSAAttn_Processor2_0.initialize_sadsa(
+        structure_p_full=structure_p_full,
+        semantic_p_full=semantic_p_full,
+        detail_p_full=detail_p_full,
+        motion_threshold_high=motion_threshold_high,
+        motion_threshold_low=motion_threshold_low,
+        num_q_centroids=num_q_centroids,
+        num_k_centroids=num_k_centroids,
+        max_timestep=max_timestep,
+        verbose=verbose,
+    )
+
+    # Set class attributes
+    Hunyuan_SADSAAttn_Processor2_0.min_kc_ratio = min_kc_ratio
+    Hunyuan_SADSAAttn_Processor2_0.kmeans_iter_init = kmeans_iter_init
+    Hunyuan_SADSAAttn_Processor2_0.kmeans_iter_step = kmeans_iter_step
+    Hunyuan_SADSAAttn_Processor2_0.first_layers_fp = first_layers_fp
+    Hunyuan_SADSAAttn_Processor2_0.first_times_fp = first_times_fp
+    Hunyuan_SADSAAttn_Processor2_0.num_frame = num_frame
+    Hunyuan_SADSAAttn_Processor2_0.frame_size = frame_size
+    Hunyuan_SADSAAttn_Processor2_0.context_length = context_length
+    Hunyuan_SADSAAttn_Processor2_0.prompt_length = prompt_length
+    Hunyuan_SADSAAttn_Processor2_0.logging_file = logging_file
+
+    # Create processor instances
+    attn_procs = {}
+    transformer = pipe.transformer
+
+    # Double transformer blocks
+    for i, block in enumerate(transformer.transformer_blocks):
+        attn_procs[f"transformer_blocks.{i}.attn"] = Hunyuan_SADSAAttn_Processor2_0(layer_idx=i)
+
+    # Single transformer blocks
+    num_double = len(transformer.transformer_blocks)
+    for i, block in enumerate(transformer.single_transformer_blocks):
+        attn_procs[f"single_transformer_blocks.{i}.attn"] = Hunyuan_SADSAAttn_Processor2_0(layer_idx=num_double + i)
+
+    # Set processors
+    transformer.set_attn_processor(attn_procs)
+
+    total_layers = len(attn_procs)
+    logger.info(f"[SADSA] Setup complete: {total_layers} attention processors configured")
+
+    return transformer
