@@ -540,16 +540,12 @@ class HybridOffloadManager:
 
     def get_statistics(self) -> Dict[str, Any]:
         """Get offloading statistics."""
-        total_ops = self.stats['prefetch_hits'] + self.stats['prefetch_misses']
-        prefetch_ratio = self.stats['prefetch_hits'] / max(total_ops, 1)
-
         inference_time = None
         if self._start_time and self._end_time:
             inference_time = self._end_time - self._start_time
 
         return {
             **self.stats,
-            'prefetch_hit_ratio': prefetch_ratio,
             'num_layers': self.num_layers,
             'layers_on_gpu': len(self._layers_on_gpu_set),
             'window_size': self.config.num_layers_on_gpu,
@@ -563,12 +559,11 @@ class HybridOffloadManager:
         print("\n" + "=" * 70)
         print("COMPONENT OFFLOADING PERFORMANCE REPORT")
         print("=" * 70)
-        print(f"Strategy: Sliding window with FFN prefetch overlap")
+        print(f"Strategy: Sliding window with async prefetch")
         print("-" * 70)
         print("CONFIGURATION:")
         print(f"  Total layers:            {stats['num_layers']}")
         print(f"  Window size:             {self.config.num_layers_on_gpu}")
-        print(f"  Component prefetch:      {self.config.enable_component_prefetch}")
         print(f"  Pinned memory:           {self.config.use_pinned_memory}")
         print("-" * 70)
         print("MEMORY EFFICIENCY:")
@@ -580,24 +575,21 @@ class HybridOffloadManager:
             savings = baseline_layers_gb - (per_layer_mb * self.config.num_layers_on_gpu / 1024)
             if savings > 0:
                 print(f"  Estimated savings:       ~{savings:.1f} GB (keeping {self.config.num_layers_on_gpu}/{stats['num_layers']} layers)")
+                pct_reduction = (savings / baseline_layers_gb) * 100
+                print(f"  Memory reduction:        {pct_reduction:.0f}%")
         else:
             print(f"  Peak GPU Memory:         Not tracked (call start_tracking() before inference)")
         print("-" * 70)
-        print("PREFETCH EFFICIENCY:")
-        print(f"  Layer loads:             {stats['layer_loads']}")
-        print(f"  Layer offloads:          {stats['layer_offloads']}")
-        print(f"  Prefetch hits:           {stats['prefetch_hits']}")
-        print(f"  Prefetch misses:         {stats['prefetch_misses']}")
-        print(f"  Prefetch hit ratio:      {stats['prefetch_hit_ratio']*100:.1f}%")
-        print(f"  FFN prefetch overlaps:   {stats['ffn_prefetch_overlaps']}")
+        print("TRANSFER STATS:")
+        print(f"  Layer loads (CPU→GPU):   {stats['layer_loads']}")
+        print(f"  Layer offloads (GPU→CPU):{stats['layer_offloads']}")
         if stats['inference_time_seconds']:
             print("-" * 70)
             print("TIMING:")
             print(f"  Inference time:          {stats['inference_time_seconds']:.1f}s")
         print("=" * 70)
         print("KEY BENEFITS:")
-        print(f"  ✓ Reduced VRAM: Only {self.config.num_layers_on_gpu}/{stats['num_layers']} layers on GPU")
-        print(f"  ✓ Prefetch efficiency: {stats['prefetch_hit_ratio']*100:.1f}% cache hits")
+        print(f"  ✓ Memory: Only {self.config.num_layers_on_gpu}/{stats['num_layers']} layers on GPU at a time")
         print(f"  ✓ Enables 24GB GPUs for 720p+ video generation")
         print("=" * 70 + "\n")
 

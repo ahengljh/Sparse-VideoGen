@@ -124,13 +124,11 @@ def run_inference(args):
             manager.stop_tracking()
             manager.print_statistics()
 
-            metrics["offload_stats"] = manager.stats.copy()
-            metrics["peak_memory_offload_gb"] = manager._peak_memory_gb
-            total_loads = manager.stats['prefetch_hits'] + manager.stats['prefetch_misses']
-            if total_loads > 0:
-                metrics["prefetch_hit_rate"] = round(
-                    manager.stats['prefetch_hits'] / total_loads * 100, 1
-                )
+            metrics["offload_stats"] = {
+                "layer_loads": manager.stats['layer_loads'],
+                "layer_offloads": manager.stats['layer_offloads'],
+            }
+            metrics["peak_memory_offload_gb"] = round(manager._peak_memory_gb, 2)
 
     return metrics
 
@@ -198,8 +196,6 @@ def main():
 
             print(f"Memory Saved: {mem_saved:.1f} GB ({mem_pct:.1f}% reduction)")
             print(f"Time Overhead: {time_overhead:.1f}s ({time_pct:.1f}% slower)")
-            if 'prefetch_hit_rate' in offload:
-                print(f"Prefetch Hit Rate: {offload['prefetch_hit_rate']}%")
 
 
 if __name__ == "__main__":
