@@ -260,4 +260,4 @@ if __name__ == "__main__":
     if args.pattern == "SADSA" and args.enable_offload:
         if 'offloaded_blocks' in dir() and offloaded_blocks is not None:
             offloaded_blocks.cleanup()
-            logger.info("Layer offloading cleanup complete")
+            logger.info("SIAO (SADSA-Informed Adaptive Offloading) cleanup complete")

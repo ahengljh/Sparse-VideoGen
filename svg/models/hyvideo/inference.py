@@ -10,6 +10,11 @@ from ...layer_offload import (
     enable_layer_offloading,
     get_gpu_memory_info,
 )
+from ...sadsa_informed_offload import (
+    SIAOConfig,
+    SADSAInformedOffloadManager,
+    create_siao_manager,
+)
 from .attention import (
     Hunyuan_SAPAttn_Processor2_0,
     Hunyuan_SADSAAttn_Processor2_0,
@@ -358,16 +363,28 @@ def setup_sadsa_with_offloading(
     replace_sparse_forward()
 
     # Step 4: Enable layer offloading if requested
-    offloaded = None
+    offload_manager = None
     if enable_offload:
-        logger.info("[SADSA+Offload] Step 3/3: Enabling layer offloading...")
-        offloaded = enable_layer_offloading(
-            pipe,
-            layers_on_gpu=layers_on_gpu,
+        logger.info("[SADSA+Offload] Step 3/3: Enabling SIAO (SADSA-Informed Adaptive Offloading)...")
+        logger.info("[SADSA+Offload] Novel features enabled:")
+        logger.info("[SADSA+Offload]   - SAMBA: Stage-Aware Memory Budget Allocation")
+        logger.info("[SADSA+Offload]   - MPP: Motion-Predictive Prefetching")
+        logger.info("[SADSA+Offload]   - QGE: Quality-Gradient Eviction")
+        logger.info("[SADSA+Offload]   - ADCP: Attention-Density Compute Prediction")
+
+        # Create SIAO manager with stage-aware budgets
+        offload_manager = create_siao_manager(
+            transformer=pipe.transformer,
+            budget_structure=1,   # Aggressive in structure stage
+            budget_semantic=2,    # Balanced in semantic stage
+            budget_detail=layers_on_gpu + 1,  # Conservative in detail stage
+            use_async_prefetch=async_prefetch,
             use_pinned_memory=use_pinned_memory,
-            async_prefetch=async_prefetch,
             verbose=verbose,
         )
+
+        # Store reference on transformer
+        pipe.transformer._siao_manager = offload_manager
     else:
         logger.info("[SADSA+Offload] Step 3/3: Layer offloading disabled (full GPU mode)")
 
@@ -377,7 +394,7 @@ def setup_sadsa_with_offloading(
     logger.info(f"[SADSA+Offload] GPU memory: {mem['allocated']:.2f}GB allocated, {mem['free']:.2f}GB free")
     logger.info("=" * 70)
 
-    return offloaded
+    return offload_manager
 
 
 def estimate_memory_requirements(
