@@ -1,8 +1,15 @@
 import os
+from typing import Optional
 
 import torch
 
 from ...logger import logger
+from ...layer_offload import (
+    OffloadConfig,
+    OffloadedTransformerBlocks,
+    enable_layer_offloading,
+    get_gpu_memory_info,
+)
 from .attention import (
     Hunyuan_SAPAttn_Processor2_0,
     Hunyuan_SADSAAttn_Processor2_0,
@@ -211,3 +218,221 @@ def replace_hyvideo_attention(
 
     else:
         assert pattern == "dense", f"Invalid pattern: {pattern}. Valid patterns: SVG, SAP, SADSA, dense"
+
+
+def setup_sadsa_with_offloading(
+    pipe,
+    height: int,
+    width: int,
+    num_frames: int,
+    prompt_length: int,
+    first_layers_fp: int = 0,
+    first_times_fp: float = 1001,
+    # SADSA specific
+    structure_p_full: float = 0.50,
+    semantic_p_full: float = 0.70,
+    detail_p_full: float = 0.85,
+    motion_threshold_high: float = 0.6,
+    motion_threshold_low: float = 0.15,
+    # Clustering params
+    num_q_centroids: int = 50,
+    num_k_centroids: int = 200,
+    min_kc_ratio: float = 0,
+    kmeans_iter_init: int = 50,
+    kmeans_iter_step: int = 2,
+    # Offloading params
+    enable_offload: bool = True,
+    layers_on_gpu: int = 1,
+    use_pinned_memory: bool = True,
+    async_prefetch: bool = True,
+    # Logging
+    logging_file: Optional[str] = None,
+    verbose: bool = False,
+) -> Optional[OffloadedTransformerBlocks]:
+    """
+    Set up SADSA (Semantic-Aware Dynamic Sparse Attention) with layer offloading.
+
+    This is the recommended configuration for running HunyuanVideo on 24GB GPUs.
+    Combines:
+    1. SADSA: Stage-adaptive sparse attention for quality + efficiency
+    2. Layer offloading: Sequential layer execution to fit in GPU memory
+
+    Memory Analysis (HunyuanVideo 720p, 129 frames):
+    - Without offloading: ~26GB GPU memory (model) + ~4GB (KV cache) = OOM on 24GB
+    - With SADSA only: ~26GB GPU memory (model) + ~1-2GB (sparse KV) = Still OOM
+    - With SADSA + Offloading: ~4GB (1-2 layers) + ~1-2GB (sparse KV) = ~6-8GB total
+
+    Args:
+        pipe: HunyuanVideoPipeline instance
+        height: Video height
+        width: Video width
+        num_frames: Number of frames
+        prompt_length: Length of text prompt tokens
+        first_layers_fp: Number of first layers to always use full precision attention
+        first_times_fp: Timestep threshold for full precision warmup
+        structure_p_full: p_full for structure stage (t > 0.7)
+        semantic_p_full: p_full for semantic stage (0.3 < t < 0.7)
+        detail_p_full: p_full for detail stage (t < 0.3)
+        motion_threshold_high: Motion threshold for forcing full attention
+        motion_threshold_low: Motion threshold for allowing skip
+        num_q_centroids: Number of query centroids for clustering
+        num_k_centroids: Number of key centroids for clustering
+        min_kc_ratio: Minimum ratio of key centroids to keep
+        kmeans_iter_init: K-means iterations for initialization
+        kmeans_iter_step: K-means iterations per step
+        enable_offload: Whether to enable layer offloading
+        layers_on_gpu: Number of layers to keep on GPU (1=min memory, 2=better latency)
+        use_pinned_memory: Use pinned memory for fast transfers
+        async_prefetch: Asynchronously prefetch next layer
+        logging_file: Path to log file
+        verbose: Enable verbose logging
+
+    Returns:
+        OffloadedTransformerBlocks instance if offloading enabled, None otherwise
+
+    Example:
+        pipe = HunyuanVideoPipeline.from_pretrained(...)
+
+        # Set up SADSA + offloading for 24GB GPU
+        offloaded = setup_sadsa_with_offloading(
+            pipe, height=720, width=1280, num_frames=129,
+            prompt_length=256, enable_offload=True
+        )
+
+        # Generate video
+        output = pipe(prompt="...", ...)
+
+        # Cleanup
+        if offloaded:
+            offloaded.cleanup()
+    """
+    logger.info("=" * 70)
+    logger.info("[SADSA+Offload] Setting up Semantic-Aware Dynamic Sparse Attention")
+    logger.info("[SADSA+Offload] with Layer Offloading for 24GB GPU inference")
+    logger.info("=" * 70)
+
+    # Calculate video dimensions
+    context_length = 256
+    num_frame = 1 + num_frames // 4
+    frame_size = height * width // 256
+
+    logger.info(f"[SADSA+Offload] Video config: {height}x{width}, {num_frames} frames")
+    logger.info(f"[SADSA+Offload] Latent config: context={context_length}, frames={num_frame}, frame_size={frame_size}")
+
+    # Make dir and clear the logging file
+    if logging_file is not None:
+        os.makedirs(os.path.dirname(logging_file), exist_ok=True)
+        with open(logging_file, "w") as f:
+            f.write("")
+
+    # Step 1: Replace with FlashAttention first
+    logger.info("[SADSA+Offload] Step 1/3: Installing FlashAttention processors...")
+    replace_hyvideo_flashattention(pipe)
+
+    # Step 2: Set up SADSA attention
+    logger.info("[SADSA+Offload] Step 2/3: Setting up SADSA attention...")
+    setup_sadsa_attention(
+        pipe=pipe,
+        structure_p_full=structure_p_full,
+        semantic_p_full=semantic_p_full,
+        detail_p_full=detail_p_full,
+        motion_threshold_high=motion_threshold_high,
+        motion_threshold_low=motion_threshold_low,
+        num_q_centroids=num_q_centroids,
+        num_k_centroids=num_k_centroids,
+        kmeans_iter_init=kmeans_iter_init,
+        kmeans_iter_step=kmeans_iter_step,
+        min_kc_ratio=min_kc_ratio,
+        first_layers_fp=first_layers_fp,
+        first_times_fp=first_times_fp,
+        num_frame=num_frame,
+        frame_size=frame_size,
+        context_length=context_length,
+        prompt_length=prompt_length,
+        max_timestep=1000,
+        logging_file=logging_file,
+        verbose=verbose,
+    )
+
+    # Step 3: Replace sparse forward (for custom transformer blocks)
+    replace_sparse_forward()
+
+    # Step 4: Enable layer offloading if requested
+    offloaded = None
+    if enable_offload:
+        logger.info("[SADSA+Offload] Step 3/3: Enabling layer offloading...")
+        offloaded = enable_layer_offloading(
+            pipe,
+            layers_on_gpu=layers_on_gpu,
+            use_pinned_memory=use_pinned_memory,
+            async_prefetch=async_prefetch,
+            verbose=verbose,
+        )
+    else:
+        logger.info("[SADSA+Offload] Step 3/3: Layer offloading disabled (full GPU mode)")
+
+    # Report memory status
+    mem = get_gpu_memory_info()
+    logger.info(f"[SADSA+Offload] Setup complete!")
+    logger.info(f"[SADSA+Offload] GPU memory: {mem['allocated']:.2f}GB allocated, {mem['free']:.2f}GB free")
+    logger.info("=" * 70)
+
+    return offloaded
+
+
+def estimate_memory_requirements(
+    height: int = 720,
+    width: int = 1280,
+    num_frames: int = 129,
+    enable_offload: bool = True,
+    enable_sadsa: bool = True,
+) -> dict:
+    """
+    Estimate GPU memory requirements for video generation.
+
+    Returns a dict with memory estimates in GB.
+    """
+    # HunyuanVideo model parameters
+    model_params_gb = 26.0  # ~13B params in bf16
+
+    # Per-layer memory (60 total layers)
+    per_layer_gb = model_params_gb / 60  # ~0.43 GB per layer
+
+    # Latent dimensions
+    num_frame = 1 + num_frames // 4
+    frame_size = height * width // 256
+    seq_len = num_frame * frame_size + 256  # + context length
+
+    # Attention memory (Q, K, V per layer)
+    # [batch, heads, seq_len, head_dim] * 3 * bf16
+    batch_size = 1
+    num_heads = 24
+    head_dim = 128
+    attn_per_layer_gb = (batch_size * num_heads * seq_len * head_dim * 3 * 2) / 1e9
+
+    # With SADSA, attention is sparse (~20-50% density on average)
+    sadsa_reduction = 0.35 if enable_sadsa else 1.0
+
+    # Compute total
+    if enable_offload:
+        # Only 1-2 layers on GPU at a time
+        model_memory = per_layer_gb * 2  # 2 layers for prefetching
+    else:
+        model_memory = model_params_gb
+
+    attention_memory = attn_per_layer_gb * sadsa_reduction
+
+    # Activations and misc
+    activation_memory = 2.0 if enable_offload else 4.0
+
+    total = model_memory + attention_memory + activation_memory
+
+    return {
+        'model_memory_gb': model_memory,
+        'attention_memory_gb': attention_memory,
+        'activation_memory_gb': activation_memory,
+        'total_estimated_gb': total,
+        'offload_enabled': enable_offload,
+        'sadsa_enabled': enable_sadsa,
+        'fits_24gb': total < 22,  # Leave 2GB headroom
+    }

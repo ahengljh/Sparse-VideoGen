@@ -14,7 +14,12 @@ from diffusers.utils import load_image, export_to_video
 from dataloader import load_prompt_or_image
 from svg.timer import print_operator_log_data
 from svg.utils.seed import seed_everything
-from svg.models.hyvideo.inference import replace_hyvideo_flashattention, replace_hyvideo_attention
+from svg.models.hyvideo.inference import (
+    replace_hyvideo_flashattention,
+    replace_hyvideo_attention,
+    setup_sadsa_with_offloading,
+    estimate_memory_requirements,
+)
 from svg.models.hyvideo.utils import get_prompt_length
 
 from svg.logger import logger
@@ -63,6 +68,12 @@ if __name__ == "__main__":
     parser.add_argument("--detail_p_full", type=float, default=0.85, help="p_full for detail stage (late timesteps, t<0.3)")
     parser.add_argument("--motion_threshold_high", type=float, default=0.6, help="Motion level above which to force full attention")
     parser.add_argument("--motion_threshold_low", type=float, default=0.15, help="Motion level below which to allow skipping")
+
+    # Layer offloading for 24GB GPU support
+    parser.add_argument("--enable_offload", action="store_true", help="Enable layer offloading for 24GB GPU inference")
+    parser.add_argument("--layers_on_gpu", type=int, default=1, help="Number of layers to keep on GPU (1=min memory, 2=better latency)")
+    parser.add_argument("--no_pinned_memory", action="store_true", help="Disable pinned memory (slower but uses less CPU RAM)")
+    parser.add_argument("--no_async_prefetch", action="store_true", help="Disable async layer prefetching")
 
     args = parser.parse_args()
 
@@ -167,28 +178,53 @@ if __name__ == "__main__":
     elif args.pattern == "SADSA":
         # SADSA: Semantic-Aware Dynamic Sparse Attention
         # Uses stage-adaptive thresholds + motion-aware routing + quality preservation
-        replace_hyvideo_attention(
+        # Combined with layer offloading for 24GB GPU support
+
+        # Estimate memory requirements first
+        mem_estimate = estimate_memory_requirements(
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            enable_offload=args.enable_offload,
+            enable_sadsa=True,
+        )
+        logger.info("=" * 60)
+        logger.info("Memory Estimation:")
+        logger.info(f"  Model memory:      {mem_estimate['model_memory_gb']:.2f} GB")
+        logger.info(f"  Attention memory:  {mem_estimate['attention_memory_gb']:.2f} GB")
+        logger.info(f"  Activation memory: {mem_estimate['activation_memory_gb']:.2f} GB")
+        logger.info(f"  Total estimated:   {mem_estimate['total_estimated_gb']:.2f} GB")
+        logger.info(f"  Fits in 24GB GPU:  {'Yes' if mem_estimate['fits_24gb'] else 'No - consider enabling offload'}")
+        logger.info("=" * 60)
+
+        # Use combined SADSA + offloading setup
+        offloaded_blocks = setup_sadsa_with_offloading(
             pipe,
-            args.height,
-            args.width,
-            args.num_frames,
-            prompt_length,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            prompt_length=prompt_length,
             first_layers_fp=args.first_layers_fp,
             first_times_fp=args.first_times_fp,
-            pattern=args.pattern,
-            # Clustering params (shared with SAP)
-            num_q_centroids=args.num_q_centroids,
-            num_k_centroids=args.num_k_centroids,
-            min_kc_ratio=args.min_kc_ratio,
-            logging_file=args.logging_file,
-            kmeans_iter_init=args.kmeans_iter_init if args.kmeans_iter_init > 0 else 50,
-            kmeans_iter_step=args.kmeans_iter_step if args.kmeans_iter_step > 0 else 2,
             # SADSA specific
             structure_p_full=args.structure_p_full,
             semantic_p_full=args.semantic_p_full,
             detail_p_full=args.detail_p_full,
             motion_threshold_high=args.motion_threshold_high,
             motion_threshold_low=args.motion_threshold_low,
+            # Clustering params
+            num_q_centroids=args.num_q_centroids if args.num_q_centroids else 50,
+            num_k_centroids=args.num_k_centroids if args.num_k_centroids else 200,
+            min_kc_ratio=args.min_kc_ratio,
+            kmeans_iter_init=args.kmeans_iter_init if args.kmeans_iter_init > 0 else 50,
+            kmeans_iter_step=args.kmeans_iter_step if args.kmeans_iter_step > 0 else 2,
+            # Offloading params
+            enable_offload=args.enable_offload,
+            layers_on_gpu=args.layers_on_gpu,
+            use_pinned_memory=not args.no_pinned_memory,
+            async_prefetch=not args.no_async_prefetch,
+            logging_file=args.logging_file,
+            verbose=True,
         )
     else:
         assert args.pattern == "dense", f"Invalid pattern: {args.pattern}"
@@ -218,3 +254,10 @@ if __name__ == "__main__":
         os.makedirs(output_dir, exist_ok=True)
 
     export_to_video(output, args.output_file, fps=24)
+    logger.info(f"Video saved to {args.output_file}")
+
+    # Cleanup offloaded layers if used
+    if args.pattern == "SADSA" and args.enable_offload:
+        if 'offloaded_blocks' in dir() and offloaded_blocks is not None:
+            offloaded_blocks.cleanup()
+            logger.info("Layer offloading cleanup complete")

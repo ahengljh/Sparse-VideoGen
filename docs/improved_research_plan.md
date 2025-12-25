@@ -952,3 +952,161 @@ Key Claims:
 The current CTA framework provides a solid foundation but lacks the **semantic awareness**, **motion understanding**, and **quality preservation** needed for a top-tier publication. The proposed SADSA framework addresses these gaps with four novel, technically deep contributions that are each independently publishable but synergize powerfully when combined.
 
 The key differentiator is shifting from "content-agnostic fixed sparsity" to "semantic-aware dynamic sparsity" — a paradigm shift that better matches how humans perceive video quality (we care more about moving objects and text-relevant regions than static backgrounds).
+
+---
+
+## Part 7: Layer Offloading for Consumer GPU Support
+
+### 7.1 Problem: HunyuanVideo Memory Requirements
+
+HunyuanVideo is a 13B parameter model that requires significant GPU memory:
+
+| Component | Memory (bf16) |
+|-----------|---------------|
+| Model parameters | ~26 GB |
+| Attention KV cache (dense) | ~4 GB |
+| Activations | ~4 GB |
+| **Total** | **~34 GB** |
+
+This exceeds the 24GB available on consumer GPUs (RTX 4090, A5000, etc.).
+
+### 7.2 Solution: Sequential Layer Offloading
+
+**Core Insight**: During inference, we only need one transformer layer on GPU at a time. The 60 layers (20 double + 40 single) can be sequentially loaded and unloaded.
+
+**Memory with Offloading**:
+
+| Component | Memory (bf16) |
+|-----------|---------------|
+| 1-2 layers on GPU | ~1 GB |
+| Attention KV cache (SADSA sparse) | ~1-2 GB |
+| Activations | ~2 GB |
+| VAE + Text encoders | ~4 GB |
+| **Total** | **~8-10 GB** |
+
+This comfortably fits in 24GB with room for other operations.
+
+### 7.3 Implementation Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    Layer Offloading Architecture                            │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  CPU Memory (Pinned)                          GPU Memory                    │
+│  ┌─────────────────────────┐                  ┌─────────────────────────┐   │
+│  │ Layer 0 (pinned)        │                  │ Active Layer (i)       │   │
+│  │ Layer 1 (pinned)        │  ──prefetch──▶   │                         │   │
+│  │ Layer 2 (pinned)        │                  │ Next Layer (i+1)       │   │
+│  │ ...                     │  ◀──offload───   │ (async loading)        │   │
+│  │ Layer 59 (pinned)       │                  │                         │   │
+│  └─────────────────────────┘                  │ KV Cache (sparse)       │   │
+│                                               │ Activations              │   │
+│  CUDA Stream for Prefetch                     └─────────────────────────┘   │
+│  ┌─────────────────────────┐                                                │
+│  │ Async copy next layer   │                                                │
+│  │ while current executes  │                                                │
+│  └─────────────────────────┘                                                │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 7.4 Key Implementation Details
+
+```python
+class LayerOffloadManager:
+    """
+    Key features:
+    1. Pinned memory for fast CPU→GPU transfers
+    2. Async prefetching with CUDA streams
+    3. Automatic layer eviction when memory is tight
+    4. Integration with SADSA sparse attention
+    """
+
+    def forward_with_offload(self, hidden_states, layer_idx, ...):
+        # 1. Ensure current layer is on GPU
+        self.ensure_on_gpu(layer_idx)
+
+        # 2. Async prefetch next layer (overlapped with compute)
+        self.prefetch_next_layer(layer_idx)
+
+        # 3. Execute layer forward (SADSA sparse attention inside)
+        output = self.layers[layer_idx](hidden_states, ...)
+
+        # 4. Evict old layers to free GPU memory
+        self.evict_old_layers(layer_idx)
+
+        return output
+```
+
+### 7.5 SADSA + Offloading Synergy
+
+The combination of SADSA and layer offloading is particularly powerful:
+
+| Feature | SADSA Contribution | Offloading Contribution |
+|---------|-------------------|-------------------------|
+| Memory reduction | Sparse attention reduces KV cache | Sequential layers reduce model memory |
+| Quality preservation | Semantic-aware sparsity | No quality impact (exact computation) |
+| Speed | Faster attention | Transfer overhead (mitigated by prefetch) |
+| **Combined** | **Best of both: 24GB inference with quality** |
+
+### 7.6 Usage Example
+
+```python
+from svg.models.hyvideo.inference import setup_sadsa_with_offloading
+
+# Load model
+pipe = HunyuanVideoPipeline.from_pretrained("tencent/HunyuanVideo", ...)
+
+# Enable SADSA + offloading for 24GB GPU
+offloaded = setup_sadsa_with_offloading(
+    pipe,
+    height=720,
+    width=1280,
+    num_frames=129,
+    prompt_length=256,
+    # SADSA params
+    structure_p_full=0.50,
+    semantic_p_full=0.70,
+    detail_p_full=0.85,
+    # Offloading params
+    enable_offload=True,
+    layers_on_gpu=1,  # Minimum memory mode
+)
+
+# Generate video (same API as before)
+output = pipe(prompt="A cat walks on the grass", ...)
+
+# Cleanup
+offloaded.cleanup()
+```
+
+### 7.7 Command Line Usage
+
+```bash
+# Run with SADSA + offloading for 24GB GPU
+python hyvideo_t2v_inference.py \
+    --pattern SADSA \
+    --enable_offload \
+    --layers_on_gpu 1 \
+    --prompt "A majestic lion walking through a savanna" \
+    --output_file output.mp4
+```
+
+---
+
+## Summary: Complete SADSA Framework
+
+The complete SADSA framework combines:
+
+1. **STIS** (Semantic Token Importance Scoring): Prioritize text-relevant tokens
+2. **DSAS** (Diffusion-Stage Adaptive Sparsity): Stage-aware thresholds
+3. **MCAR** (Motion-Conditioned Attention Routing): Protect high-motion regions
+4. **QPTC** (Quality-Preserving Temporal Coherence): Self-supervised quality feedback
+5. **Layer Offloading**: Sequential layer execution for 24GB GPU support
+
+This combination achieves:
+- **2-2.5x speedup** vs full attention
+- **<2% FVD degradation** in quality
+- **24GB GPU support** (vs 34GB+ without offloading)
+- **Better semantic alignment** than fixed-sparsity methods
