@@ -97,7 +97,19 @@ if __name__ == "__main__":
     scheduler = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
     pipe = HunyuanVideoPipeline.from_pretrained(args.model_id, transformer=transformer, scheduler=scheduler, revision='refs/pr/18', torch_dtype=torch.bfloat16)
     pipe.vae.enable_tiling()
-    pipe.to("cuda")
+
+    # Only move to CUDA if NOT using offloading
+    # With offloading, SIAO will manage device placement
+    if not (args.pattern == "SADSA" and args.enable_offload):
+        pipe.to("cuda")
+    else:
+        # For offloading: keep transformer on CPU, move other components to CUDA
+        pipe.text_encoder.to("cuda")
+        if hasattr(pipe, 'text_encoder_2') and pipe.text_encoder_2 is not None:
+            pipe.text_encoder_2.to("cuda")
+        pipe.vae.to("cuda")
+        # Transformer stays on CPU - SIAO will manage layer-by-layer movement
+        logger.info("[Offload] Keeping transformer on CPU for layer-by-layer offloading")
     
     config = pipe.transformer.config
 
