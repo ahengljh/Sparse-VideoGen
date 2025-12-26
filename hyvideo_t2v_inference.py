@@ -78,7 +78,8 @@ if __name__ == "__main__":
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
     parser.add_argument("--offload_strategy", type=str, default="layer", choices=["layer", "component"],
                         help="Offloading strategy: 'layer' (full layer offload) or 'component' (pin attention, offload FFN).")
-    parser.add_argument("--offload_num_layers", type=int, default=6, help="Number of transformer layers to keep on GPU (sliding window size). Higher=faster but more VRAM. Recommended: 4-8 for 24GB, 10-15 for 40GB+.")
+    parser.add_argument("--offload_num_layers", type=int, default=None, help="Number of transformer layers to keep on GPU (sliding window size). None=auto-detect based on GPU memory and resolution.")
+    parser.add_argument("--offload_auto", action="store_true", help="Enable adaptive offloading that auto-calculates optimal layers based on GPU memory and video resolution.")
     parser.add_argument("--offload_max_memory_gb", type=float, default=None, help="Auto-tune num_layers based on memory budget (e.g., 20.0 for 24GB GPU).")
     parser.add_argument("--offload_pinned_memory", action="store_true", default=True, help="Use pinned CPU memory for faster transfers.")
     parser.add_argument("--offload_no_pinned_memory", action="store_false", dest="offload_pinned_memory", help="Disable pinned memory.")
@@ -213,15 +214,26 @@ if __name__ == "__main__":
             logger.info(f"  FFN: {savings['ffn_total_gb']:.2f}GB")
             logger.info(f"  Norm: {savings['norm_total_gb']:.2f}GB")
             logger.info(f"  Per layer: {savings['avg_layer_gb']*1024:.1f}MB")
-            logger.info(f"  Window ({args.offload_num_layers} layers): {args.offload_num_layers * savings['avg_layer_gb']:.2f}GB")
+
+            # Determine layers on GPU: None for auto, or user-specified value
+            if args.offload_auto or args.offload_num_layers is None:
+                ffn_layers = None  # Auto-detect based on GPU memory and resolution
+                logger.info("Using ADAPTIVE offloading (auto-detect layers based on GPU memory)")
+            else:
+                ffn_layers = args.offload_num_layers
+                logger.info(f"  Window ({ffn_layers} layers): {ffn_layers * savings['avg_layer_gb']:.2f}GB")
 
             offload_manager, offload_hooks = enable_component_offloading(
                 pipe,
-                ffn_layers_on_gpu=args.offload_num_layers,
+                ffn_layers_on_gpu=ffn_layers,
                 use_pinned_memory=args.offload_pinned_memory,
                 enable_prefetch=args.offload_prefetch,
                 ffn_prefetch_count=2,
                 verbose=args.offload_verbose,
+                # Pass video resolution for adaptive mode activation estimation
+                video_height=args.height,
+                video_width=args.width,
+                num_frames=args.num_frames,
             )
         else:
             # Standard layer-level offloading (text encoders already on CPU)

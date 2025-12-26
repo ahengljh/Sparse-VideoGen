@@ -5,7 +5,7 @@
 # Strategy: Sliding Window with Cross-Timestep Cluster Amortization (CTCA)
 # - Uses sliding window of full layers (like standard AIO)
 # - SAP_CTCA reuses cluster assignments across timesteps for efficiency
-# - Tuned parameters for good quality-speed balance
+# - Adaptive offloading: auto-calculates layers based on GPU memory & resolution
 #
 # This is especially useful for GPUs with limited VRAM (e.g., RTX 4090 24GB)
 # where we want to maximize GPU utilization while staying within memory limits.
@@ -21,11 +21,11 @@ RESOLUTION="${RESOLUTION:-720p}"
 NUM_FRAMES="${NUM_FRAMES:-129}"
 SEED="${SEED:-42}"
 
-# Offloading parameters
-# FFN_LAYERS_ON_GPU: Number of layers to keep on GPU (sliding window)
-# Higher = faster but more VRAM, Lower = slower but less VRAM
-# Recommended: 4-8 for 24GB GPU, 10-15 for 40GB+ GPU
-FFN_LAYERS_ON_GPU="${FFN_LAYERS_ON_GPU:-6}"
+# Offloading mode:
+# - Set OFFLOAD_AUTO=1 for adaptive mode (auto-detect based on GPU memory)
+# - Set FFN_LAYERS_ON_GPU to a number for fixed mode
+OFFLOAD_AUTO="${OFFLOAD_AUTO:-1}"
+FFN_LAYERS_ON_GPU="${FFN_LAYERS_ON_GPU:-}"
 
 echo "=============================================="
 echo "SAP_CTCA with Component Offloading"
@@ -35,9 +35,21 @@ echo ""
 echo "Model: $MODEL_ID"
 echo "Resolution: $RESOLUTION"
 echo "Frames: $NUM_FRAMES"
-echo "Layers on GPU: $FFN_LAYERS_ON_GPU"
+if [ "$OFFLOAD_AUTO" = "1" ]; then
+    echo "Offload Mode: ADAPTIVE (auto-detect layers)"
+else
+    echo "Layers on GPU: $FFN_LAYERS_ON_GPU"
+fi
 echo "Output: $OUTPUT_FILE"
 echo "=============================================="
+
+# Build offload arguments
+OFFLOAD_ARGS="--enable_offload --offload_strategy component --offload_pinned_memory --offload_prefetch"
+if [ "$OFFLOAD_AUTO" = "1" ]; then
+    OFFLOAD_ARGS="$OFFLOAD_ARGS --offload_auto"
+elif [ -n "$FFN_LAYERS_ON_GPU" ]; then
+    OFFLOAD_ARGS="$OFFLOAD_ARGS --offload_num_layers $FFN_LAYERS_ON_GPU"
+fi
 
 python hyvideo_t2v_inference.py \
     --model_id "$MODEL_ID" \
@@ -58,11 +70,7 @@ python hyvideo_t2v_inference.py \
     --ctca_quality_threshold 0.88 \
     --ctca_min_interval 1 \
     --ctca_max_interval 5 \
-    --enable_offload \
-    --offload_strategy component \
-    --offload_num_layers "$FFN_LAYERS_ON_GPU" \
-    --offload_pinned_memory \
-    --offload_prefetch
+    $OFFLOAD_ARGS
 
 echo ""
 echo "=============================================="
