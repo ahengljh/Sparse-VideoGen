@@ -50,6 +50,10 @@ from .logger import logger
 from .timer import time_logging_decorator
 
 
+# Safety buffer for memory fragmentation (GB)
+MEMORY_SAFETY_BUFFER_GB = 2.0
+
+
 @dataclass
 class HybridOffloadConfig:
     """Configuration for hybrid component-level offloading."""
@@ -123,9 +127,6 @@ ACTIVATION_RESERVE_GB = {
     (1080, 1920, 45): 14.0,
     (1080, 1920, 97): 20.0,
 }
-
-# Safety buffer for memory fragmentation (GB)
-MEMORY_SAFETY_BUFFER_GB = 2.0
 
 
 def estimate_activation_reserve(height: int, width: int, num_frames: int) -> float:
