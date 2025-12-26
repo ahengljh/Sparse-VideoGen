@@ -64,7 +64,19 @@ class HybridOffloadConfig:
     # Sliding window size (number of FULL layers on GPU)
     # Each layer = attention + norm + FFN
     # For 24GB GPU: 6-8 layers typical
+    # Set to -1 or "auto" for adaptive mode
     num_layers_on_gpu: int = 6
+
+    # Adaptive offloading settings
+    # When True, automatically calculate optimal layers based on GPU memory
+    adaptive_mode: bool = False
+    activation_reserve_gb: Optional[float] = None  # Auto-calculated if None
+    safety_buffer_gb: float = MEMORY_SAFETY_BUFFER_GB
+
+    # Video resolution for activation estimation (used in adaptive mode)
+    video_height: int = 720
+    video_width: int = 1280
+    num_frames: int = 129
 
     # Prefetching settings
     enable_prefetch: bool = True
@@ -91,6 +103,127 @@ DOUBLE_BLOCK_NORM_COMPONENTS = ['norm1', 'norm1_context', 'norm2', 'norm2_contex
 SINGLE_BLOCK_ATTENTION_COMPONENTS = ['attn']
 SINGLE_BLOCK_MLP_COMPONENTS = ['proj_out']
 SINGLE_BLOCK_NORM_COMPONENTS = ['norm', 'proj_mlp', 'act_mlp']
+
+
+# Activation reserve estimates (in GB) for different resolutions
+# These are conservative estimates that account for:
+# - Q, K, V tensors
+# - FFN intermediate (4x expansion)
+# - Residual connections
+# - PyTorch memory fragmentation and overhead
+ACTIVATION_RESERVE_GB = {
+    # (height, width, frames): reserve_gb
+    (480, 848, 45): 4.0,
+    (480, 848, 97): 6.0,
+    (540, 960, 45): 5.0,
+    (540, 960, 97): 8.0,
+    (720, 1280, 45): 8.0,
+    (720, 1280, 97): 12.0,
+    (720, 1280, 129): 14.0,
+    (1080, 1920, 45): 14.0,
+    (1080, 1920, 97): 20.0,
+}
+
+# Safety buffer for memory fragmentation (GB)
+MEMORY_SAFETY_BUFFER_GB = 2.0
+
+
+def estimate_activation_reserve(height: int, width: int, num_frames: int) -> float:
+    """
+    Estimate GPU memory reserve needed for activations during inference.
+
+    This accounts for temporary tensors created during forward pass:
+    - Q, K, V projections
+    - FFN intermediate (4x expansion)
+    - Attention output
+    - Residual connections
+
+    Args:
+        height: Video height
+        width: Video width
+        num_frames: Number of frames
+
+    Returns:
+        Estimated activation reserve in GB
+    """
+    # Try exact match first
+    key = (height, width, num_frames)
+    if key in ACTIVATION_RESERVE_GB:
+        return ACTIVATION_RESERVE_GB[key]
+
+    # Find closest match or interpolate
+    # Calculate based on sequence length
+    latent_t = num_frames // 4
+    latent_h = height // 8 // 2  # After VAE and patchify
+    latent_w = width // 8 // 2
+    seq_len = latent_t * latent_h * latent_w
+
+    # Rough formula based on sequence length
+    # Hidden dim = 3072, bf16 = 2 bytes
+    hidden_dim = 3072
+    bytes_per_elem = 2
+
+    # Peak activation per layer (Q,K,V + FFN intermediate)
+    qkv_bytes = 3 * seq_len * hidden_dim * bytes_per_elem
+    ffn_bytes = seq_len * hidden_dim * 4 * bytes_per_elem  # 4x expansion
+    peak_per_layer_gb = (qkv_bytes + ffn_bytes) / (1024**3)
+
+    # Multiple layers' activations can overlap, add buffer
+    # Also account for PyTorch overhead (~30%)
+    estimated_reserve = peak_per_layer_gb * 3 * 1.3
+
+    # Clamp to reasonable range
+    return max(4.0, min(estimated_reserve, 24.0))
+
+
+def calculate_optimal_layers_on_gpu(
+    total_gpu_memory_gb: float,
+    model_weights_gb: float,
+    num_layers: int,
+    activation_reserve_gb: float,
+    safety_buffer_gb: float = MEMORY_SAFETY_BUFFER_GB,
+) -> int:
+    """
+    Calculate optimal number of layers to keep on GPU.
+
+    Strategy: Reserve space for activations first, then use remaining
+    space for model weights.
+
+    Args:
+        total_gpu_memory_gb: Total GPU memory in GB
+        model_weights_gb: Total model weights in GB
+        num_layers: Total number of layers
+        activation_reserve_gb: Reserved memory for activations
+        safety_buffer_gb: Additional safety buffer
+
+    Returns:
+        Number of layers to keep on GPU
+    """
+    # Available space for weights
+    available_for_weights = total_gpu_memory_gb - activation_reserve_gb - safety_buffer_gb
+
+    if available_for_weights <= 0:
+        logger.warning(f"GPU memory ({total_gpu_memory_gb:.1f}GB) too small for "
+                      f"activation reserve ({activation_reserve_gb:.1f}GB). Using minimum 1 layer.")
+        return 1
+
+    # Per-layer weight size
+    per_layer_gb = model_weights_gb / num_layers
+
+    # How many layers fit
+    num_layers_on_gpu = int(available_for_weights / per_layer_gb)
+
+    # Clamp to valid range
+    num_layers_on_gpu = max(1, min(num_layers_on_gpu, num_layers))
+
+    logger.info(f"[ADAPTIVE] GPU: {total_gpu_memory_gb:.1f}GB")
+    logger.info(f"[ADAPTIVE] Activation reserve: {activation_reserve_gb:.1f}GB")
+    logger.info(f"[ADAPTIVE] Safety buffer: {safety_buffer_gb:.1f}GB")
+    logger.info(f"[ADAPTIVE] Available for weights: {available_for_weights:.1f}GB")
+    logger.info(f"[ADAPTIVE] Per-layer size: {per_layer_gb:.3f}GB")
+    logger.info(f"[ADAPTIVE] Optimal layers on GPU: {num_layers_on_gpu}/{num_layers}")
+
+    return num_layers_on_gpu
 
 
 @dataclass
@@ -559,18 +692,22 @@ class HybridOffloadManager:
         print("\n" + "=" * 70)
         print("COMPONENT OFFLOADING PERFORMANCE REPORT")
         print("=" * 70)
-        print(f"Strategy: Sliding window with async prefetch")
+        mode_str = "Adaptive (auto-calculated)" if self.config.adaptive_mode else "Fixed (user-specified)"
+        print(f"Strategy: Sliding window with async prefetch ({mode_str})")
         print("-" * 70)
         print("CONFIGURATION:")
         print(f"  Total layers:            {stats['num_layers']}")
-        print(f"  Window size:             {self.config.num_layers_on_gpu}")
+        print(f"  Layers on GPU:           {self.config.num_layers_on_gpu}")
         print(f"  Pinned memory:           {self.config.use_pinned_memory}")
+        if self.config.adaptive_mode:
+            print(f"  Video resolution:        {self.config.video_height}x{self.config.video_width}")
+            print(f"  Frames:                  {self.config.num_frames}")
         print("-" * 70)
         print("MEMORY EFFICIENCY:")
         if stats['peak_memory_gb'] > 0:
             print(f"  Peak GPU Memory:         {stats['peak_memory_gb']:.2f} GB")
             # Estimate baseline (all layers on GPU)
-            per_layer_mb = sum(info.total_mb for info in self._layer_memory_info.values()) / max(len(self._layer_memory_info), 1)
+            per_layer_mb = sum(info.total_mb for info in self._layer_memory.values()) / max(len(self._layer_memory), 1)
             baseline_layers_gb = (per_layer_mb * stats['num_layers']) / 1024
             savings = baseline_layers_gb - (per_layer_mb * self.config.num_layers_on_gpu / 1024)
             if savings > 0:
@@ -664,12 +801,16 @@ def create_hybrid_offload_hooks(
 
 def enable_component_offloading(
     pipe,
-    ffn_layers_on_gpu: int = 6,
+    ffn_layers_on_gpu: Optional[int] = None,
     use_pinned_memory: bool = True,
     enable_prefetch: bool = True,
     ffn_prefetch_count: int = 2,
     enable_component_prefetch: bool = False,  # Disabled for now - causes device issues
     verbose: bool = False,
+    # Adaptive mode parameters
+    video_height: int = 720,
+    video_width: int = 1280,
+    num_frames: int = 129,
 ) -> Tuple[HybridOffloadManager, Dict]:
     """
     Enable hybrid component offloading for a HunyuanVideo pipeline.
@@ -679,18 +820,61 @@ def enable_component_offloading(
     2. Prefetch next layers while current layer computes
     3. Use pinned memory for faster CPU->GPU transfers
 
+    Adaptive Mode:
+    When ffn_layers_on_gpu is None, automatically calculates optimal layers
+    based on GPU memory and video resolution. This reserves space for
+    activations first, then uses remaining memory for model weights.
+
     Args:
         pipe: HunyuanVideoPipeline
-        ffn_layers_on_gpu: Number of layers to keep on GPU (sliding window)
+        ffn_layers_on_gpu: Number of layers on GPU. None = auto-detect
         use_pinned_memory: Use pinned CPU memory for faster transfers
         enable_prefetch: Enable async layer prefetching
         ffn_prefetch_count: Number of layers to prefetch ahead
         enable_component_prefetch: (Experimental) Enable FFN prefetch during attention
         verbose: Enable verbose logging
+        video_height: Video height (for adaptive mode activation estimation)
+        video_width: Video width (for adaptive mode activation estimation)
+        num_frames: Number of frames (for adaptive mode activation estimation)
 
     Returns:
         Tuple of (HybridOffloadManager, hooks_dict)
     """
+    transformer = pipe.transformer
+
+    # Calculate model size for adaptive mode
+    def get_model_weights_gb(model):
+        return sum(p.numel() * p.element_size() for p in model.parameters()) / (1024**3)
+
+    num_layers = (len(transformer.transformer_blocks) +
+                  len(transformer.single_transformer_blocks))
+    model_weights_gb = get_model_weights_gb(transformer)
+
+    # Determine number of layers on GPU
+    adaptive_mode = ffn_layers_on_gpu is None
+
+    if adaptive_mode:
+        # Get GPU memory
+        if torch.cuda.is_available():
+            total_gpu_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        else:
+            total_gpu_gb = 24.0  # Default assumption
+
+        # Estimate activation reserve based on resolution
+        activation_reserve = estimate_activation_reserve(video_height, video_width, num_frames)
+
+        # Calculate optimal layers
+        ffn_layers_on_gpu = calculate_optimal_layers_on_gpu(
+            total_gpu_memory_gb=total_gpu_gb,
+            model_weights_gb=model_weights_gb,
+            num_layers=num_layers,
+            activation_reserve_gb=activation_reserve,
+        )
+
+        logger.info(f"[ADAPTIVE] Auto-selected {ffn_layers_on_gpu} layers on GPU")
+    else:
+        logger.info(f"[FIXED] Using {ffn_layers_on_gpu} layers on GPU (user specified)")
+
     config = HybridOffloadConfig(
         num_layers_on_gpu=ffn_layers_on_gpu,
         use_pinned_memory=use_pinned_memory,
@@ -698,9 +882,11 @@ def enable_component_offloading(
         prefetch_count=ffn_prefetch_count,
         enable_component_prefetch=False,  # Force disabled for stability
         verbose=verbose,
+        adaptive_mode=adaptive_mode,
+        video_height=video_height,
+        video_width=video_width,
+        num_frames=num_frames,
     )
-
-    transformer = pipe.transformer
 
     # Keep other transformer components on GPU FIRST (before moving blocks to CPU)
     # This follows the same order as offload.py
