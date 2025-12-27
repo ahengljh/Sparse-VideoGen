@@ -905,11 +905,33 @@ def enable_component_offloading(
                     size_mb = sum(p.numel() * p.element_size() for p in comp.parameters()) / 1024**2
                     logger.info(f"  {name}: {size_mb:.1f}MB → {first_param.device}")
 
-    # Keep VAE on GPU for decoding (it's small ~300MB)
+    # Lazy VAE loading: Keep VAE on CPU, move to GPU only when decode is called
+    # This saves ~300MB during transformer inference
+    vae_hook_handle = None
     if hasattr(pipe, 'vae') and pipe.vae is not None:
-        pipe.vae.to(config.compute_device)
         vae_size_mb = sum(p.numel() * p.element_size() for p in pipe.vae.parameters()) / 1024**2
-        logger.info(f"VAE kept on GPU: {vae_size_mb:.1f}MB")
+
+        # Keep VAE on CPU
+        pipe.vae.to('cpu')
+        logger.info(f"VAE on CPU (lazy load): {vae_size_mb:.1f}MB - will move to GPU when decode is called")
+
+        # Register a forward pre-hook on VAE decoder to move to GPU before use
+        def create_vae_lazy_load_hook(vae_module, device):
+            """Create a hook that moves VAE to GPU before forward pass."""
+            _moved = [False]  # Use list to allow mutation in closure
+
+            def hook(module, args):
+                if not _moved[0]:
+                    logger.info(f"[LAZY-VAE] Moving VAE to {device} for decode...")
+                    vae_module.to(device)
+                    _moved[0] = True
+                    torch.cuda.empty_cache()
+                return args
+            return hook
+
+        vae_hook = create_vae_lazy_load_hook(pipe.vae, config.compute_device)
+        vae_hook_handle = pipe.vae.register_forward_pre_hook(vae_hook)
+        logger.info("Registered lazy-load hook on VAE")
 
     # Move transformer blocks to CPU using the ModuleList's .to() method
     # This ensures proper PyTorch module tracking
@@ -945,6 +967,10 @@ def enable_component_offloading(
     hook_handle = transformer.register_forward_pre_hook(ensure_embedders_on_gpu)
     hooks['transformer_embedder_safety'] = hook_handle
     logger.info("Registered embedder safety hook on transformer")
+
+    # Add VAE hook to hooks dict
+    if vae_hook_handle is not None:
+        hooks['vae_lazy_load'] = vae_hook_handle
 
     torch.cuda.empty_cache()
     gc.collect()
