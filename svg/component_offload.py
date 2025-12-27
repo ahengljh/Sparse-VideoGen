@@ -115,18 +115,22 @@ SINGLE_BLOCK_NORM_COMPONENTS = ['norm', 'proj_mlp', 'act_mlp']
 # - FFN intermediate (4x expansion)
 # - Residual connections
 # - PyTorch memory fragmentation and overhead
+# - CTCA cache and sparse attention intermediates
 ACTIVATION_RESERVE_GB = {
     # (height, width, frames): reserve_gb
-    (480, 848, 45): 4.0,
-    (480, 848, 97): 6.0,
-    (540, 960, 45): 5.0,
-    (540, 960, 97): 8.0,
-    (720, 1280, 45): 8.0,
-    (720, 1280, 97): 12.0,
-    (720, 1280, 129): 14.0,
-    (1080, 1920, 45): 14.0,
-    (1080, 1920, 97): 20.0,
+    (480, 848, 45): 6.0,
+    (480, 848, 97): 8.0,
+    (540, 960, 45): 7.0,
+    (540, 960, 97): 10.0,
+    (720, 1280, 45): 10.0,
+    (720, 1280, 97): 14.0,
+    (720, 1280, 129): 18.0,  # Increased from 14 - was causing OOM
+    (1080, 1920, 45): 18.0,
+    (1080, 1920, 97): 24.0,
 }
+
+# Safety buffer for memory fragmentation (GB) - increased for stability
+MEMORY_SAFETY_BUFFER_GB_ADAPTIVE = 3.0
 
 
 def estimate_activation_reserve(height: int, width: int, num_frames: int) -> float:
@@ -182,7 +186,7 @@ def calculate_optimal_layers_on_gpu(
     model_weights_gb: float,
     num_layers: int,
     activation_reserve_gb: float,
-    safety_buffer_gb: float = MEMORY_SAFETY_BUFFER_GB,
+    safety_buffer_gb: float = MEMORY_SAFETY_BUFFER_GB_ADAPTIVE,
 ) -> int:
     """
     Calculate optimal number of layers to keep on GPU.
