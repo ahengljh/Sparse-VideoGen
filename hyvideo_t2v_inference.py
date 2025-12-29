@@ -23,7 +23,7 @@ from svg.models.hyvideo.inference import (
     reset_ctaa_statistics,
 )
 from svg.models.hyvideo.utils import get_prompt_length
-from svg.offload import enable_offloading, pre_encode_and_offload, OffloadConfig
+from svg.offload import pre_encode_and_offload
 from svg.component_offload import enable_component_offloading, estimate_memory_savings
 
 from svg.logger import logger
@@ -201,51 +201,46 @@ if __name__ == "__main__":
         )
 
         # Choose offloading strategy
-        if args.offload_strategy == "component":
-            # Hybrid component offloading: Sliding window with FFN prefetch overlap
-            # Uses same memory as layer-level but achieves compute-transfer overlap
-            logger.info("Setting up hybrid component offloading (sliding window + FFN prefetch)...")
+        # Both "layer" and "component" strategies use the unified enable_component_offloading
+        # - "layer": Slide entire layers through a window (standard AIO-style)
+        # - "component": Pin ALL attention on GPU, slide only FFN (fine-grained)
+        strategy_desc = {
+            "layer": "Slide entire layers (standard AIO)",
+            "component": "Pin attention on GPU, slide FFN only (fine-grained)",
+        }
+        logger.info(f"Setting up offloading: {strategy_desc.get(args.offload_strategy, args.offload_strategy)}")
 
-            # Show memory analysis
-            savings = estimate_memory_savings(pipe)
-            logger.info(f"Memory analysis:")
-            logger.info(f"  Full model: {savings['full_model_gb']:.2f}GB")
-            logger.info(f"  Attention: {savings['attention_total_gb']:.2f}GB")
-            logger.info(f"  FFN: {savings['ffn_total_gb']:.2f}GB")
-            logger.info(f"  Norm: {savings['norm_total_gb']:.2f}GB")
-            logger.info(f"  Per layer: {savings['avg_layer_gb']*1024:.1f}MB")
+        # Show memory analysis
+        savings = estimate_memory_savings(pipe)
+        logger.info(f"Memory analysis:")
+        logger.info(f"  Full model: {savings['full_model_gb']:.2f}GB")
+        logger.info(f"  Attention: {savings['attention_total_gb']:.2f}GB")
+        logger.info(f"  FFN: {savings['ffn_total_gb']:.2f}GB")
+        logger.info(f"  Norm: {savings['norm_total_gb']:.2f}GB")
+        logger.info(f"  Per layer: {savings['avg_layer_gb']*1024:.1f}MB")
 
-            # Determine layers on GPU: None for auto, or user-specified value
-            if args.offload_auto or args.offload_num_layers is None:
-                ffn_layers = None  # Auto-detect based on GPU memory and resolution
-                logger.info("Using ADAPTIVE offloading (auto-detect layers based on GPU memory)")
-            else:
-                ffn_layers = args.offload_num_layers
-                logger.info(f"  Window ({ffn_layers} layers): {ffn_layers * savings['avg_layer_gb']:.2f}GB")
-
-            offload_manager, offload_hooks = enable_component_offloading(
-                pipe,
-                ffn_layers_on_gpu=ffn_layers,
-                use_pinned_memory=args.offload_pinned_memory,
-                enable_prefetch=args.offload_prefetch,
-                ffn_prefetch_count=2,
-                verbose=args.offload_verbose,
-                # Pass video resolution for adaptive mode activation estimation
-                video_height=args.height,
-                video_width=args.width,
-                num_frames=args.num_frames,
-            )
+        # Determine layers on GPU: None for auto, or user-specified value
+        if args.offload_auto or args.offload_num_layers is None:
+            ffn_layers = None  # Auto-detect based on GPU memory and resolution
+            logger.info("Using ADAPTIVE offloading (auto-detect layers based on GPU memory)")
         else:
-            # Standard layer-level offloading (text encoders already on CPU)
-            logger.info("Setting up transformer layer offloading...")
-            offload_manager, offload_hooks = enable_offloading(
-                pipe,
-                use_pinned_memory=args.offload_pinned_memory,
-                enable_prefetch=args.offload_prefetch,
-                num_layers_on_gpu=args.offload_num_layers,
-                max_memory_gb=args.offload_max_memory_gb,
-                verbose=args.offload_verbose,
-            )
+            ffn_layers = args.offload_num_layers
+            logger.info(f"  Window ({ffn_layers} layers): {ffn_layers * savings['avg_layer_gb']:.2f}GB")
+
+        offload_manager, offload_hooks = enable_component_offloading(
+            pipe,
+            ffn_layers_on_gpu=ffn_layers,
+            use_pinned_memory=args.offload_pinned_memory,
+            enable_prefetch=args.offload_prefetch,
+            ffn_prefetch_count=2,
+            verbose=args.offload_verbose,
+            # Pass video resolution for adaptive mode activation estimation
+            video_height=args.height,
+            video_width=args.width,
+            num_frames=args.num_frames,
+            # Strategy: "layer" (slide whole layers) or "component" (pin attention, slide FFN)
+            offload_strategy=args.offload_strategy,
+        )
 
     #########################################################
     # Replace the attention

@@ -65,11 +65,20 @@ class HybridOffloadConfig:
     # Memory settings
     use_pinned_memory: bool = True
 
+    # Offloading strategy
+    # - "layer": Move entire layers as blocks (current default)
+    # - "component": Pin attention on GPU, slide only FFN (fine-grained)
+    offload_strategy: str = "layer"
+
     # Sliding window size (number of FULL layers on GPU)
     # Each layer = attention + norm + FFN
     # For 24GB GPU: 6-8 layers typical
     # Set to -1 or "auto" for adaptive mode
     num_layers_on_gpu: int = 6
+
+    # For "component" strategy: number of FFN layers in sliding window
+    # Attention stays on GPU for all layers, only FFN slides
+    num_ffn_on_gpu: int = 10
 
     # Adaptive offloading settings
     # When True, automatically calculate optimal layers based on GPU memory
@@ -275,9 +284,14 @@ class HybridOffloadManager:
         self._layer_memory: Dict[int, LayerMemoryInfo] = {}
         self._analyze_layer_memory()
 
-        # Track what's on GPU
+        # Track what's on GPU (layer-level)
         self._layer_on_gpu: Dict[int, bool] = {i: False for i in range(self.num_layers)}
         self._layers_on_gpu_set: Set[int] = set()
+
+        # Track component-level GPU placement (for "component" strategy)
+        self._attention_on_gpu: Dict[int, bool] = {i: False for i in range(self.num_layers)}
+        self._ffn_on_gpu: Dict[int, bool] = {i: False for i in range(self.num_layers)}
+        self._ffn_on_gpu_set: Set[int] = set()
 
         # For component-level prefetch within a layer
         self._ffn_prefetch_in_progress: Dict[int, bool] = {}
@@ -417,23 +431,37 @@ class HybridOffloadManager:
 
         This sets up CUDA streams, tracking for layers, and pinned memory.
         Layers should already be on CPU (moved by enable_component_offloading).
+
+        For "component" strategy:
+        - Pins all attention+norm modules on GPU permanently
+        - Only FFN modules remain on CPU for sliding window
         """
         if self._initialized:
             return
 
+        strategy = self.config.offload_strategy
+        is_component = strategy == "component"
+
         logger.info("=" * 70)
         logger.info("[HYBRID-OFFLOAD] Initializing Hybrid Component Offloading")
         logger.info("=" * 70)
-        logger.info(f"[HYBRID-OFFLOAD] Strategy: Sliding window with FFN prefetch overlap")
-        logger.info(f"[HYBRID-OFFLOAD] Total layers: {self.num_layers}")
-        logger.info(f"[HYBRID-OFFLOAD] Window size: {self.config.num_layers_on_gpu} layers")
+        if is_component:
+            logger.info(f"[HYBRID-OFFLOAD] Strategy: COMPONENT (Pin Attention, Slide FFN)")
+            logger.info(f"[HYBRID-OFFLOAD] Total layers: {self.num_layers}")
+            logger.info(f"[HYBRID-OFFLOAD] Attention: ALL {self.num_layers} pinned on GPU")
+            logger.info(f"[HYBRID-OFFLOAD] FFN window: {self.config.num_ffn_on_gpu} layers")
+        else:
+            logger.info(f"[HYBRID-OFFLOAD] Strategy: LAYER (Slide entire layers)")
+            logger.info(f"[HYBRID-OFFLOAD] Total layers: {self.num_layers}")
+            logger.info(f"[HYBRID-OFFLOAD] Window size: {self.config.num_layers_on_gpu} layers")
         logger.info(f"[HYBRID-OFFLOAD] Component prefetch: {self.config.enable_component_prefetch}")
         logger.info("=" * 70)
 
         # Create CUDA streams
         if self.config.enable_prefetch:
             self._prefetch_stream = torch.cuda.Stream()
-        if self.config.enable_component_prefetch:
+        # Always create FFN stream for component strategy
+        if self.config.enable_component_prefetch or is_component:
             self._ffn_stream = torch.cuda.Stream()
 
         # Check layer locations and set up tracking
@@ -449,13 +477,30 @@ class HybridOffloadManager:
                 if is_on_cpu and self.config.use_pinned_memory:
                     self._ensure_pinned_memory(idx)
 
+        # For component strategy: Pin all attention+norm on GPU now
+        if is_component:
+            logger.info("[COMPONENT-OFFLOAD] Pinning all attention+norm modules on GPU...")
+            attention_mb_total = 0.0
+            for idx in range(self.num_layers):
+                self._move_attention_to_gpu(idx, non_blocking=False)
+                info = self._layer_memory.get(idx)
+                if info:
+                    attention_mb_total += info.attention_mb + info.norm_mb
+            logger.info(f"[COMPONENT-OFFLOAD] Pinned {self.num_layers} attention modules "
+                       f"({attention_mb_total:.1f}MB = {attention_mb_total/1024:.2f}GB)")
+
         torch.cuda.empty_cache()
         gc.collect()
 
         self._initialized = True
 
-        num_on_cpu = sum(1 for v in self._layer_on_gpu.values() if not v)
-        logger.info(f"[HYBRID-OFFLOAD] {num_on_cpu}/{self.num_layers} layers on CPU with pinned memory")
+        if is_component:
+            attn_on_gpu = sum(1 for v in self._attention_on_gpu.values() if v)
+            logger.info(f"[COMPONENT-OFFLOAD] {attn_on_gpu}/{self.num_layers} attention modules pinned on GPU")
+            logger.info(f"[COMPONENT-OFFLOAD] FFN will slide through window of {self.config.num_ffn_on_gpu}")
+        else:
+            num_on_cpu = sum(1 for v in self._layer_on_gpu.values() if not v)
+            logger.info(f"[HYBRID-OFFLOAD] {num_on_cpu}/{self.num_layers} layers on CPU with pinned memory")
 
     def _move_layer_to_cpu(self, layer_idx: int, use_pinned: bool = True):
         """Move entire layer to CPU."""
@@ -489,7 +534,7 @@ class HybridOffloadManager:
         self.stats['layer_loads'] += 1
 
     def _move_attention_to_gpu(self, layer_idx: int, non_blocking: bool = False):
-        """Move only attention and norm components to GPU (for component-level prefetch)."""
+        """Move only attention and norm components to GPU (for component-level strategy)."""
         block = self._get_block(layer_idx)
         is_double = self._is_double_block(layer_idx)
 
@@ -501,6 +546,24 @@ class HybridOffloadManager:
                 comp = getattr(block, name)
                 if comp is not None:
                     comp.to(self.config.compute_device, non_blocking=non_blocking)
+
+        self._attention_on_gpu[layer_idx] = True
+
+    def _move_attention_to_cpu(self, layer_idx: int):
+        """Move only attention and norm components to CPU."""
+        block = self._get_block(layer_idx)
+        is_double = self._is_double_block(layer_idx)
+
+        attn_comps = DOUBLE_BLOCK_ATTENTION_COMPONENTS if is_double else SINGLE_BLOCK_ATTENTION_COMPONENTS
+        norm_comps = DOUBLE_BLOCK_NORM_COMPONENTS if is_double else SINGLE_BLOCK_NORM_COMPONENTS
+
+        for name in attn_comps + norm_comps:
+            if hasattr(block, name):
+                comp = getattr(block, name)
+                if comp is not None:
+                    comp.to('cpu')
+
+        self._attention_on_gpu[layer_idx] = False
 
     def _move_ffn_to_gpu(self, layer_idx: int, non_blocking: bool = False):
         """Move only FFN components to GPU."""
@@ -514,6 +577,27 @@ class HybridOffloadManager:
                 comp = getattr(block, name)
                 if comp is not None:
                     comp.to(self.config.compute_device, non_blocking=non_blocking)
+
+        self._ffn_on_gpu[layer_idx] = True
+        self._ffn_on_gpu_set.add(layer_idx)
+        self.stats['layer_loads'] += 1
+
+    def _move_ffn_to_cpu(self, layer_idx: int):
+        """Move only FFN components to CPU."""
+        block = self._get_block(layer_idx)
+        is_double = self._is_double_block(layer_idx)
+
+        ffn_comps = DOUBLE_BLOCK_FFN_COMPONENTS if is_double else SINGLE_BLOCK_MLP_COMPONENTS
+
+        for name in ffn_comps:
+            if hasattr(block, name):
+                comp = getattr(block, name)
+                if comp is not None:
+                    comp.to('cpu')
+
+        self._ffn_on_gpu[layer_idx] = False
+        self._ffn_on_gpu_set.discard(layer_idx)
+        self.stats['layer_offloads'] += 1
 
     def _start_layer_prefetch(self, layer_idx: int):
         """Start async prefetch of entire layer."""
@@ -590,18 +674,47 @@ class HybridOffloadManager:
             if self.config.verbose:
                 logger.debug(f"Evicted layer {idx} (window: [{window_start}, {window_end}])")
 
+    def _evict_ffn_outside_window(self, current_layer: int):
+        """
+        Evict only FFN components outside the sliding window.
+
+        This is used in "component" strategy where attention stays pinned
+        on GPU and only FFN layers slide through a window.
+        """
+        window_size = self.config.num_ffn_on_gpu
+        window_start = max(0, current_layer - window_size + 1)
+        window_end = current_layer
+
+        ffn_to_evict = []
+        for idx in list(self._ffn_on_gpu_set):
+            if idx < window_start or idx > window_end:
+                ffn_to_evict.append(idx)
+
+        for idx in ffn_to_evict:
+            self._move_ffn_to_cpu(idx)
+
+            if self.config.verbose:
+                logger.debug(f"Evicted FFN {idx} (window: [{window_start}, {window_end}])")
+
     @time_logging_decorator("Level 3 - Ensure layer ready (hybrid)")
     def ensure_layer_on_gpu(self, layer_idx: int):
         """
         Ensure layer is on GPU.
 
-        For now, we load the ENTIRE layer at once (like standard AIO).
-        The component-level optimization (attention first, FFN prefetch)
-        can be enabled later once the basic flow is stable.
+        Supports two strategies:
+        - "layer": Load entire layers as blocks (standard AIO-style)
+        - "component": Pin attention on GPU, slide only FFN through window
         """
         if not self._initialized:
             self.prepare_for_inference()
 
+        if self.config.offload_strategy == "component":
+            self._ensure_layer_on_gpu_component(layer_idx)
+        else:
+            self._ensure_layer_on_gpu_layer(layer_idx)
+
+    def _ensure_layer_on_gpu_layer(self, layer_idx: int):
+        """Layer-level offloading: Load entire layers as blocks."""
         # Check if already on GPU
         if self._layer_on_gpu.get(layer_idx, False):
             if self._layer_prefetch_in_progress.get(layer_idx, False):
@@ -640,6 +753,55 @@ class HybridOffloadManager:
         if self._log_counter == 1 or self._log_counter % 100 == 0:
             on_gpu = len(self._layers_on_gpu_set)
             logger.info(f"[HYBRID-OFFLOAD] Layer {layer_idx} ready | GPU: {on_gpu} layers")
+
+    def _ensure_layer_on_gpu_component(self, layer_idx: int):
+        """
+        Component-level offloading: Pin attention on GPU, slide FFN.
+
+        Strategy:
+        - All attention+norm modules stay on GPU permanently
+        - Only FFN modules slide through a window
+        - This reduces transfer overhead since attention is smaller (~30% of layer)
+        - FFN is larger (~60%) but has less reuse within a timestep
+        """
+        # Attention should already be on GPU (pinned during initialization)
+        # Just verify it's there
+        if not self._attention_on_gpu.get(layer_idx, False):
+            # Shouldn't happen if prepare_for_inference was called correctly
+            self._move_attention_to_gpu(layer_idx, non_blocking=False)
+
+        # Handle FFN: Check if it's on GPU or needs to be loaded
+        if not self._ffn_on_gpu.get(layer_idx, False):
+            # Check if FFN prefetch is in progress
+            if self._ffn_prefetch_in_progress.get(layer_idx, False):
+                self._wait_for_ffn_prefetch(layer_idx)
+            else:
+                # Load FFN synchronously
+                self._move_ffn_to_gpu(layer_idx, non_blocking=False)
+
+        # Safety net: Ensure all params are on GPU
+        block = self._get_block(layer_idx)
+        target_device = self.config.compute_device
+        for param in block.parameters():
+            if param.device.type != 'cuda':
+                param.data = param.data.to(target_device)
+
+        # Evict FFN layers outside the window (attention stays)
+        self._evict_ffn_outside_window(layer_idx)
+
+        # Start prefetching FFN for next layers
+        for i in range(1, self.config.prefetch_count + 1):
+            next_idx = layer_idx + i
+            if next_idx < self.num_layers and not self._ffn_on_gpu.get(next_idx, False):
+                self._start_ffn_prefetch(next_idx)
+
+        # Periodic logging
+        self._log_counter += 1
+        if self._log_counter == 1 or self._log_counter % 100 == 0:
+            ffn_on_gpu = len(self._ffn_on_gpu_set)
+            attn_on_gpu = sum(1 for v in self._attention_on_gpu.values() if v)
+            logger.info(f"[COMPONENT-OFFLOAD] Layer {layer_idx} ready | "
+                       f"Attention: {attn_on_gpu} pinned, FFN: {ffn_on_gpu} in window")
 
     @time_logging_decorator("Level 3 - Ensure FFN ready (hybrid)")
     def ensure_ffn_ready(self, layer_idx: int):
@@ -694,15 +856,25 @@ class HybridOffloadManager:
     def print_statistics(self):
         """Print offloading statistics."""
         stats = self.get_statistics()
+        is_component = self.config.offload_strategy == "component"
+
         print("\n" + "=" * 70)
         print("COMPONENT OFFLOADING PERFORMANCE REPORT")
         print("=" * 70)
         mode_str = "Adaptive (auto-calculated)" if self.config.adaptive_mode else "Fixed (user-specified)"
-        print(f"Strategy: Sliding window with async prefetch ({mode_str})")
+        if is_component:
+            print(f"Strategy: COMPONENT - Pin Attention, Slide FFN ({mode_str})")
+        else:
+            print(f"Strategy: LAYER - Sliding window ({mode_str})")
         print("-" * 70)
         print("CONFIGURATION:")
         print(f"  Total layers:            {stats['num_layers']}")
-        print(f"  Layers on GPU:           {self.config.num_layers_on_gpu}")
+        if is_component:
+            attn_on_gpu = sum(1 for v in self._attention_on_gpu.values() if v)
+            print(f"  Attention pinned:        {attn_on_gpu}/{stats['num_layers']} (ALL)")
+            print(f"  FFN window size:         {self.config.num_ffn_on_gpu}")
+        else:
+            print(f"  Layers on GPU:           {self.config.num_layers_on_gpu}")
         print(f"  Pinned memory:           {self.config.use_pinned_memory}")
         if self.config.adaptive_mode:
             print(f"  Video resolution:        {self.config.video_height}x{self.config.video_width}")
@@ -714,24 +886,46 @@ class HybridOffloadManager:
             # Estimate baseline (all layers on GPU)
             per_layer_mb = sum(info.total_mb for info in self._layer_memory.values()) / max(len(self._layer_memory), 1)
             baseline_layers_gb = (per_layer_mb * stats['num_layers']) / 1024
-            savings = baseline_layers_gb - (per_layer_mb * self.config.num_layers_on_gpu / 1024)
-            if savings > 0:
-                print(f"  Estimated savings:       ~{savings:.1f} GB (keeping {self.config.num_layers_on_gpu}/{stats['num_layers']} layers)")
-                pct_reduction = (savings / baseline_layers_gb) * 100
-                print(f"  Memory reduction:        {pct_reduction:.0f}%")
+            if is_component:
+                # For component: all attention + window of FFN
+                attn_per_layer = sum(info.attention_mb + info.norm_mb for info in self._layer_memory.values()) / max(len(self._layer_memory), 1)
+                ffn_per_layer = sum(info.ffn_mb for info in self._layer_memory.values()) / max(len(self._layer_memory), 1)
+                on_gpu_gb = (attn_per_layer * stats['num_layers'] + ffn_per_layer * self.config.num_ffn_on_gpu) / 1024
+                savings = baseline_layers_gb - on_gpu_gb
+                if savings > 0:
+                    print(f"  Estimated savings:       ~{savings:.1f} GB")
+                    print(f"    (All attention pinned, FFN window={self.config.num_ffn_on_gpu})")
+                    pct_reduction = (savings / baseline_layers_gb) * 100
+                    print(f"  Memory reduction:        {pct_reduction:.0f}%")
+            else:
+                savings = baseline_layers_gb - (per_layer_mb * self.config.num_layers_on_gpu / 1024)
+                if savings > 0:
+                    print(f"  Estimated savings:       ~{savings:.1f} GB (keeping {self.config.num_layers_on_gpu}/{stats['num_layers']} layers)")
+                    pct_reduction = (savings / baseline_layers_gb) * 100
+                    print(f"  Memory reduction:        {pct_reduction:.0f}%")
         else:
             print(f"  Peak GPU Memory:         Not tracked (call start_tracking() before inference)")
         print("-" * 70)
         print("TRANSFER STATS:")
-        print(f"  Layer loads (CPU→GPU):   {stats['layer_loads']}")
-        print(f"  Layer offloads (GPU→CPU):{stats['layer_offloads']}")
+        if is_component:
+            print(f"  FFN loads (CPU→GPU):     {stats['layer_loads']}")
+            print(f"  FFN offloads (GPU→CPU):  {stats['layer_offloads']}")
+            print(f"  (Attention stays on GPU)")
+        else:
+            print(f"  Layer loads (CPU→GPU):   {stats['layer_loads']}")
+            print(f"  Layer offloads (GPU→CPU):{stats['layer_offloads']}")
         if stats['inference_time_seconds']:
             print("-" * 70)
             print("TIMING:")
             print(f"  Inference time:          {stats['inference_time_seconds']:.1f}s")
         print("=" * 70)
         print("KEY BENEFITS:")
-        print(f"  ✓ Memory: Only {self.config.num_layers_on_gpu}/{stats['num_layers']} layers on GPU at a time")
+        if is_component:
+            print(f"  ✓ Attention: ALL {stats['num_layers']} modules pinned (fast reuse)")
+            print(f"  ✓ FFN: Sliding window of {self.config.num_ffn_on_gpu} layers")
+            print(f"  ✓ Reduced transfers: Only FFN moves, not attention")
+        else:
+            print(f"  ✓ Memory: Only {self.config.num_layers_on_gpu}/{stats['num_layers']} layers on GPU at a time")
         print(f"  ✓ Enables 24GB GPUs for 720p+ video generation")
         print("=" * 70 + "\n")
 
@@ -816,14 +1010,25 @@ def enable_component_offloading(
     video_height: int = 720,
     video_width: int = 1280,
     num_frames: int = 129,
+    # Strategy: "layer" or "component"
+    offload_strategy: str = "layer",
+    num_ffn_on_gpu: Optional[int] = None,  # For "component" strategy
 ) -> Tuple[HybridOffloadManager, Dict]:
     """
     Enable hybrid component offloading for a HunyuanVideo pipeline.
 
-    This uses a sliding window approach similar to standard AIO:
-    1. Keep N layers on GPU at a time (sliding window)
-    2. Prefetch next layers while current layer computes
-    3. Use pinned memory for faster CPU->GPU transfers
+    Supports two offloading strategies:
+
+    1. "layer" strategy (default):
+       - Keep N entire layers on GPU at a time (sliding window)
+       - Prefetch next layers while current layer computes
+       - Use pinned memory for faster CPU->GPU transfers
+
+    2. "component" strategy (fine-grained):
+       - Pin ALL attention+norm modules on GPU permanently
+       - Only slide FFN modules through a window
+       - Reduces transfer overhead since attention is smaller (~30% of layer)
+       - Better for scenarios where attention is frequently accessed
 
     Adaptive Mode:
     When ffn_layers_on_gpu is None, automatically calculates optimal layers
@@ -832,7 +1037,7 @@ def enable_component_offloading(
 
     Args:
         pipe: HunyuanVideoPipeline
-        ffn_layers_on_gpu: Number of layers on GPU. None = auto-detect
+        ffn_layers_on_gpu: Number of layers on GPU (for "layer" strategy). None = auto-detect
         use_pinned_memory: Use pinned CPU memory for faster transfers
         enable_prefetch: Enable async layer prefetching
         ffn_prefetch_count: Number of layers to prefetch ahead
@@ -841,6 +1046,8 @@ def enable_component_offloading(
         video_height: Video height (for adaptive mode activation estimation)
         video_width: Video width (for adaptive mode activation estimation)
         num_frames: Number of frames (for adaptive mode activation estimation)
+        offload_strategy: "layer" (slide whole layers) or "component" (pin attention, slide FFN)
+        num_ffn_on_gpu: FFN window size for "component" strategy. None = auto-calculate
 
     Returns:
         Tuple of (HybridOffloadManager, hooks_dict)
@@ -858,16 +1065,16 @@ def enable_component_offloading(
     # Determine number of layers on GPU
     adaptive_mode = ffn_layers_on_gpu is None
 
+    # Get GPU memory for adaptive calculations
+    if torch.cuda.is_available():
+        total_gpu_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+    else:
+        total_gpu_gb = 24.0  # Default assumption
+
+    # Estimate activation reserve based on resolution
+    activation_reserve = estimate_activation_reserve(video_height, video_width, num_frames)
+
     if adaptive_mode:
-        # Get GPU memory
-        if torch.cuda.is_available():
-            total_gpu_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
-        else:
-            total_gpu_gb = 24.0  # Default assumption
-
-        # Estimate activation reserve based on resolution
-        activation_reserve = estimate_activation_reserve(video_height, video_width, num_frames)
-
         # Calculate optimal layers
         ffn_layers_on_gpu = calculate_optimal_layers_on_gpu(
             total_gpu_memory_gb=total_gpu_gb,
@@ -875,13 +1082,42 @@ def enable_component_offloading(
             num_layers=num_layers,
             activation_reserve_gb=activation_reserve,
         )
-
         logger.info(f"[ADAPTIVE] Auto-selected {ffn_layers_on_gpu} layers on GPU")
     else:
         logger.info(f"[FIXED] Using {ffn_layers_on_gpu} layers on GPU (user specified)")
 
+    # For component strategy, calculate FFN window size if not specified
+    # Attention uses ~30% of layer, so we can fit more FFN in the same space
+    if offload_strategy == "component":
+        if num_ffn_on_gpu is None:
+            # Calculate attention memory (all attention modules pinned)
+            attention_per_layer_gb = model_weights_gb * 0.35 / num_layers  # ~35% for attention+norm
+            all_attention_gb = attention_per_layer_gb * num_layers
+
+            # Remaining space for FFN
+            available_for_ffn = total_gpu_gb - activation_reserve - all_attention_gb - MEMORY_SAFETY_BUFFER_GB_ADAPTIVE
+
+            # FFN per layer
+            ffn_per_layer_gb = model_weights_gb * 0.65 / num_layers  # ~65% for FFN
+
+            if available_for_ffn > 0:
+                num_ffn_on_gpu = int(available_for_ffn / ffn_per_layer_gb)
+                num_ffn_on_gpu = max(1, min(num_ffn_on_gpu, num_layers))
+            else:
+                # Not enough memory for component strategy, fall back to fewer FFN
+                num_ffn_on_gpu = max(1, ffn_layers_on_gpu)
+
+            logger.info(f"[COMPONENT] All attention pinned: ~{all_attention_gb:.2f}GB")
+            logger.info(f"[COMPONENT] FFN window size: {num_ffn_on_gpu} layers")
+        else:
+            logger.info(f"[COMPONENT] Using {num_ffn_on_gpu} FFN layers (user specified)")
+    else:
+        num_ffn_on_gpu = ffn_layers_on_gpu  # Not used in layer strategy
+
     config = HybridOffloadConfig(
         num_layers_on_gpu=ffn_layers_on_gpu,
+        num_ffn_on_gpu=num_ffn_on_gpu,
+        offload_strategy=offload_strategy,
         use_pinned_memory=use_pinned_memory,
         enable_prefetch=enable_prefetch,
         prefetch_count=ffn_prefetch_count,

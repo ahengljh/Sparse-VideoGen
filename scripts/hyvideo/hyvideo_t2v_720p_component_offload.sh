@@ -2,10 +2,19 @@
 #
 # Example script demonstrating hybrid component-level offloading with SAP_CTCA
 #
-# Strategy: Sliding Window with Cross-Timestep Cluster Amortization (CTCA)
-# - Uses sliding window of full layers (like standard AIO)
-# - SAP_CTCA reuses cluster assignments across timesteps for efficiency
-# - Adaptive offloading: auto-calculates layers based on GPU memory & resolution
+# Supports two offloading strategies:
+#
+# 1. "layer" strategy (default):
+#    - Slide entire layers through a window
+#    - Standard AIO-style offloading
+#
+# 2. "component" strategy (fine-grained):
+#    - Pin ALL attention+norm modules on GPU permanently (~35% of each layer)
+#    - Only slide FFN modules through a window (~65% of each layer)
+#    - Reduces transfer overhead since attention is smaller
+#    - Better for scenarios with frequent attention reuse
+#
+# Combined with SAP_CTCA for sparse attention.
 #
 # This is especially useful for GPUs with limited VRAM (e.g., RTX 4090 24GB)
 # where we want to maximize GPU utilization while staying within memory limits.
@@ -21,6 +30,11 @@ RESOLUTION="${RESOLUTION:-720p}"
 NUM_FRAMES="${NUM_FRAMES:-129}"
 SEED="${SEED:-42}"
 
+# Offloading strategy:
+# - "layer": Slide entire layers (standard AIO-style)
+# - "component": Pin attention on GPU, slide only FFN (fine-grained)
+OFFLOAD_STRATEGY="${OFFLOAD_STRATEGY:-component}"
+
 # Offloading mode:
 # - Set OFFLOAD_AUTO=1 for adaptive mode (auto-detect based on GPU memory)
 # - Set FFN_LAYERS_ON_GPU to a number for fixed mode
@@ -35,6 +49,12 @@ echo ""
 echo "Model: $MODEL_ID"
 echo "Resolution: $RESOLUTION"
 echo "Frames: $NUM_FRAMES"
+echo "Offload Strategy: $OFFLOAD_STRATEGY"
+if [ "$OFFLOAD_STRATEGY" = "component" ]; then
+    echo "  → Pin ALL attention on GPU, slide FFN only"
+else
+    echo "  → Slide entire layers"
+fi
 if [ "$OFFLOAD_AUTO" = "1" ]; then
     echo "Offload Mode: ADAPTIVE (auto-detect layers)"
 else
@@ -44,7 +64,7 @@ echo "Output: $OUTPUT_FILE"
 echo "=============================================="
 
 # Build offload arguments
-OFFLOAD_ARGS="--enable_offload --offload_strategy component --offload_pinned_memory --offload_prefetch"
+OFFLOAD_ARGS="--enable_offload --offload_strategy $OFFLOAD_STRATEGY --offload_pinned_memory --offload_prefetch"
 if [ "$OFFLOAD_AUTO" = "1" ]; then
     OFFLOAD_ARGS="$OFFLOAD_ARGS --offload_auto"
 elif [ -n "$FFN_LAYERS_ON_GPU" ]; then
