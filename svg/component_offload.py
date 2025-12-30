@@ -67,32 +67,20 @@ class HybridOffloadConfig:
 
     # Offloading strategy
     # - "layer": Move entire layers as blocks (standard AIO-style)
-    # - "stream": StreamBlock pipelining with anchor layers
-    #
-    # Key Innovation: Anchor Layers (Cross-Timestep Persistence)
-    # ┌─────────────────────────────────────────────────────────────────┐
-    # │ Problem: At end of timestep T, GPU has layers [54-59]          │
-    # │          At start of T+1, we need layers [0-5]                 │
-    # │          → Complete cache miss! Same weights loaded 50 times   │
-    # │                                                                 │
-    # │ Solution: "Anchor" first N layers - NEVER offload them         │
-    # │          - Zero cold-start between timesteps                   │
-    # │          - Reduces total transfers by N × num_timesteps        │
-    # │          - First layers ready immediately each timestep        │
-    # └─────────────────────────────────────────────────────────────────┘
-    offload_strategy: str = "stream"
+    # - "stream": StreamBlock pipelining - overlap compute with transfer
+    #             While computing attention, prefetch FFN
+    #             While computing FFN, prefetch next layer's attention
+    #             Achieves near-zero GPU idle time
+    offload_strategy: str = "layer"
 
-    # Sliding window size (number of layers for sliding window)
+    # Sliding window size (number of FULL layers on GPU)
+    # Each layer = attention + norm + FFN
     # For 24GB GPU: 6-8 layers typical
+    # Set to -1 or "auto" for adaptive mode
     num_layers_on_gpu: int = 6
 
-    # Anchor layers: First N layers that NEVER get offloaded
-    # These persist across all timesteps, eliminating cold-start
-    # Set to 0 to disable anchor layers
-    # Recommended: 3-4 for 24GB GPU (saves ~600-800MB but avoids 150-200 loads)
-    num_anchor_layers: int = 3
-
     # For "stream" strategy: how many layers ahead to prefetch
+    # Higher = more memory used but better overlap
     stream_prefetch_depth: int = 2
 
     # Adaptive offloading settings
@@ -320,10 +308,6 @@ class HybridOffloadManager:
         self._layer_prefetch_in_progress: Dict[int, bool] = {}
         self._layer_prefetch_events: Dict[int, torch.cuda.Event] = {}
 
-        # Anchor layers: First N layers that persist across timesteps
-        # These are NEVER offloaded, reducing total transfers
-        self._anchor_layers: Set[int] = set(range(min(config.num_anchor_layers, self.num_layers)))
-
         # Statistics
         self.stats = {
             'layer_loads': 0,
@@ -332,12 +316,7 @@ class HybridOffloadManager:
             'prefetch_misses': 0,
             'ffn_prefetch_overlaps': 0,
             'cache_clears': 0,
-            'anchor_layer_hits': 0,  # Times we used an anchor layer without loading
         }
-
-        # Cross-timestep tracking
-        self._current_timestep = 0
-        self._timestep_layer_loads = 0  # Loads in current timestep
 
         # Memory tracking
         self._peak_memory_gb = 0.0
@@ -453,51 +432,43 @@ class HybridOffloadManager:
         """
         Prepare the model for offloaded inference.
 
-        This sets up CUDA streams, tracking for layers, pinned memory,
-        and pins anchor layers on GPU for cross-timestep persistence.
+        This sets up CUDA streams, tracking for layers, and pinned memory.
+        Layers should already be on CPU (moved by enable_component_offloading).
 
-        Anchor Layer Strategy:
-        - First N layers are "anchored" - they stay on GPU permanently
-        - Eliminates cold-start latency between timesteps
-        - Reduces total transfers by N × num_timesteps
+        For "component" strategy:
+        - Pins all attention+norm modules on GPU permanently
+        - Only FFN modules remain on CPU for sliding window
         """
         if self._initialized:
             return
 
         strategy = self.config.offload_strategy
         is_stream = strategy == "stream"
-        num_anchors = len(self._anchor_layers)
 
         logger.info("=" * 70)
         logger.info("[OFFLOAD] Initializing Offload Manager")
         logger.info("=" * 70)
         if is_stream:
-            logger.info(f"[OFFLOAD] Strategy: STREAM (Anchor + Pipelining)")
+            logger.info(f"[OFFLOAD] Strategy: STREAM (Component-aware pipelining)")
             logger.info(f"[OFFLOAD] Total layers: {self.num_layers}")
-            logger.info(f"[OFFLOAD] Anchor layers: {num_anchors} (persist across timesteps)")
-            logger.info(f"[OFFLOAD] Sliding window: {self.config.num_layers_on_gpu} layers")
+            logger.info(f"[OFFLOAD] Window size: {self.config.num_layers_on_gpu} layers")
             logger.info(f"[OFFLOAD] Prefetch depth: {self.config.stream_prefetch_depth}")
+            logger.info(f"[OFFLOAD] Key innovation: Overlap attention compute with FFN transfer")
         else:
-            logger.info(f"[OFFLOAD] Strategy: LAYER (Anchor + Sliding window)")
+            logger.info(f"[OFFLOAD] Strategy: LAYER (Slide entire layers)")
             logger.info(f"[OFFLOAD] Total layers: {self.num_layers}")
-            logger.info(f"[OFFLOAD] Anchor layers: {num_anchors} (persist across timesteps)")
-            logger.info(f"[OFFLOAD] Sliding window: {self.config.num_layers_on_gpu} layers")
-
-        if num_anchors > 0:
-            logger.info("-" * 70)
-            logger.info("[ANCHOR] Cross-Timestep Persistence Optimization:")
-            logger.info(f"[ANCHOR] Layers 0-{num_anchors-1} will NEVER be offloaded")
-            logger.info(f"[ANCHOR] Benefit: Zero cold-start between timesteps")
-            logger.info(f"[ANCHOR] Saved transfers: {num_anchors} × num_timesteps loads avoided")
+            logger.info(f"[OFFLOAD] Window size: {self.config.num_layers_on_gpu} layers")
         logger.info("=" * 70)
 
         # Create CUDA streams
+        # For stream strategy, we need separate streams for attention and FFN prefetch
         if self.config.enable_prefetch or is_stream:
             self._prefetch_stream = torch.cuda.Stream()
         if is_stream:
             self._ffn_stream = torch.cuda.Stream()
 
         # Check layer locations and set up tracking
+        # Layers should already be on CPU from enable_component_offloading
         for idx in range(self.num_layers):
             block = self._get_block(idx)
             first_param = next(block.parameters(), None)
@@ -506,22 +477,8 @@ class HybridOffloadManager:
                 self._layer_on_gpu[idx] = not is_on_cpu
 
                 # If on CPU and we want pinned memory, convert to pinned
-                # (except for anchor layers which will be moved to GPU)
-                if is_on_cpu and self.config.use_pinned_memory and idx not in self._anchor_layers:
+                if is_on_cpu and self.config.use_pinned_memory:
                     self._ensure_pinned_memory(idx)
-
-        # Pin anchor layers on GPU - these persist across all timesteps
-        if num_anchors > 0:
-            logger.info(f"[ANCHOR] Pinning {num_anchors} anchor layers on GPU...")
-            anchor_mb_total = 0.0
-            for idx in sorted(self._anchor_layers):
-                if not self._layer_on_gpu[idx]:
-                    self._move_layer_to_gpu(idx, non_blocking=False)
-                info = self._layer_memory.get(idx)
-                if info:
-                    anchor_mb_total += info.total_mb
-                self._layers_on_gpu_set.add(idx)
-            logger.info(f"[ANCHOR] Pinned layers 0-{num_anchors-1}: {anchor_mb_total:.1f}MB ({anchor_mb_total/1024:.2f}GB)")
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -690,16 +647,13 @@ class HybridOffloadManager:
             self.stats['ffn_prefetch_overlaps'] += 1
 
     def _evict_layers_outside_window(self, current_layer: int):
-        """Evict layers outside the sliding window (but NEVER anchor layers)."""
+        """Evict layers outside the sliding window."""
         window_size = self.config.num_layers_on_gpu
         window_start = max(0, current_layer - window_size + 1)
         window_end = current_layer
 
         layers_to_evict = []
         for idx in list(self._layers_on_gpu_set):
-            # NEVER evict anchor layers - they persist across timesteps
-            if idx in self._anchor_layers:
-                continue
             if idx < window_start or idx > window_end:
                 layers_to_evict.append(idx)
 
@@ -713,24 +667,25 @@ class HybridOffloadManager:
     def _evict_components_outside_window(self, current_layer: int):
         """
         Evict components outside the sliding window for stream strategy.
-        NEVER evicts anchor layers - they persist across timesteps.
+
+        In stream strategy, we keep a small window of complete layers
+        plus partially loaded next layers (attention prefetched while
+        previous layer's FFN computes).
         """
+        # For stream strategy, use same window as layer strategy
+        # but with smarter prefetching
         window_size = self.config.num_layers_on_gpu
         window_start = max(0, current_layer - window_size + 1)
         window_end = current_layer + self.config.stream_prefetch_depth
 
-        # Evict attention outside window (but never for anchor layers)
+        # Evict attention outside window
         for idx in list(self._attention_on_gpu.keys()):
-            if idx in self._anchor_layers:
-                continue  # Never evict anchor layers
             if self._attention_on_gpu[idx] and (idx < window_start or idx > window_end):
                 self._move_attention_to_cpu(idx)
 
-        # Evict FFN outside window (but never for anchor layers)
+        # Evict FFN outside window
         ffn_to_evict = []
         for idx in list(self._ffn_on_gpu_set):
-            if idx in self._anchor_layers:
-                continue  # Never evict anchor layers
             if idx < window_start or idx > window_end:
                 ffn_to_evict.append(idx)
 
@@ -760,18 +715,6 @@ class HybridOffloadManager:
 
     def _ensure_layer_on_gpu_layer(self, layer_idx: int):
         """Layer-level offloading: Load entire layers as blocks."""
-        # Anchor layers are already on GPU and never evicted
-        if layer_idx in self._anchor_layers:
-            self.stats['anchor_layer_hits'] += 1
-            self._layers_on_gpu_set.add(layer_idx)
-            # Still need to evict other layers and prefetch
-            self._evict_layers_outside_window(layer_idx)
-            for i in range(1, self.config.prefetch_count + 1):
-                next_idx = layer_idx + i
-                if next_idx < self.num_layers and next_idx not in self._anchor_layers:
-                    self._start_layer_prefetch(next_idx)
-            return
-
         # Check if already on GPU
         if self._layer_on_gpu.get(layer_idx, False):
             if self._layer_prefetch_in_progress.get(layer_idx, False):
@@ -815,34 +758,28 @@ class HybridOffloadManager:
         """
         StreamBlock pipelining: Component-aware prefetching for compute-transfer overlap.
 
-        Combined with Anchor Layer strategy:
-        - Anchor layers (first N) are already on GPU, no loading needed
-        - Non-anchor layers use component-aware pipelining
+        Key Innovation:
+        Instead of loading entire layers, we load components separately:
+        1. Attention+Norm (smaller, ~35% of layer) - loaded first
+        2. FFN (larger, ~65% of layer) - prefetched during attention compute
 
         Pipeline visualization:
         ┌─────────────────────────────────────────────────────────────────────┐
-        │ Anchor Layers 0-2: Always on GPU (zero transfer after init)        │
-        ├─────────────────────────────────────────────────────────────────────┤
         │ Layer N-1:  [Attn Compute]────[FFN Compute]                         │
         │                    ↓              ↓                                  │
         │             Prefetch FFN_N   Prefetch Attn_{N+1}                    │
         │                    ↓              ↓                                  │
         │ Layer N:        [Wait]────[Attn Compute]────[FFN Compute]           │
+        │                                  ↓              ↓                    │
+        │                           Prefetch FFN_N   Prefetch Attn_{N+1}      │
         └─────────────────────────────────────────────────────────────────────┘
-        """
-        # Anchor layers are already on GPU - instant hit
-        if layer_idx in self._anchor_layers:
-            self.stats['anchor_layer_hits'] += 1
-            # Still need to prefetch next non-anchor layers
-            self._evict_components_outside_window(layer_idx)
-            for i in range(1, self.config.stream_prefetch_depth + 1):
-                next_idx = layer_idx + i
-                if next_idx < self.num_layers and next_idx not in self._anchor_layers:
-                    if not self._attention_on_gpu.get(next_idx, False):
-                        if not self._layer_prefetch_in_progress.get(next_idx, False):
-                            self._start_attention_prefetch(next_idx)
-            return
 
+        Benefits:
+        - Smaller transfer units = better overlap with computation
+        - Attention loaded first (needed first in forward pass)
+        - FFN prefetched while attention computes
+        - Near-zero GPU idle time for memory transfers
+        """
         # Step 1: Ensure attention+norm is on GPU
         if not self._attention_on_gpu.get(layer_idx, False):
             # Check if attention prefetch was started by previous layer
@@ -862,10 +799,11 @@ class HybridOffloadManager:
             if not self._ffn_prefetch_in_progress.get(layer_idx, False):
                 self._start_ffn_prefetch(layer_idx)
 
-        # Step 3: Start async prefetch of NEXT layer's attention (skip anchor layers)
+        # Step 3: Start async prefetch of NEXT layer's attention
+        # This will be ready by the time we finish this layer
         for i in range(1, self.config.stream_prefetch_depth + 1):
             next_idx = layer_idx + i
-            if next_idx < self.num_layers and next_idx not in self._anchor_layers:
+            if next_idx < self.num_layers:
                 if not self._attention_on_gpu.get(next_idx, False):
                     if not self._layer_prefetch_in_progress.get(next_idx, False):
                         self._start_attention_prefetch(next_idx)
@@ -970,21 +908,19 @@ class HybridOffloadManager:
         """Print offloading statistics."""
         stats = self.get_statistics()
         is_stream = self.config.offload_strategy == "stream"
-        num_anchors = len(self._anchor_layers)
 
         print("\n" + "=" * 70)
         print("OFFLOADING PERFORMANCE REPORT")
         print("=" * 70)
         mode_str = "Adaptive (auto-calculated)" if self.config.adaptive_mode else "Fixed (user-specified)"
         if is_stream:
-            print(f"Strategy: STREAM - Anchor + Pipelining ({mode_str})")
+            print(f"Strategy: STREAM - Component-aware pipelining ({mode_str})")
         else:
-            print(f"Strategy: LAYER - Anchor + Sliding window ({mode_str})")
+            print(f"Strategy: LAYER - Sliding window ({mode_str})")
         print("-" * 70)
         print("CONFIGURATION:")
         print(f"  Total layers:            {stats['num_layers']}")
-        print(f"  Anchor layers:           {num_anchors} (persist across timesteps)")
-        print(f"  Sliding window:          {self.config.num_layers_on_gpu} layers")
+        print(f"  Window size:             {self.config.num_layers_on_gpu} layers")
         if is_stream:
             print(f"  Prefetch depth:          {self.config.stream_prefetch_depth}")
         print(f"  Pinned memory:           {self.config.use_pinned_memory}")
@@ -998,11 +934,9 @@ class HybridOffloadManager:
             # Estimate baseline (all layers on GPU)
             per_layer_mb = sum(info.total_mb for info in self._layer_memory.values()) / max(len(self._layer_memory), 1)
             baseline_layers_gb = (per_layer_mb * stats['num_layers']) / 1024
-            # Effective layers on GPU = anchor + window
-            effective_on_gpu = num_anchors + self.config.num_layers_on_gpu
-            savings = baseline_layers_gb - (per_layer_mb * min(effective_on_gpu, stats['num_layers']) / 1024)
+            savings = baseline_layers_gb - (per_layer_mb * self.config.num_layers_on_gpu / 1024)
             if savings > 0:
-                print(f"  Estimated savings:       ~{savings:.1f} GB")
+                print(f"  Estimated savings:       ~{savings:.1f} GB (keeping {self.config.num_layers_on_gpu}/{stats['num_layers']} layers)")
                 pct_reduction = (savings / baseline_layers_gb) * 100
                 print(f"  Memory reduction:        {pct_reduction:.0f}%")
         else:
@@ -1011,7 +945,6 @@ class HybridOffloadManager:
         print("TRANSFER STATS:")
         print(f"  Component loads:         {stats['layer_loads']}")
         print(f"  Component offloads:      {stats['layer_offloads']}")
-        print(f"  Anchor layer hits:       {stats['anchor_layer_hits']} (zero-cost access)")
         print(f"  Prefetch hits:           {stats['prefetch_hits']}")
         print(f"  Prefetch misses:         {stats['prefetch_misses']}")
         if is_stream:
@@ -1020,16 +953,6 @@ class HybridOffloadManager:
             print("-" * 70)
             print("TIMING:")
             print(f"  Inference time:          {stats['inference_time_seconds']:.1f}s")
-        print("=" * 70)
-        print("CROSS-TIMESTEP OPTIMIZATION (Anchor Layers):")
-        if num_anchors > 0:
-            # Estimate saved loads: anchor_hits are times we didn't need to load
-            saved_loads = stats['anchor_layer_hits']
-            print(f"  Anchor layer hits:       {saved_loads}")
-            print(f"  Saved loads:             {saved_loads} × ~{per_layer_mb:.0f}MB = ~{saved_loads * per_layer_mb / 1024:.2f}GB")
-            print(f"  Benefit:                 Zero cold-start between timesteps")
-        else:
-            print(f"  (Anchor layers disabled)")
         print("=" * 70)
         print("KEY BENEFITS:")
         print(f"  ✓ Memory: Only {self.config.num_layers_on_gpu}/{stats['num_layers']} layers on GPU at a time")
@@ -1114,7 +1037,7 @@ def enable_component_offloading(
     use_pinned_memory: bool = True,
     enable_prefetch: bool = True,
     ffn_prefetch_count: int = 2,
-    enable_component_prefetch: bool = False,  # Deprecated
+    enable_component_prefetch: bool = False,  # Disabled for now - causes device issues
     verbose: bool = False,
     # Adaptive mode parameters
     video_height: int = 720,
@@ -1122,55 +1045,52 @@ def enable_component_offloading(
     num_frames: int = 129,
     # Strategy: "layer" or "stream"
     offload_strategy: str = "stream",
-    stream_prefetch_depth: int = 2,
-    # Anchor layers: persist across timesteps for cross-timestep reuse
-    num_anchor_layers: int = 3,
+    stream_prefetch_depth: int = 2,  # For "stream" strategy
 ) -> Tuple[HybridOffloadManager, Dict]:
     """
     Enable hybrid component offloading for a HunyuanVideo pipeline.
 
-    Key Innovation: Anchor Layers + StreamBlock Pipelining
+    Supports two offloading strategies:
 
-    1. Anchor Layers (Cross-Timestep Persistence):
-       ┌─────────────────────────────────────────────────────────────────┐
-       │ Problem: At end of timestep T, GPU has layers [54-59]          │
-       │          At start of T+1, we need layers [0-5]                 │
-       │          → Complete cache miss! Same weights loaded 50 times   │
-       │                                                                 │
-       │ Solution: "Anchor" first N layers - NEVER offload them         │
-       │          - Zero cold-start between timesteps                   │
-       │          - Reduces total transfers by N × num_timesteps        │
-       └─────────────────────────────────────────────────────────────────┘
+    1. "layer" strategy:
+       - Keep N entire layers on GPU at a time (sliding window)
+       - Prefetch next layers while current layer computes
+       - Use pinned memory for faster CPU->GPU transfers
+       - Simple but can have GPU idle time during transfers
 
-    2. "stream" strategy (recommended):
+    2. "stream" strategy (default, recommended):
        - StreamBlock pipelining with component-aware prefetching
        - While computing attention, prefetch FFN for same layer
        - While computing FFN, prefetch attention for next layer
+       - Achieves near-zero GPU idle time through compute-transfer overlap
 
-    3. "layer" strategy:
-       - Keep N entire layers on GPU at a time (sliding window)
-       - Simpler but may have GPU idle time during transfers
+       Key Innovation (StreamBlock Pipelining):
+       ┌─────────────────────────────────────────────────────────────────┐
+       │ Layer N:  [Attn Compute]─────[FFN Compute]                      │
+       │                 ↓                  ↓                            │
+       │          Prefetch FFN_N    Prefetch Attn_{N+1}                  │
+       │                 ↓                  ↓                            │
+       │ Layer N+1:   [Wait]─────[Attn Compute]─────[FFN Compute]        │
+       └─────────────────────────────────────────────────────────────────┘
 
-    Memory Layout:
-    ┌─────────────────────────────────────────────────────────────────┐
-    │  ANCHOR LAYERS (0 to N-1)    │  SLIDING WINDOW (N to 59)       │
-    │  Never offloaded             │  Prefetch + evict as before     │
-    │  ~650MB (3 layers)           │  ~1.3GB (6 layers)              │
-    └─────────────────────────────────────────────────────────────────┘
+    Adaptive Mode:
+    When ffn_layers_on_gpu is None, automatically calculates optimal layers
+    based on GPU memory and video resolution. This reserves space for
+    activations first, then uses remaining memory for model weights.
 
     Args:
         pipe: HunyuanVideoPipeline
-        ffn_layers_on_gpu: Sliding window size. None = auto-detect
+        ffn_layers_on_gpu: Number of layers on GPU. None = auto-detect
         use_pinned_memory: Use pinned CPU memory for faster transfers
         enable_prefetch: Enable async layer prefetching
         ffn_prefetch_count: Number of layers to prefetch ahead
+        enable_component_prefetch: (Deprecated) Use stream strategy instead
         verbose: Enable verbose logging
-        video_height: Video height (for adaptive mode)
-        video_width: Video width (for adaptive mode)
-        num_frames: Number of frames (for adaptive mode)
+        video_height: Video height (for adaptive mode activation estimation)
+        video_width: Video width (for adaptive mode activation estimation)
+        num_frames: Number of frames (for adaptive mode activation estimation)
         offload_strategy: "layer" or "stream" (recommended)
-        stream_prefetch_depth: Prefetch depth for stream strategy
-        num_anchor_layers: Layers to persist across timesteps (0 to disable)
+        stream_prefetch_depth: How many layers ahead to prefetch for stream strategy
 
     Returns:
         Tuple of (HybridOffloadManager, hooks_dict)
@@ -1212,19 +1132,12 @@ def enable_component_offloading(
     # Log strategy info
     if offload_strategy == "stream":
         logger.info(f"[STREAM] Using StreamBlock pipelining with prefetch depth {stream_prefetch_depth}")
+        logger.info(f"[STREAM] Key innovation: Overlap attention compute with FFN transfer")
     else:
         logger.info(f"[LAYER] Using standard layer-level sliding window")
 
-    # Log anchor layer info
-    if num_anchor_layers > 0:
-        logger.info(f"[ANCHOR] {num_anchor_layers} layers will persist across timesteps")
-        logger.info(f"[ANCHOR] Benefit: Zero cold-start, reduced transfers by {num_anchor_layers} × num_timesteps")
-    else:
-        logger.info(f"[ANCHOR] Disabled (all layers use sliding window)")
-
     config = HybridOffloadConfig(
         num_layers_on_gpu=ffn_layers_on_gpu,
-        num_anchor_layers=num_anchor_layers,
         offload_strategy=offload_strategy,
         stream_prefetch_depth=stream_prefetch_depth,
         use_pinned_memory=use_pinned_memory,
