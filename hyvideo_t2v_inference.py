@@ -104,30 +104,49 @@ if __name__ == "__main__":
     #########################################################
     import gc
 
-    # Load transformer (loads to CPU by default from from_pretrained)
+    # For offload mode: Load all models to CPU to avoid OOM during initialization
+    # Full model (~22GB) exceeds 24GB VRAM, so we MUST load to CPU first
     if args.enable_offload:
-        logger.info("Loading model for offload mode...")
-    transformer = HunyuanVideoTransformer3DModel.from_pretrained(
-        args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16, revision='refs/pr/18'
-    )
+        logger.info("Loading model for offload mode (forcing CPU placement)...")
+        # Clear any existing GPU allocations first
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Load transformer to CPU explicitly
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(
+            args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16,
+            revision='refs/pr/18', low_cpu_mem_usage=True
+        )
+        # Ensure transformer is on CPU before loading pipeline
+        transformer.to('cpu')
+        logger.info(f"Transformer on CPU. GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+    else:
+        transformer = HunyuanVideoTransformer3DModel.from_pretrained(
+            args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16, revision='refs/pr/18'
+        )
 
     flow_shift = 7.0
     scheduler = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
 
     # Load pipeline
-    pipe = HunyuanVideoPipeline.from_pretrained(
-        args.model_id, transformer=transformer, scheduler=scheduler,
-        revision='refs/pr/18', torch_dtype=torch.bfloat16
-    )
-
     if args.enable_offload:
-        # Immediately move everything to CPU to free GPU memory
-        # This is crucial for 24GB GPUs - diffusers may load to GPU during from_pretrained
-        logger.info("Moving all pipeline components to CPU to free GPU memory...")
+        # Load pipeline with low memory mode - keeps components on CPU
+        # This prevents OOM when text encoders (~9GB) + transformer (~13GB) are loaded
+        pipe = HunyuanVideoPipeline.from_pretrained(
+            args.model_id, transformer=transformer, scheduler=scheduler,
+            revision='refs/pr/18', torch_dtype=torch.bfloat16,
+            low_cpu_mem_usage=True
+        )
+        # Immediately move everything to CPU in case any component got to GPU
         pipe.to('cpu')
         gc.collect()
         torch.cuda.empty_cache()
-        logger.info(f"Pipeline on CPU. GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+        logger.info(f"Pipeline loaded to CPU. GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+    else:
+        pipe = HunyuanVideoPipeline.from_pretrained(
+            args.model_id, transformer=transformer, scheduler=scheduler,
+            revision='refs/pr/18', torch_dtype=torch.bfloat16
+        )
 
     pipe.vae.enable_tiling()
 
