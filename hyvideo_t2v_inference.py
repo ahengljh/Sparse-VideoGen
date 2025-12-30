@@ -76,8 +76,8 @@ if __name__ == "__main__":
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
-    parser.add_argument("--offload_strategy", type=str, default="layer", choices=["layer", "component"],
-                        help="Offloading strategy: 'layer' (full layer offload) or 'component' (pin attention, offload FFN).")
+    parser.add_argument("--offload_strategy", type=str, default="stream", choices=["layer", "stream"],
+                        help="Offloading strategy: 'layer' (full layer offload) or 'stream' (component-aware pipelining).")
     parser.add_argument("--offload_num_layers", type=int, default=None, help="Number of transformer layers to keep on GPU (sliding window size). None=auto-detect based on GPU memory and resolution.")
     parser.add_argument("--offload_auto", action="store_true", help="Enable adaptive offloading that auto-calculates optimal layers based on GPU memory and video resolution.")
     parser.add_argument("--offload_max_memory_gb", type=float, default=None, help="Auto-tune num_layers based on memory budget (e.g., 20.0 for 24GB GPU).")
@@ -201,12 +201,11 @@ if __name__ == "__main__":
         )
 
         # Choose offloading strategy
-        # Both "layer" and "component" strategies use the unified enable_component_offloading
         # - "layer": Slide entire layers through a window (standard AIO-style)
-        # - "component": Pin ALL attention on GPU, slide only FFN (fine-grained)
+        # - "stream": StreamBlock pipelining - overlap compute with transfer
         strategy_desc = {
             "layer": "Slide entire layers (standard AIO)",
-            "component": "Pin attention on GPU, slide FFN only (fine-grained)",
+            "stream": "StreamBlock pipelining (overlap compute with transfer)",
         }
         logger.info(f"Setting up offloading: {strategy_desc.get(args.offload_strategy, args.offload_strategy)}")
 
