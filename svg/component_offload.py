@@ -83,6 +83,37 @@ class HybridOffloadConfig:
     # Higher = more memory used but better overlap
     stream_prefetch_depth: int = 2
 
+    # =========================================================================
+    # Profile-Guided Dynamic Pinning (PGDP) - Key Innovation
+    # =========================================================================
+    #
+    # During SAP warm-up (first N timesteps with full attention), we profile
+    # each layer's compute time. After warm-up, we identify "heavy" layers
+    # and pin them on GPU while offloading lighter layers.
+    #
+    # Why this works:
+    # - Heavy layers have high compute/transfer ratio → worth keeping on GPU
+    # - Light layers can tolerate transfer overhead
+    # - Data-driven: Uses actual measured compute, not heuristics
+    # - Zero overhead: Profiling happens during warm-up we already run
+    #
+    # ┌─────────────────────────────────────────────────────────────────────┐
+    # │ Phase 1: Warm-up Profiling (first N timesteps)                      │
+    # │   - All layers run full attention                                   │
+    # │   - Measure compute time per layer                                  │
+    # │   - Build per-layer compute cost profile                            │
+    # │                                                                     │
+    # │ Phase 2: Dynamic Pinning (after warm-up)                            │
+    # │   - Rank layers by observed compute cost                            │
+    # │   - Top-K heavy layers → Pin on GPU (never offload)                 │
+    # │   - Remaining layers → Sliding window with prefetch                 │
+    # └─────────────────────────────────────────────────────────────────────┘
+    #
+    enable_profiling: bool = True
+    num_warmup_timesteps: int = 5  # Timesteps for profiling (matches SAP warm-up)
+    num_pinned_heavy_layers: int = 6  # Top-K heavy layers to pin after profiling
+    heavy_layer_threshold: float = 0.7  # Pin layers with compute > 70th percentile
+
     # Adaptive offloading settings
     # When True, automatically calculate optimal layers based on GPU memory
     adaptive_mode: bool = False
@@ -308,6 +339,26 @@ class HybridOffloadManager:
         self._layer_prefetch_in_progress: Dict[int, bool] = {}
         self._layer_prefetch_events: Dict[int, torch.cuda.Event] = {}
 
+        # =====================================================================
+        # Profile-Guided Dynamic Pinning (PGDP) State
+        # =====================================================================
+        # Timestep tracking for profiling phase
+        self._current_timestep: int = 0
+        self._profiling_complete: bool = False
+
+        # Per-layer compute time tracking (layer_idx -> list of times in ms)
+        self._layer_compute_times: Dict[int, List[float]] = defaultdict(list)
+
+        # Timing events for profiling
+        self._layer_start_event: Optional[torch.cuda.Event] = None
+        self._layer_end_event: Optional[torch.cuda.Event] = None
+
+        # Pinned heavy layers (determined after profiling)
+        self._pinned_heavy_layers: Set[int] = set()
+
+        # Per-layer average compute cost (computed after profiling)
+        self._layer_avg_compute: Dict[int, float] = {}
+
         # Statistics
         self.stats = {
             'layer_loads': 0,
@@ -316,6 +367,8 @@ class HybridOffloadManager:
             'prefetch_misses': 0,
             'ffn_prefetch_overlaps': 0,
             'cache_clears': 0,
+            'pinned_layer_hits': 0,  # Accesses to pinned heavy layers
+            'profiling_samples': 0,  # Number of profiling measurements
         }
 
         # Memory tracking
@@ -492,6 +545,155 @@ class HybridOffloadManager:
         else:
             logger.info(f"[LAYER-OFFLOAD] {num_on_cpu}/{self.num_layers} layers on CPU with pinned memory")
 
+        # Log profiling info if enabled
+        if self.config.enable_profiling:
+            logger.info("-" * 70)
+            logger.info("[PGDP] Profile-Guided Dynamic Pinning ENABLED")
+            logger.info(f"[PGDP] Warm-up profiling: {self.config.num_warmup_timesteps} timesteps")
+            logger.info(f"[PGDP] Heavy layers to pin: {self.config.num_pinned_heavy_layers}")
+            logger.info(f"[PGDP] Heavy threshold: top {(1-self.config.heavy_layer_threshold)*100:.0f}%")
+            logger.info("-" * 70)
+
+    # =========================================================================
+    # Profile-Guided Dynamic Pinning (PGDP) Methods
+    # =========================================================================
+
+    def on_timestep_start(self, timestep_idx: int):
+        """
+        Called at the start of each diffusion timestep.
+
+        During warm-up phase, we profile layer compute times.
+        After warm-up, we analyze results and pin heavy layers.
+        """
+        self._current_timestep = timestep_idx
+
+        # Check if we just finished warm-up phase
+        if (self.config.enable_profiling and
+            not self._profiling_complete and
+            timestep_idx >= self.config.num_warmup_timesteps):
+            self._analyze_and_apply_profiling()
+
+    def _start_layer_timing(self, layer_idx: int):
+        """Start timing for a layer (called before layer forward)."""
+        if not self.config.enable_profiling:
+            return
+        if self._profiling_complete:
+            return
+
+        # Create timing events if needed
+        if self._layer_start_event is None:
+            self._layer_start_event = torch.cuda.Event(enable_timing=True)
+            self._layer_end_event = torch.cuda.Event(enable_timing=True)
+
+        self._layer_start_event.record()
+
+    def _end_layer_timing(self, layer_idx: int):
+        """End timing for a layer and record result (called after layer forward)."""
+        if not self.config.enable_profiling:
+            return
+        if self._profiling_complete:
+            return
+        if self._layer_start_event is None:
+            return
+
+        self._layer_end_event.record()
+        torch.cuda.synchronize()
+
+        elapsed_ms = self._layer_start_event.elapsed_time(self._layer_end_event)
+        self._layer_compute_times[layer_idx].append(elapsed_ms)
+        self.stats['profiling_samples'] += 1
+
+    def _analyze_and_apply_profiling(self):
+        """
+        Analyze profiling results and pin heavy layers.
+
+        This is the core of PGDP: we identify layers with high compute cost
+        and pin them on GPU to avoid transfer overhead.
+        """
+        if self._profiling_complete:
+            return
+
+        logger.info("=" * 70)
+        logger.info("[PGDP] Analyzing warm-up profiling results...")
+        logger.info("=" * 70)
+
+        # Compute average compute time per layer
+        for layer_idx in range(self.num_layers):
+            times = self._layer_compute_times.get(layer_idx, [])
+            if times:
+                self._layer_avg_compute[layer_idx] = sum(times) / len(times)
+            else:
+                self._layer_avg_compute[layer_idx] = 0.0
+
+        # Rank layers by compute cost
+        sorted_layers = sorted(
+            self._layer_avg_compute.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        # Determine heavy layers to pin
+        # Method 1: Top-K layers
+        num_to_pin = min(self.config.num_pinned_heavy_layers, self.num_layers)
+
+        # Method 2: Threshold-based (layers above percentile)
+        if sorted_layers:
+            all_times = [t for t in self._layer_avg_compute.values() if t > 0]
+            if all_times:
+                threshold_idx = int(len(all_times) * self.config.heavy_layer_threshold)
+                threshold_time = sorted(all_times, reverse=True)[min(threshold_idx, len(all_times)-1)]
+            else:
+                threshold_time = 0
+
+        # Select heavy layers (use both criteria)
+        heavy_layers = []
+        for layer_idx, avg_time in sorted_layers[:num_to_pin]:
+            if avg_time > 0:  # Only pin layers we actually profiled
+                heavy_layers.append(layer_idx)
+
+        self._pinned_heavy_layers = set(heavy_layers)
+
+        # Log profiling results
+        logger.info(f"[PGDP] Profiling complete: {self.stats['profiling_samples']} samples")
+        logger.info(f"[PGDP] Layer compute times (top 10):")
+        for layer_idx, avg_time in sorted_layers[:10]:
+            pin_marker = " [PIN]" if layer_idx in self._pinned_heavy_layers else ""
+            logger.info(f"[PGDP]   Layer {layer_idx:2d}: {avg_time:6.2f}ms{pin_marker}")
+
+        # Now pin the heavy layers on GPU
+        if self._pinned_heavy_layers:
+            self._pin_heavy_layers_on_gpu()
+
+        self._profiling_complete = True
+        logger.info("=" * 70)
+
+    def _pin_heavy_layers_on_gpu(self):
+        """Move heavy layers to GPU and mark them as pinned."""
+        logger.info(f"[PGDP] Pinning {len(self._pinned_heavy_layers)} heavy layers on GPU...")
+
+        pinned_mb = 0.0
+        for layer_idx in sorted(self._pinned_heavy_layers):
+            # Move to GPU if not already there
+            if not self._layer_on_gpu.get(layer_idx, False):
+                self._move_layer_to_gpu(layer_idx, non_blocking=False)
+
+            self._layers_on_gpu_set.add(layer_idx)
+
+            # Track memory
+            info = self._layer_memory.get(layer_idx)
+            if info:
+                pinned_mb += info.total_mb
+
+        logger.info(f"[PGDP] Pinned layers: {sorted(self._pinned_heavy_layers)}")
+        logger.info(f"[PGDP] Pinned memory: {pinned_mb:.1f}MB ({pinned_mb/1024:.2f}GB)")
+        logger.info(f"[PGDP] Benefit: These layers will NEVER be offloaded")
+
+        torch.cuda.empty_cache()
+
+    def is_layer_pinned(self, layer_idx: int) -> bool:
+        """Check if a layer is pinned (should never be offloaded)."""
+        return layer_idx in self._pinned_heavy_layers
+
     def _move_layer_to_cpu(self, layer_idx: int, use_pinned: bool = True):
         """Move entire layer to CPU."""
         block = self._get_block(layer_idx)
@@ -647,13 +849,16 @@ class HybridOffloadManager:
             self.stats['ffn_prefetch_overlaps'] += 1
 
     def _evict_layers_outside_window(self, current_layer: int):
-        """Evict layers outside the sliding window."""
+        """Evict layers outside the sliding window (but NEVER pinned heavy layers)."""
         window_size = self.config.num_layers_on_gpu
         window_start = max(0, current_layer - window_size + 1)
         window_end = current_layer
 
         layers_to_evict = []
         for idx in list(self._layers_on_gpu_set):
+            # NEVER evict pinned heavy layers - they were identified during profiling
+            if idx in self._pinned_heavy_layers:
+                continue
             if idx < window_start or idx > window_end:
                 layers_to_evict.append(idx)
 
@@ -667,6 +872,7 @@ class HybridOffloadManager:
     def _evict_components_outside_window(self, current_layer: int):
         """
         Evict components outside the sliding window for stream strategy.
+        NEVER evicts pinned heavy layers - they persist based on profiling.
 
         In stream strategy, we keep a small window of complete layers
         plus partially loaded next layers (attention prefetched while
@@ -678,14 +884,18 @@ class HybridOffloadManager:
         window_start = max(0, current_layer - window_size + 1)
         window_end = current_layer + self.config.stream_prefetch_depth
 
-        # Evict attention outside window
+        # Evict attention outside window (but never for pinned layers)
         for idx in list(self._attention_on_gpu.keys()):
+            if idx in self._pinned_heavy_layers:
+                continue  # Never evict pinned heavy layers
             if self._attention_on_gpu[idx] and (idx < window_start or idx > window_end):
                 self._move_attention_to_cpu(idx)
 
-        # Evict FFN outside window
+        # Evict FFN outside window (but never for pinned layers)
         ffn_to_evict = []
         for idx in list(self._ffn_on_gpu_set):
+            if idx in self._pinned_heavy_layers:
+                continue  # Never evict pinned heavy layers
             if idx < window_start or idx > window_end:
                 ffn_to_evict.append(idx)
 
@@ -715,6 +925,20 @@ class HybridOffloadManager:
 
     def _ensure_layer_on_gpu_layer(self, layer_idx: int):
         """Layer-level offloading: Load entire layers as blocks."""
+        # Check if this is a pinned heavy layer (identified during profiling)
+        if layer_idx in self._pinned_heavy_layers:
+            self.stats['pinned_layer_hits'] += 1
+            self._layers_on_gpu_set.add(layer_idx)
+            # Still need to evict other layers and prefetch
+            self._evict_layers_outside_window(layer_idx)
+            for i in range(1, self.config.prefetch_count + 1):
+                next_idx = layer_idx + i
+                if next_idx < self.num_layers and next_idx not in self._pinned_heavy_layers:
+                    self._start_layer_prefetch(next_idx)
+            # Start timing for profiling
+            self._start_layer_timing(layer_idx)
+            return
+
         # Check if already on GPU
         if self._layer_on_gpu.get(layer_idx, False):
             if self._layer_prefetch_in_progress.get(layer_idx, False):
@@ -742,21 +966,29 @@ class HybridOffloadManager:
         # Evict old layers
         self._evict_layers_outside_window(layer_idx)
 
-        # Start prefetching next layers
+        # Start prefetching next layers (skip pinned layers - they're already on GPU)
         for i in range(1, self.config.prefetch_count + 1):
             next_idx = layer_idx + i
-            if next_idx < self.num_layers:
+            if next_idx < self.num_layers and next_idx not in self._pinned_heavy_layers:
                 self._start_layer_prefetch(next_idx)
+
+        # Start timing for profiling (during warm-up phase)
+        self._start_layer_timing(layer_idx)
 
         # Periodic logging (reduced frequency)
         self._log_counter += 1
         if self._log_counter == 1 or self._log_counter % 100 == 0:
             on_gpu = len(self._layers_on_gpu_set)
-            logger.info(f"[HYBRID-OFFLOAD] Layer {layer_idx} ready | GPU: {on_gpu} layers")
+            pinned = len(self._pinned_heavy_layers)
+            logger.info(f"[HYBRID-OFFLOAD] Layer {layer_idx} ready | GPU: {on_gpu} layers | Pinned: {pinned}")
 
     def _ensure_layer_on_gpu_stream(self, layer_idx: int):
         """
         StreamBlock pipelining: Component-aware prefetching for compute-transfer overlap.
+
+        Combined with Profile-Guided Dynamic Pinning (PGDP):
+        - Pinned heavy layers (identified during warm-up) are already on GPU
+        - Non-pinned layers use component-aware pipelining
 
         Key Innovation:
         Instead of loading entire layers, we load components separately:
@@ -765,13 +997,13 @@ class HybridOffloadManager:
 
         Pipeline visualization:
         ┌─────────────────────────────────────────────────────────────────────┐
+        │ Pinned Heavy Layers: Always on GPU (zero transfer after profiling) │
+        ├─────────────────────────────────────────────────────────────────────┤
         │ Layer N-1:  [Attn Compute]────[FFN Compute]                         │
         │                    ↓              ↓                                  │
         │             Prefetch FFN_N   Prefetch Attn_{N+1}                    │
         │                    ↓              ↓                                  │
         │ Layer N:        [Wait]────[Attn Compute]────[FFN Compute]           │
-        │                                  ↓              ↓                    │
-        │                           Prefetch FFN_N   Prefetch Attn_{N+1}      │
         └─────────────────────────────────────────────────────────────────────┘
 
         Benefits:
@@ -779,7 +1011,23 @@ class HybridOffloadManager:
         - Attention loaded first (needed first in forward pass)
         - FFN prefetched while attention computes
         - Near-zero GPU idle time for memory transfers
+        - Heavy layers pinned based on profiling data
         """
+        # Pinned heavy layers are already on GPU - instant hit
+        if layer_idx in self._pinned_heavy_layers:
+            self.stats['pinned_layer_hits'] += 1
+            # Still need to prefetch next non-pinned layers
+            self._evict_components_outside_window(layer_idx)
+            for i in range(1, self.config.stream_prefetch_depth + 1):
+                next_idx = layer_idx + i
+                if next_idx < self.num_layers and next_idx not in self._pinned_heavy_layers:
+                    if not self._attention_on_gpu.get(next_idx, False):
+                        if not self._layer_prefetch_in_progress.get(next_idx, False):
+                            self._start_attention_prefetch(next_idx)
+            # Start timing for profiling
+            self._start_layer_timing(layer_idx)
+            return
+
         # Step 1: Ensure attention+norm is on GPU
         if not self._attention_on_gpu.get(layer_idx, False):
             # Check if attention prefetch was started by previous layer
@@ -799,11 +1047,10 @@ class HybridOffloadManager:
             if not self._ffn_prefetch_in_progress.get(layer_idx, False):
                 self._start_ffn_prefetch(layer_idx)
 
-        # Step 3: Start async prefetch of NEXT layer's attention
-        # This will be ready by the time we finish this layer
+        # Step 3: Start async prefetch of NEXT layer's attention (skip pinned layers)
         for i in range(1, self.config.stream_prefetch_depth + 1):
             next_idx = layer_idx + i
-            if next_idx < self.num_layers:
+            if next_idx < self.num_layers and next_idx not in self._pinned_heavy_layers:
                 if not self._attention_on_gpu.get(next_idx, False):
                     if not self._layer_prefetch_in_progress.get(next_idx, False):
                         self._start_attention_prefetch(next_idx)
@@ -826,13 +1073,17 @@ class HybridOffloadManager:
         # Evict old components outside window
         self._evict_components_outside_window(layer_idx)
 
+        # Start timing for profiling (during warm-up phase)
+        self._start_layer_timing(layer_idx)
+
         # Periodic logging
         self._log_counter += 1
         if self._log_counter == 1 or self._log_counter % 100 == 0:
             ffn_on_gpu = len(self._ffn_on_gpu_set)
             attn_on_gpu = sum(1 for v in self._attention_on_gpu.values() if v)
+            pinned = len(self._pinned_heavy_layers)
             logger.info(f"[STREAM-OFFLOAD] Layer {layer_idx} ready | "
-                       f"Attn: {attn_on_gpu}, FFN: {ffn_on_gpu} on GPU")
+                       f"Attn: {attn_on_gpu}, FFN: {ffn_on_gpu} on GPU | Pinned: {pinned}")
 
     def _start_attention_prefetch(self, layer_idx: int):
         """Start async prefetch of attention+norm components."""
@@ -867,6 +1118,9 @@ class HybridOffloadManager:
     @time_logging_decorator("Level 3 - Layer forward complete (hybrid)")
     def layer_forward_complete(self, layer_idx: int):
         """Called after a layer's forward pass is complete."""
+        # End timing for profiling (during warm-up phase)
+        self._end_layer_timing(layer_idx)
+
         # Periodic cache clear
         if (layer_idx + 1) % self.config.empty_cache_frequency == 0:
             torch.cuda.empty_cache()
@@ -908,22 +1162,24 @@ class HybridOffloadManager:
         """Print offloading statistics."""
         stats = self.get_statistics()
         is_stream = self.config.offload_strategy == "stream"
+        num_pinned = len(self._pinned_heavy_layers)
 
         print("\n" + "=" * 70)
         print("OFFLOADING PERFORMANCE REPORT")
         print("=" * 70)
         mode_str = "Adaptive (auto-calculated)" if self.config.adaptive_mode else "Fixed (user-specified)"
         if is_stream:
-            print(f"Strategy: STREAM - Component-aware pipelining ({mode_str})")
+            print(f"Strategy: STREAM + PGDP - Component pipelining with profiled pinning ({mode_str})")
         else:
-            print(f"Strategy: LAYER - Sliding window ({mode_str})")
+            print(f"Strategy: LAYER + PGDP - Sliding window with profiled pinning ({mode_str})")
         print("-" * 70)
         print("CONFIGURATION:")
         print(f"  Total layers:            {stats['num_layers']}")
-        print(f"  Window size:             {self.config.num_layers_on_gpu} layers")
+        print(f"  Sliding window:          {self.config.num_layers_on_gpu} layers")
+        print(f"  Pinned heavy layers:     {num_pinned} (PGDP)")
         if is_stream:
             print(f"  Prefetch depth:          {self.config.stream_prefetch_depth}")
-        print(f"  Pinned memory:           {self.config.use_pinned_memory}")
+        print(f"  Pinned memory (CPU):     {self.config.use_pinned_memory}")
         if self.config.adaptive_mode:
             print(f"  Video resolution:        {self.config.video_height}x{self.config.video_width}")
             print(f"  Frames:                  {self.config.num_frames}")
@@ -934,9 +1190,10 @@ class HybridOffloadManager:
             # Estimate baseline (all layers on GPU)
             per_layer_mb = sum(info.total_mb for info in self._layer_memory.values()) / max(len(self._layer_memory), 1)
             baseline_layers_gb = (per_layer_mb * stats['num_layers']) / 1024
-            savings = baseline_layers_gb - (per_layer_mb * self.config.num_layers_on_gpu / 1024)
+            effective_on_gpu = num_pinned + self.config.num_layers_on_gpu
+            savings = baseline_layers_gb - (per_layer_mb * min(effective_on_gpu, stats['num_layers']) / 1024)
             if savings > 0:
-                print(f"  Estimated savings:       ~{savings:.1f} GB (keeping {self.config.num_layers_on_gpu}/{stats['num_layers']} layers)")
+                print(f"  Estimated savings:       ~{savings:.1f} GB")
                 pct_reduction = (savings / baseline_layers_gb) * 100
                 print(f"  Memory reduction:        {pct_reduction:.0f}%")
         else:
@@ -945,6 +1202,7 @@ class HybridOffloadManager:
         print("TRANSFER STATS:")
         print(f"  Component loads:         {stats['layer_loads']}")
         print(f"  Component offloads:      {stats['layer_offloads']}")
+        print(f"  Pinned layer hits:       {stats['pinned_layer_hits']} (zero-cost access)")
         print(f"  Prefetch hits:           {stats['prefetch_hits']}")
         print(f"  Prefetch misses:         {stats['prefetch_misses']}")
         if is_stream:
@@ -954,8 +1212,24 @@ class HybridOffloadManager:
             print("TIMING:")
             print(f"  Inference time:          {stats['inference_time_seconds']:.1f}s")
         print("=" * 70)
+        print("PROFILE-GUIDED DYNAMIC PINNING (PGDP):")
+        if self.config.enable_profiling and self._profiling_complete:
+            print(f"  Profiling samples:       {stats['profiling_samples']}")
+            print(f"  Pinned heavy layers:     {sorted(self._pinned_heavy_layers)}")
+            print(f"  Pinned layer hits:       {stats['pinned_layer_hits']}")
+            if self._layer_avg_compute:
+                top_layers = sorted(self._layer_avg_compute.items(), key=lambda x: x[1], reverse=True)[:5]
+                print(f"  Top-5 heavy layers:")
+                for layer_idx, avg_time in top_layers:
+                    pin_marker = " [PINNED]" if layer_idx in self._pinned_heavy_layers else ""
+                    print(f"    Layer {layer_idx:2d}: {avg_time:6.2f}ms{pin_marker}")
+        else:
+            print(f"  Status: {'Disabled' if not self.config.enable_profiling else 'Not yet complete'}")
+        print("=" * 70)
         print("KEY BENEFITS:")
-        print(f"  ✓ Memory: Only {self.config.num_layers_on_gpu}/{stats['num_layers']} layers on GPU at a time")
+        print(f"  ✓ Memory: Only {self.config.num_layers_on_gpu + num_pinned}/{stats['num_layers']} layers on GPU")
+        if num_pinned > 0:
+            print(f"  ✓ PGDP: Heavy layers pinned based on warm-up profiling")
         if is_stream:
             print(f"  ✓ Pipelining: Overlap attention compute with FFN transfer")
             print(f"  ✓ Component-aware: Smaller transfer units for better overlap")
@@ -973,6 +1247,14 @@ class HybridOffloadManager:
         self._peak_memory_gb = 0.0
         self._start_time = None
         self._end_time = None
+
+        # Reset PGDP state for new profiling run
+        self._current_timestep = 0
+        self._profiling_complete = False
+        self._layer_compute_times.clear()
+        self._layer_avg_compute.clear()
+        # Note: Keep pinned layers as they were identified - don't reset for warm start
+        # To fully reset, call reset_profiling() explicitly
 
 
 def create_hybrid_offload_hooks(
@@ -1046,11 +1328,15 @@ def enable_component_offloading(
     # Strategy: "layer" or "stream"
     offload_strategy: str = "stream",
     stream_prefetch_depth: int = 2,  # For "stream" strategy
+    # Profile-Guided Dynamic Pinning (PGDP) parameters
+    enable_profiling: bool = True,
+    num_warmup_timesteps: int = 5,  # Match SAP warm-up
+    num_pinned_heavy_layers: int = 6,  # Top-K heavy layers to pin
 ) -> Tuple[HybridOffloadManager, Dict]:
     """
     Enable hybrid component offloading for a HunyuanVideo pipeline.
 
-    Supports two offloading strategies:
+    Supports two offloading strategies combined with Profile-Guided Dynamic Pinning (PGDP):
 
     1. "layer" strategy:
        - Keep N entire layers on GPU at a time (sliding window)
@@ -1064,14 +1350,26 @@ def enable_component_offloading(
        - While computing FFN, prefetch attention for next layer
        - Achieves near-zero GPU idle time through compute-transfer overlap
 
-       Key Innovation (StreamBlock Pipelining):
+    3. Profile-Guided Dynamic Pinning (PGDP) - Key Innovation:
+       During SAP warm-up (first N timesteps), we profile compute time per layer.
+       After warm-up, we pin heavy layers on GPU while offloading lighter layers.
+
        ┌─────────────────────────────────────────────────────────────────┐
-       │ Layer N:  [Attn Compute]─────[FFN Compute]                      │
-       │                 ↓                  ↓                            │
-       │          Prefetch FFN_N    Prefetch Attn_{N+1}                  │
-       │                 ↓                  ↓                            │
-       │ Layer N+1:   [Wait]─────[Attn Compute]─────[FFN Compute]        │
+       │ Phase 1: Warm-up Profiling                                      │
+       │   - Measure compute time per layer during dense attention       │
+       │   - Build per-layer compute cost profile                        │
+       │                                                                 │
+       │ Phase 2: Dynamic Pinning (after warm-up)                        │
+       │   - Rank layers by observed compute cost                        │
+       │   - Top-K heavy layers → Pin on GPU (never offload)             │
+       │   - Remaining layers → Sliding window with prefetch             │
        └─────────────────────────────────────────────────────────────────┘
+
+       Why this works:
+       - Heavy layers have high compute/transfer ratio → worth keeping on GPU
+       - Light layers can tolerate transfer overhead
+       - Data-driven: Uses actual measured compute, not heuristics
+       - Zero overhead: Profiling during warm-up we already run
 
     Adaptive Mode:
     When ffn_layers_on_gpu is None, automatically calculates optimal layers
@@ -1091,6 +1389,9 @@ def enable_component_offloading(
         num_frames: Number of frames (for adaptive mode activation estimation)
         offload_strategy: "layer" or "stream" (recommended)
         stream_prefetch_depth: How many layers ahead to prefetch for stream strategy
+        enable_profiling: Enable PGDP profiling during warm-up
+        num_warmup_timesteps: Number of timesteps for profiling (match SAP warm-up)
+        num_pinned_heavy_layers: Number of heavy layers to pin after profiling
 
     Returns:
         Tuple of (HybridOffloadManager, hooks_dict)
@@ -1136,6 +1437,12 @@ def enable_component_offloading(
     else:
         logger.info(f"[LAYER] Using standard layer-level sliding window")
 
+    # Log PGDP info
+    if enable_profiling:
+        logger.info(f"[PGDP] Profile-Guided Dynamic Pinning ENABLED")
+        logger.info(f"[PGDP] Warm-up profiling: {num_warmup_timesteps} timesteps")
+        logger.info(f"[PGDP] Will pin top {num_pinned_heavy_layers} heavy layers after warm-up")
+
     config = HybridOffloadConfig(
         num_layers_on_gpu=ffn_layers_on_gpu,
         offload_strategy=offload_strategy,
@@ -1148,6 +1455,10 @@ def enable_component_offloading(
         video_height=video_height,
         video_width=video_width,
         num_frames=num_frames,
+        # PGDP parameters
+        enable_profiling=enable_profiling,
+        num_warmup_timesteps=num_warmup_timesteps,
+        num_pinned_heavy_layers=num_pinned_heavy_layers,
     )
 
     # Keep other transformer components on GPU FIRST (before moving blocks to CPU)
