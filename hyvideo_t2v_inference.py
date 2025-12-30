@@ -24,7 +24,7 @@ from svg.models.hyvideo.inference import (
 )
 from svg.models.hyvideo.utils import get_prompt_length
 from svg.offload import pre_encode_and_offload
-from svg.component_offload import enable_component_offloading, estimate_memory_savings
+from svg.component_offload import enable_component_offloading, estimate_memory_savings, create_pgdp_callback
 
 from svg.logger import logger
 
@@ -138,6 +138,7 @@ if __name__ == "__main__":
     #########################################################
     offload_manager = None
     offload_hooks = None
+    pgdp_callback = None  # PGDP callback for dynamic pinning during inference
     pre_encoded_embeds = None  # Will store pre-computed prompt embeddings if offloading
 
     if args.enable_offload:
@@ -237,9 +238,15 @@ if __name__ == "__main__":
             video_height=args.height,
             video_width=args.width,
             num_frames=args.num_frames,
-            # Strategy: "layer" (slide whole layers) or "component" (pin attention, slide FFN)
+            # Strategy: "layer" (slide whole layers) or "stream" (component pipelining)
             offload_strategy=args.offload_strategy,
         )
+
+        # Create PGDP callback for dynamic pinning during inference
+        # This integrates with diffusers' callback system to trigger
+        # profiling and re-pinning at each timestep
+        pgdp_callback = create_pgdp_callback(offload_manager)
+        logger.info("[PGDP] Created callback for dynamic pinning integration")
 
     #########################################################
     # Replace the attention
@@ -328,7 +335,9 @@ if __name__ == "__main__":
         # Use pre-computed embeddings (offload mode)
         # Note: Embedders will be moved to GPU by the forward pre-hook registered in enable_offloading
         logger.info("Using pre-computed prompt embeddings...")
-        output = pipe(
+
+        # Build pipe kwargs with optional PGDP callback
+        pipe_kwargs = dict(
             prompt_embeds=pre_encoded_embeds['prompt_embeds'].cuda(),
             pooled_prompt_embeds=pre_encoded_embeds['pooled_prompt_embeds'].cuda(),
             prompt_attention_mask=pre_encoded_embeds['prompt_attention_mask'].cuda(),
@@ -337,7 +346,15 @@ if __name__ == "__main__":
             num_frames=args.num_frames,
             guidance_scale=6.0,
             num_inference_steps=args.num_inference_steps,
-        ).frames[0]
+        )
+
+        # Add PGDP callback if offloading is enabled
+        if pgdp_callback is not None:
+            pipe_kwargs['callback_on_step_end'] = pgdp_callback
+            pipe_kwargs['callback_on_step_end_tensor_inputs'] = ["latents"]
+            logger.info("[PGDP] Enabled dynamic pinning callback for inference")
+
+        output = pipe(**pipe_kwargs).frames[0]
     else:
         # Standard mode - encode prompt on-the-fly
         output = pipe(

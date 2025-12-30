@@ -1668,6 +1668,58 @@ def get_offload_manager() -> Optional[HybridOffloadManager]:
     return _global_offload_manager
 
 
+def create_pgdp_callback(manager: HybridOffloadManager):
+    """
+    Create a callback function for integration with diffusers pipeline.
+
+    This callback should be passed to the pipeline's `callback_on_step_end` parameter.
+    It calls `on_timestep_start` at the beginning of each timestep to trigger
+    PGDP's dynamic profiling and re-pinning logic.
+
+    Usage:
+        offload_manager, hooks = enable_component_offloading(pipe, ...)
+        callback = create_pgdp_callback(offload_manager)
+        output = pipe(
+            ...,
+            callback_on_step_end=callback,
+            callback_on_step_end_tensor_inputs=["latents"],
+        )
+
+    Args:
+        manager: The HybridOffloadManager instance
+
+    Returns:
+        A callback function compatible with diffusers pipelines
+    """
+    # Track if we've called for the first timestep
+    _first_call_done = [False]
+
+    def pgdp_step_callback(pipeline, step_idx: int, timestep: torch.Tensor, callback_kwargs: Dict):
+        """
+        Callback invoked at the end of each denoising step.
+
+        We use this to trigger PGDP logic for the NEXT timestep.
+        For the first call (step 0), we also handle the initial timestep.
+        """
+        if not _first_call_done[0]:
+            # First call - trigger for timestep 0 (already done) and prepare for step 1
+            _first_call_done[0] = True
+            # The pipeline has already processed step 0, so we trigger for step 1
+            manager.on_timestep_start(step_idx + 1)
+        else:
+            # Subsequent calls - trigger for the next timestep
+            manager.on_timestep_start(step_idx + 1)
+
+        # Return the callback_kwargs unchanged (required by diffusers)
+        return callback_kwargs
+
+    # Also trigger for the first timestep before the loop starts
+    # This is done by calling on_timestep_start(0) when the manager is first used
+    manager.on_timestep_start(0)
+
+    return pgdp_step_callback
+
+
 def estimate_memory_savings(
     pipe,
 ) -> Dict[str, float]:
