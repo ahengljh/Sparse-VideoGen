@@ -112,14 +112,27 @@ if __name__ == "__main__":
         gc.collect()
         torch.cuda.empty_cache()
 
-        # Load transformer to CPU explicitly
+        # Check if GPU is already occupied by another process
+        if torch.cuda.is_available():
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            total_mem = torch.cuda.mem_get_info()[1] / 1024**3
+            used_by_others = total_mem - free_mem - torch.cuda.memory_allocated() / 1024**3
+            if used_by_others > 10:  # More than 10GB used by other processes
+                logger.warning(f"WARNING: GPU has {used_by_others:.1f}GB used by other processes!")
+                logger.warning("Run 'nvidia-smi' to check and kill other GPU processes if needed.")
+            logger.info(f"GPU status: {free_mem:.1f}GB free / {total_mem:.1f}GB total")
+
+        # Load transformer to CPU explicitly using device_map
+        # This prevents any GPU allocation during from_pretrained
         transformer = HunyuanVideoTransformer3DModel.from_pretrained(
             args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16,
-            revision='refs/pr/18', low_cpu_mem_usage=True
+            revision='refs/pr/18'
         )
-        # Ensure transformer is on CPU before loading pipeline
-        transformer.to('cpu')
-        logger.info(f"Transformer on CPU. GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+        # Immediately move to CPU (should already be there, but ensure it)
+        transformer = transformer.to('cpu')
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(f"Transformer loaded. GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
     else:
         transformer = HunyuanVideoTransformer3DModel.from_pretrained(
             args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16, revision='refs/pr/18'
@@ -130,18 +143,30 @@ if __name__ == "__main__":
 
     # Load pipeline
     if args.enable_offload:
-        # Load pipeline with low memory mode - keeps components on CPU
-        # This prevents OOM when text encoders (~9GB) + transformer (~13GB) are loaded
+        # Load pipeline - text encoders may go to GPU during from_pretrained
+        # We'll immediately move them to CPU after loading
         pipe = HunyuanVideoPipeline.from_pretrained(
             args.model_id, transformer=transformer, scheduler=scheduler,
-            revision='refs/pr/18', torch_dtype=torch.bfloat16,
-            low_cpu_mem_usage=True
+            revision='refs/pr/18', torch_dtype=torch.bfloat16
         )
-        # Immediately move everything to CPU in case any component got to GPU
-        pipe.to('cpu')
+        # CRITICAL: Move everything to CPU immediately to free GPU memory
+        # This must happen before any GPU operations
+        logger.info("Moving all pipeline components to CPU...")
+        pipe = pipe.to('cpu')
+
+        # Aggressive memory cleanup
         gc.collect()
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
         torch.cuda.empty_cache()
-        logger.info(f"Pipeline loaded to CPU. GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
+        gc.collect()
+
+        # Verify GPU is free
+        if torch.cuda.is_available():
+            gpu_mem = torch.cuda.memory_allocated() / 1024**3
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            logger.info(f"Pipeline on CPU. PyTorch GPU: {gpu_mem:.2f}GB, Free VRAM: {free_mem:.1f}GB")
+            if free_mem < 15:
+                logger.warning(f"Only {free_mem:.1f}GB free! Check for other processes using GPU.")
     else:
         pipe = HunyuanVideoPipeline.from_pretrained(
             args.model_id, transformer=transformer, scheduler=scheduler,
@@ -210,6 +235,17 @@ if __name__ == "__main__":
     # This must happen BEFORE replacing attention
     #########################################################
     if args.enable_offload:
+        # Check GPU memory before pre-encoding (text encoders need ~9GB)
+        if torch.cuda.is_available():
+            free_mem = torch.cuda.mem_get_info()[0] / 1024**3
+            required_mem = 10.0  # Text encoders need ~9GB, add buffer
+            if free_mem < required_mem:
+                logger.error(f"FATAL: Not enough GPU memory for text encoding!")
+                logger.error(f"  Required: ~{required_mem:.0f}GB, Available: {free_mem:.1f}GB")
+                logger.error(f"  Another process may be using the GPU. Run 'nvidia-smi' to check.")
+                logger.error(f"  Kill other GPU processes with: kill -9 <PID>")
+                raise RuntimeError(f"Insufficient GPU memory: {free_mem:.1f}GB free, need {required_mem:.0f}GB for text encoders")
+
         logger.info("Pre-encoding prompt (text encoders temporarily on GPU)...")
         # Pre-encode prompt - this moves text encoders to GPU, encodes, then offloads to CPU
         # Note: HunyuanVideoPipeline.encode_prompt doesn't support negative_prompt
