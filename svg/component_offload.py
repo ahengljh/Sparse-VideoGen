@@ -87,32 +87,37 @@ class HybridOffloadConfig:
     # Profile-Guided Dynamic Pinning (PGDP) - Key Innovation
     # =========================================================================
     #
-    # During SAP warm-up (first N timesteps with full attention), we profile
-    # each layer's compute time. After warm-up, we identify "heavy" layers
-    # and pin them on GPU while offloading lighter layers.
+    # PGDP uses runtime profiling to identify "heavy" layers and pin them on GPU.
+    # Unlike static approaches, PGDP continuously adapts as compute patterns change.
     #
     # Why this works:
     # - Heavy layers have high compute/transfer ratio → worth keeping on GPU
     # - Light layers can tolerate transfer overhead
     # - Data-driven: Uses actual measured compute, not heuristics
-    # - Zero overhead: Profiling happens during warm-up we already run
+    # - ADAPTIVE: Continuously updates as sparse attention changes layer costs
     #
     # ┌─────────────────────────────────────────────────────────────────────┐
-    # │ Phase 1: Warm-up Profiling (first N timesteps)                      │
+    # │ Phase 1: Initial Profiling (warm-up timesteps)                      │
     # │   - All layers run full attention                                   │
     # │   - Measure compute time per layer                                  │
-    # │   - Build per-layer compute cost profile                            │
+    # │   - Initial pinning based on observed heavy layers                  │
     # │                                                                     │
-    # │ Phase 2: Dynamic Pinning (after warm-up)                            │
-    # │   - Rank layers by observed compute cost                            │
-    # │   - Top-K heavy layers → Pin on GPU (never offload)                 │
-    # │   - Remaining layers → Sliding window with prefetch                 │
+    # │ Phase 2: Continuous Adaptation (after warm-up)                      │
+    # │   - Keep profiling all layers with EMA smoothing                    │
+    # │   - Periodically re-evaluate heavy layer set                        │
+    # │   - Dynamically adjust pinning: unpin light, pin new heavy          │
+    # │   - Adapt to sparse attention patterns that change layer costs      │
     # └─────────────────────────────────────────────────────────────────────┘
     #
     enable_profiling: bool = True
-    num_warmup_timesteps: int = 5  # Timesteps for profiling (matches SAP warm-up)
-    num_pinned_heavy_layers: int = 6  # Top-K heavy layers to pin after profiling
+    num_warmup_timesteps: int = 5  # Initial profiling before first pinning decision
+    num_pinned_heavy_layers: int = 6  # Top-K heavy layers to pin
     heavy_layer_threshold: float = 0.7  # Pin layers with compute > 70th percentile
+
+    # Dynamic pinning - continuously adapt based on runtime observations
+    dynamic_pinning: bool = True  # Enable continuous adaptation (vs static after warm-up)
+    repin_interval: int = 5  # Re-evaluate pinning every N timesteps
+    ema_alpha: float = 0.3  # EMA smoothing factor (higher = more weight on recent)
 
     # Adaptive offloading settings
     # When True, automatically calculate optimal layers based on GPU memory
@@ -342,22 +347,27 @@ class HybridOffloadManager:
         # =====================================================================
         # Profile-Guided Dynamic Pinning (PGDP) State
         # =====================================================================
-        # Timestep tracking for profiling phase
+        # Timestep tracking
         self._current_timestep: int = 0
-        self._profiling_complete: bool = False
+        self._last_repin_timestep: int = 0  # Last timestep when we re-evaluated pinning
+        self._initial_profiling_complete: bool = False  # Initial warm-up profiling done
 
-        # Per-layer compute time tracking (layer_idx -> list of times in ms)
+        # Per-layer compute time tracking
+        # For initial profiling: raw list of times
         self._layer_compute_times: Dict[int, List[float]] = defaultdict(list)
+        # For continuous profiling: EMA-smoothed compute time per layer
+        self._layer_ema_compute: Dict[int, float] = {}
 
         # Timing events for profiling
         self._layer_start_event: Optional[torch.cuda.Event] = None
         self._layer_end_event: Optional[torch.cuda.Event] = None
 
-        # Pinned heavy layers (determined after profiling)
+        # Pinned heavy layers (dynamically updated based on runtime profiling)
         self._pinned_heavy_layers: Set[int] = set()
 
-        # Per-layer average compute cost (computed after profiling)
-        self._layer_avg_compute: Dict[int, float] = {}
+        # Track pinning changes for statistics
+        self._total_repin_events: int = 0
+        self._layers_pinned_count: Dict[int, int] = defaultdict(int)  # How often each layer was pinned
 
         # Statistics
         self.stats = {
@@ -549,9 +559,13 @@ class HybridOffloadManager:
         if self.config.enable_profiling:
             logger.info("-" * 70)
             logger.info("[PGDP] Profile-Guided Dynamic Pinning ENABLED")
-            logger.info(f"[PGDP] Warm-up profiling: {self.config.num_warmup_timesteps} timesteps")
+            logger.info(f"[PGDP] Initial profiling: {self.config.num_warmup_timesteps} timesteps")
             logger.info(f"[PGDP] Heavy layers to pin: {self.config.num_pinned_heavy_layers}")
-            logger.info(f"[PGDP] Heavy threshold: top {(1-self.config.heavy_layer_threshold)*100:.0f}%")
+            if self.config.dynamic_pinning:
+                logger.info(f"[PGDP] Dynamic mode: Re-evaluate every {self.config.repin_interval} timesteps")
+                logger.info(f"[PGDP] EMA alpha: {self.config.ema_alpha} (smoothing factor)")
+            else:
+                logger.info(f"[PGDP] Static mode: Pinning fixed after warm-up")
             logger.info("-" * 70)
 
     # =========================================================================
@@ -562,22 +576,28 @@ class HybridOffloadManager:
         """
         Called at the start of each diffusion timestep.
 
-        During warm-up phase, we profile layer compute times.
-        After warm-up, we analyze results and pin heavy layers.
+        Handles both initial profiling and dynamic re-pinning:
+        1. After warm-up: Initial pinning based on profiled data
+        2. Every repin_interval: Re-evaluate and adjust pinning dynamically
         """
         self._current_timestep = timestep_idx
 
-        # Check if we just finished warm-up phase
-        if (self.config.enable_profiling and
-            not self._profiling_complete and
-            timestep_idx >= self.config.num_warmup_timesteps):
-            self._analyze_and_apply_profiling()
+        if not self.config.enable_profiling:
+            return
+
+        # Phase 1: Initial profiling complete - do first pinning
+        if not self._initial_profiling_complete and timestep_idx >= self.config.num_warmup_timesteps:
+            self._analyze_and_apply_initial_profiling()
+
+        # Phase 2: Dynamic re-pinning based on continuous profiling
+        elif (self.config.dynamic_pinning and
+              self._initial_profiling_complete and
+              timestep_idx - self._last_repin_timestep >= self.config.repin_interval):
+            self._dynamic_repin(timestep_idx)
 
     def _start_layer_timing(self, layer_idx: int):
         """Start timing for a layer (called before layer forward)."""
         if not self.config.enable_profiling:
-            return
-        if self._profiling_complete:
             return
 
         # Create timing events if needed
@@ -588,10 +608,14 @@ class HybridOffloadManager:
         self._layer_start_event.record()
 
     def _end_layer_timing(self, layer_idx: int):
-        """End timing for a layer and record result (called after layer forward)."""
+        """
+        End timing for a layer and record result.
+
+        Uses different recording strategies:
+        - Before initial profiling: Collect raw samples
+        - After initial profiling: Update EMA for continuous tracking
+        """
         if not self.config.enable_profiling:
-            return
-        if self._profiling_complete:
             return
         if self._layer_start_event is None:
             return
@@ -600,93 +624,141 @@ class HybridOffloadManager:
         torch.cuda.synchronize()
 
         elapsed_ms = self._layer_start_event.elapsed_time(self._layer_end_event)
-        self._layer_compute_times[layer_idx].append(elapsed_ms)
         self.stats['profiling_samples'] += 1
 
-    def _analyze_and_apply_profiling(self):
-        """
-        Analyze profiling results and pin heavy layers.
+        if not self._initial_profiling_complete:
+            # Phase 1: Collect raw samples during warm-up
+            self._layer_compute_times[layer_idx].append(elapsed_ms)
+        else:
+            # Phase 2: Update EMA for continuous profiling
+            alpha = self.config.ema_alpha
+            if layer_idx in self._layer_ema_compute:
+                # EMA update: new_ema = alpha * new_value + (1 - alpha) * old_ema
+                self._layer_ema_compute[layer_idx] = (
+                    alpha * elapsed_ms + (1 - alpha) * self._layer_ema_compute[layer_idx]
+                )
+            else:
+                # First observation after warm-up
+                self._layer_ema_compute[layer_idx] = elapsed_ms
 
-        This is the core of PGDP: we identify layers with high compute cost
-        and pin them on GPU to avoid transfer overhead.
+    def _analyze_and_apply_initial_profiling(self):
         """
-        if self._profiling_complete:
+        Analyze initial warm-up profiling and do first pinning.
+
+        This establishes the initial EMA values and pins heavy layers.
+        """
+        if self._initial_profiling_complete:
             return
 
         logger.info("=" * 70)
         logger.info("[PGDP] Analyzing warm-up profiling results...")
         logger.info("=" * 70)
 
-        # Compute average compute time per layer
+        # Initialize EMA from warm-up samples
         for layer_idx in range(self.num_layers):
             times = self._layer_compute_times.get(layer_idx, [])
             if times:
-                self._layer_avg_compute[layer_idx] = sum(times) / len(times)
+                avg_time = sum(times) / len(times)
+                self._layer_ema_compute[layer_idx] = avg_time
             else:
-                self._layer_avg_compute[layer_idx] = 0.0
+                self._layer_ema_compute[layer_idx] = 0.0
 
-        # Rank layers by compute cost
-        sorted_layers = sorted(
-            self._layer_avg_compute.items(),
-            key=lambda x: x[1],
-            reverse=True
-        )
-
-        # Determine heavy layers to pin
-        # Method 1: Top-K layers
-        num_to_pin = min(self.config.num_pinned_heavy_layers, self.num_layers)
-
-        # Method 2: Threshold-based (layers above percentile)
-        if sorted_layers:
-            all_times = [t for t in self._layer_avg_compute.values() if t > 0]
-            if all_times:
-                threshold_idx = int(len(all_times) * self.config.heavy_layer_threshold)
-                threshold_time = sorted(all_times, reverse=True)[min(threshold_idx, len(all_times)-1)]
-            else:
-                threshold_time = 0
-
-        # Select heavy layers (use both criteria)
-        heavy_layers = []
-        for layer_idx, avg_time in sorted_layers[:num_to_pin]:
-            if avg_time > 0:  # Only pin layers we actually profiled
-                heavy_layers.append(layer_idx)
-
+        # Determine and pin heavy layers
+        heavy_layers = self._identify_heavy_layers()
         self._pinned_heavy_layers = set(heavy_layers)
 
         # Log profiling results
-        logger.info(f"[PGDP] Profiling complete: {self.stats['profiling_samples']} samples")
+        sorted_layers = sorted(self._layer_ema_compute.items(), key=lambda x: x[1], reverse=True)
+        logger.info(f"[PGDP] Initial profiling complete: {self.stats['profiling_samples']} samples")
         logger.info(f"[PGDP] Layer compute times (top 10):")
         for layer_idx, avg_time in sorted_layers[:10]:
             pin_marker = " [PIN]" if layer_idx in self._pinned_heavy_layers else ""
             logger.info(f"[PGDP]   Layer {layer_idx:2d}: {avg_time:6.2f}ms{pin_marker}")
 
-        # Now pin the heavy layers on GPU
+        # Pin the heavy layers on GPU
         if self._pinned_heavy_layers:
-            self._pin_heavy_layers_on_gpu()
+            self._apply_pinning_changes(set(), self._pinned_heavy_layers)
+            for layer_idx in self._pinned_heavy_layers:
+                self._layers_pinned_count[layer_idx] += 1
 
-        self._profiling_complete = True
+        self._initial_profiling_complete = True
+        self._last_repin_timestep = self._current_timestep
         logger.info("=" * 70)
 
-    def _pin_heavy_layers_on_gpu(self):
-        """Move heavy layers to GPU and mark them as pinned."""
-        logger.info(f"[PGDP] Pinning {len(self._pinned_heavy_layers)} heavy layers on GPU...")
+    def _identify_heavy_layers(self) -> List[int]:
+        """Identify top-K heavy layers based on current EMA compute times."""
+        if not self._layer_ema_compute:
+            return []
 
+        sorted_layers = sorted(
+            self._layer_ema_compute.items(),
+            key=lambda x: x[1],
+            reverse=True
+        )
+
+        num_to_pin = min(self.config.num_pinned_heavy_layers, self.num_layers)
+        heavy_layers = []
+        for layer_idx, avg_time in sorted_layers[:num_to_pin]:
+            if avg_time > 0:
+                heavy_layers.append(layer_idx)
+
+        return heavy_layers
+
+    def _dynamic_repin(self, timestep_idx: int):
+        """
+        Dynamically re-evaluate and adjust pinning based on recent observations.
+
+        This is the key innovation: as sparse attention changes layer costs,
+        we adapt pinning to keep the currently-heavy layers on GPU.
+        """
+        # Identify current heavy layers based on EMA
+        new_heavy_layers = set(self._identify_heavy_layers())
+
+        # Compare with currently pinned layers
+        layers_to_unpin = self._pinned_heavy_layers - new_heavy_layers
+        layers_to_pin = new_heavy_layers - self._pinned_heavy_layers
+
+        if layers_to_unpin or layers_to_pin:
+            self._total_repin_events += 1
+            logger.info(f"[PGDP] Dynamic repin at timestep {timestep_idx}:")
+            if layers_to_unpin:
+                logger.info(f"[PGDP]   Unpinning: {sorted(layers_to_unpin)} (became lighter)")
+            if layers_to_pin:
+                logger.info(f"[PGDP]   Pinning: {sorted(layers_to_pin)} (became heavier)")
+
+            # Apply the changes
+            self._apply_pinning_changes(layers_to_unpin, layers_to_pin)
+
+            # Update pinned set
+            self._pinned_heavy_layers = new_heavy_layers
+
+            # Track pinning frequency
+            for layer_idx in layers_to_pin:
+                self._layers_pinned_count[layer_idx] += 1
+
+        self._last_repin_timestep = timestep_idx
+
+    def _apply_pinning_changes(self, layers_to_unpin: Set[int], layers_to_pin: Set[int]):
+        """Apply pinning changes: move layers to/from GPU."""
+        # Unpin layers (move to CPU if not in current window)
+        for layer_idx in layers_to_unpin:
+            # Note: We don't immediately move to CPU - just remove from pinned set
+            # The regular eviction logic will handle it if needed
+            pass
+
+        # Pin new heavy layers (move to GPU)
         pinned_mb = 0.0
-        for layer_idx in sorted(self._pinned_heavy_layers):
-            # Move to GPU if not already there
+        for layer_idx in sorted(layers_to_pin):
             if not self._layer_on_gpu.get(layer_idx, False):
                 self._move_layer_to_gpu(layer_idx, non_blocking=False)
-
             self._layers_on_gpu_set.add(layer_idx)
 
-            # Track memory
             info = self._layer_memory.get(layer_idx)
             if info:
                 pinned_mb += info.total_mb
 
-        logger.info(f"[PGDP] Pinned layers: {sorted(self._pinned_heavy_layers)}")
-        logger.info(f"[PGDP] Pinned memory: {pinned_mb:.1f}MB ({pinned_mb/1024:.2f}GB)")
-        logger.info(f"[PGDP] Benefit: These layers will NEVER be offloaded")
+        if layers_to_pin:
+            logger.info(f"[PGDP] Pinned {len(layers_to_pin)} layers ({pinned_mb:.1f}MB)")
 
         torch.cuda.empty_cache()
 
@@ -1213,23 +1285,32 @@ class HybridOffloadManager:
             print(f"  Inference time:          {stats['inference_time_seconds']:.1f}s")
         print("=" * 70)
         print("PROFILE-GUIDED DYNAMIC PINNING (PGDP):")
-        if self.config.enable_profiling and self._profiling_complete:
+        if self.config.enable_profiling and self._initial_profiling_complete:
+            print(f"  Mode:                    {'Dynamic' if self.config.dynamic_pinning else 'Static'}")
             print(f"  Profiling samples:       {stats['profiling_samples']}")
-            print(f"  Pinned heavy layers:     {sorted(self._pinned_heavy_layers)}")
-            print(f"  Pinned layer hits:       {stats['pinned_layer_hits']}")
-            if self._layer_avg_compute:
-                top_layers = sorted(self._layer_avg_compute.items(), key=lambda x: x[1], reverse=True)[:5]
-                print(f"  Top-5 heavy layers:")
+            print(f"  Current pinned layers:   {sorted(self._pinned_heavy_layers)}")
+            print(f"  Pinned layer hits:       {stats['pinned_layer_hits']} (zero-cost access)")
+            if self.config.dynamic_pinning:
+                print(f"  Repin events:            {self._total_repin_events}")
+                print(f"  Repin interval:          Every {self.config.repin_interval} timesteps")
+                print(f"  EMA alpha:               {self.config.ema_alpha}")
+            if self._layer_ema_compute:
+                top_layers = sorted(self._layer_ema_compute.items(), key=lambda x: x[1], reverse=True)[:5]
+                print(f"  Top-5 heavy layers (current EMA):")
                 for layer_idx, avg_time in top_layers:
                     pin_marker = " [PINNED]" if layer_idx in self._pinned_heavy_layers else ""
-                    print(f"    Layer {layer_idx:2d}: {avg_time:6.2f}ms{pin_marker}")
+                    pin_count = self._layers_pinned_count.get(layer_idx, 0)
+                    print(f"    Layer {layer_idx:2d}: {avg_time:6.2f}ms{pin_marker} (pinned {pin_count}x)")
         else:
             print(f"  Status: {'Disabled' if not self.config.enable_profiling else 'Not yet complete'}")
         print("=" * 70)
         print("KEY BENEFITS:")
         print(f"  ✓ Memory: Only {self.config.num_layers_on_gpu + num_pinned}/{stats['num_layers']} layers on GPU")
         if num_pinned > 0:
-            print(f"  ✓ PGDP: Heavy layers pinned based on warm-up profiling")
+            if self.config.dynamic_pinning:
+                print(f"  ✓ PGDP: Dynamic pinning adapts to changing compute patterns")
+            else:
+                print(f"  ✓ PGDP: Heavy layers pinned based on warm-up profiling")
         if is_stream:
             print(f"  ✓ Pipelining: Overlap attention compute with FFN transfer")
             print(f"  ✓ Component-aware: Smaller transfer units for better overlap")
@@ -1250,11 +1331,14 @@ class HybridOffloadManager:
 
         # Reset PGDP state for new profiling run
         self._current_timestep = 0
-        self._profiling_complete = False
+        self._last_repin_timestep = 0
+        self._initial_profiling_complete = False
         self._layer_compute_times.clear()
-        self._layer_avg_compute.clear()
-        # Note: Keep pinned layers as they were identified - don't reset for warm start
-        # To fully reset, call reset_profiling() explicitly
+        self._layer_ema_compute.clear()
+        self._total_repin_events = 0
+        self._layers_pinned_count.clear()
+        # Note: Keep pinned layers for warm start - they'll be re-evaluated
+        # during the first repin interval of the new run
 
 
 def create_hybrid_offload_hooks(
@@ -1332,6 +1416,10 @@ def enable_component_offloading(
     enable_profiling: bool = True,
     num_warmup_timesteps: int = 5,  # Match SAP warm-up
     num_pinned_heavy_layers: int = 6,  # Top-K heavy layers to pin
+    # Dynamic pinning - continuously adapt based on runtime observations
+    dynamic_pinning: bool = True,  # Enable continuous adaptation
+    repin_interval: int = 5,  # Re-evaluate pinning every N timesteps
+    ema_alpha: float = 0.3,  # EMA smoothing factor
 ) -> Tuple[HybridOffloadManager, Dict]:
     """
     Enable hybrid component offloading for a HunyuanVideo pipeline.
@@ -1352,24 +1440,26 @@ def enable_component_offloading(
 
     3. Profile-Guided Dynamic Pinning (PGDP) - Key Innovation:
        During SAP warm-up (first N timesteps), we profile compute time per layer.
-       After warm-up, we pin heavy layers on GPU while offloading lighter layers.
+       After warm-up, we pin heavy layers on GPU. With dynamic_pinning=True,
+       we continuously adapt pinning as sparse attention changes layer costs.
 
        ┌─────────────────────────────────────────────────────────────────┐
-       │ Phase 1: Warm-up Profiling                                      │
+       │ Phase 1: Initial Profiling (warm-up timesteps)                  │
        │   - Measure compute time per layer during dense attention       │
-       │   - Build per-layer compute cost profile                        │
+       │   - Initial pinning based on observed heavy layers              │
        │                                                                 │
-       │ Phase 2: Dynamic Pinning (after warm-up)                        │
-       │   - Rank layers by observed compute cost                        │
-       │   - Top-K heavy layers → Pin on GPU (never offload)             │
-       │   - Remaining layers → Sliding window with prefetch             │
+       │ Phase 2: Continuous Adaptation (if dynamic_pinning=True)        │
+       │   - Keep profiling with EMA smoothing                           │
+       │   - Periodically re-evaluate heavy layer set                    │
+       │   - Dynamically adjust: unpin light layers, pin new heavy ones  │
+       │   - Adapts to sparse attention patterns as they change          │
        └─────────────────────────────────────────────────────────────────┘
 
        Why this works:
        - Heavy layers have high compute/transfer ratio → worth keeping on GPU
        - Light layers can tolerate transfer overhead
        - Data-driven: Uses actual measured compute, not heuristics
-       - Zero overhead: Profiling during warm-up we already run
+       - ADAPTIVE: Continuously updates as compute patterns change
 
     Adaptive Mode:
     When ffn_layers_on_gpu is None, automatically calculates optimal layers
@@ -1389,9 +1479,12 @@ def enable_component_offloading(
         num_frames: Number of frames (for adaptive mode activation estimation)
         offload_strategy: "layer" or "stream" (recommended)
         stream_prefetch_depth: How many layers ahead to prefetch for stream strategy
-        enable_profiling: Enable PGDP profiling during warm-up
-        num_warmup_timesteps: Number of timesteps for profiling (match SAP warm-up)
-        num_pinned_heavy_layers: Number of heavy layers to pin after profiling
+        enable_profiling: Enable PGDP profiling
+        num_warmup_timesteps: Number of timesteps for initial profiling
+        num_pinned_heavy_layers: Number of heavy layers to pin
+        dynamic_pinning: Enable continuous adaptation (vs static after warm-up)
+        repin_interval: Re-evaluate pinning every N timesteps
+        ema_alpha: EMA smoothing factor (higher = more weight on recent)
 
     Returns:
         Tuple of (HybridOffloadManager, hooks_dict)
@@ -1440,8 +1533,13 @@ def enable_component_offloading(
     # Log PGDP info
     if enable_profiling:
         logger.info(f"[PGDP] Profile-Guided Dynamic Pinning ENABLED")
-        logger.info(f"[PGDP] Warm-up profiling: {num_warmup_timesteps} timesteps")
-        logger.info(f"[PGDP] Will pin top {num_pinned_heavy_layers} heavy layers after warm-up")
+        logger.info(f"[PGDP] Initial profiling: {num_warmup_timesteps} timesteps")
+        logger.info(f"[PGDP] Will pin top {num_pinned_heavy_layers} heavy layers")
+        if dynamic_pinning:
+            logger.info(f"[PGDP] Dynamic mode: Re-evaluate every {repin_interval} timesteps")
+            logger.info(f"[PGDP] EMA alpha: {ema_alpha} (continuous adaptation)")
+        else:
+            logger.info(f"[PGDP] Static mode: Pinning fixed after warm-up")
 
     config = HybridOffloadConfig(
         num_layers_on_gpu=ffn_layers_on_gpu,
@@ -1459,6 +1557,10 @@ def enable_component_offloading(
         enable_profiling=enable_profiling,
         num_warmup_timesteps=num_warmup_timesteps,
         num_pinned_heavy_layers=num_pinned_heavy_layers,
+        # Dynamic pinning parameters
+        dynamic_pinning=dynamic_pinning,
+        repin_interval=repin_interval,
+        ema_alpha=ema_alpha,
     )
 
     # Keep other transformer components on GPU FIRST (before moving blocks to CPU)
