@@ -1,12 +1,12 @@
 \section{Methodology}
 \label{sec:methodology}
 
-We present \textbf{RabbitVideo}, which exploits temporal coherence in diffusion models to accelerate sparse attention computation and enable memory-efficient inference on consumer GPUs. The system comprises three synergistic components: \textbf{Reuse-Across-Blocks} (RAB) for reducing K-means clustering overhead, \textbf{Block-Importance Tiers} (BIT) for hierarchical sparse attention computation, and \textbf{Attention-Informed Offloading} (AIO) for intelligent GPU memory management. Figure~\ref{fig:overview} illustrates the overall architecture.
+We present \textbf{RabbitVideo}, which exploits temporal coherence in diffusion models to accelerate sparse attention computation and enable memory-efficient inference on consumer GPUs. The system comprises three synergistic components: \textbf{Reuse-Across-Blocks} (RAB) for reducing K-means clustering overhead, \textbf{Block-Importance Tiers} (BIT) for hierarchical sparse attention computation, and \textbf{Profile-Informed Offloading} (PIO) for intelligent GPU memory management via runtime profiling and dynamic layer pinning. A key innovation is that PIO \emph{continuously adapts} to the changing compute patterns induced by sparse attention---as RAB and BIT modify layer costs throughout the denoising trajectory, PIO dynamically re-pins heavy layers to maintain optimal memory utilization. Figure~\ref{fig:overview} illustrates the overall architecture.
 
 \begin{figure}[t]
     \centering
     \includegraphics[width=\linewidth]{Figures/architecture.png}
-    \caption{RabbitVideo overview. RabbitVideo amortizes semantic sparse attention across diffusion timesteps via a CPU-resident cluster cache (RAB), allocates attention computation using block-importance tiers (BIT), and fits within memory budgets by streaming transformer blocks with a sliding-window offloading runtime.}
+    \caption{RabbitVideo overview. RabbitVideo amortizes semantic sparse attention across diffusion timesteps via a CPU-resident cluster cache (RAB), allocates attention computation using block-importance tiers (BIT), and fits within memory budgets via Profile-Guided Dynamic Pinning (PGDP) with StreamBlock pipelining (PIO). PGDP continuously profiles layer compute times and dynamically adjusts which layers remain GPU-resident as sparse attention patterns evolve.}
     \label{fig:overview}
 \end{figure}
 
@@ -46,7 +46,7 @@ This coherence manifests in three exploitable properties:
 \begin{enumerate}
     \item \textbf{Cluster Stability}: Token cluster assignments remain largely stable across timesteps, with only boundary tokens shifting between clusters (exploited by RAB).
     \item \textbf{Attention Pattern Stability}: The importance distribution across cluster pairs changes gradually, allowing for hierarchical approximation (exploited by BIT).
-    \item \textbf{Compute Cost Predictability}: Layer compute costs at timestep $t$ are predictive of costs at timestep $t+1$, enabling intelligent prefetching decisions (exploited by AIO).
+    \item \textbf{Compute Cost Stability}: Layer compute costs evolve smoothly across timesteps, enabling runtime profiling to identify persistently heavy layers for GPU pinning (exploited by PIO).
 \end{enumerate}
 
 We exploit all three properties to amortize computation across timesteps, achieving substantial speedup without quality degradation.
@@ -190,7 +190,8 @@ Table~\ref{tab:complexity} summarizes the computational complexity of each compo
 K-means per layer & $\mathcal{O}(NCI)$ & $\mathcal{O}(NC/R)$ \\
 Attention (full) & $\mathcal{O}(N^2)$ & $\mathcal{O}(p_{\text{full}} \cdot N \cdot B)$ \\
 Attention (centroid) & --- & $\mathcal{O}(C_Q \cdot C_K)$ \\
-Memory transfer & Sequential & Overlapped (AIO) \\
+Memory transfer & Sequential & Pipelined (PIO) \\
+Heavy layer access & Transfer each use & Pinned on GPU \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -204,69 +205,117 @@ The combined speedup from RAB and BIT depends on the reuse ratio and the tier di
 \end{equation}
 where $\epsilon \ll 1$ is the relative cost of centroid attention. In practice we tune $(p_{\text{full}}, p_{\text{total}})$ to trace a speed--quality Pareto frontier and report the resulting runtime/quality trade-offs in Section~\ref{sec:evaluation}.
 
-\subsection{AIO: Attention-Informed Offloading}
+\subsection{PIO: Profile-Informed Offloading with Dynamic Pinning}
 \label{sec:offloading}
 
-To enable inference on memory-constrained GPUs (24GB), we introduce Attention-Informed Offloading (AIO), which uses signals from RAB and BIT to make intelligent prefetching and eviction decisions---going beyond naive FIFO scheduling.
+To enable inference on memory-constrained GPUs (24GB), we introduce Profile-Informed Offloading (PIO), which uses \textit{runtime profiling} rather than heuristic prediction to make intelligent memory management decisions. The key insight is that actual measured compute times are more reliable than predicted signals, especially as sparse attention patterns dynamically change layer costs throughout the denoising trajectory.
 
-\paragraph{Compute Cost Prediction.}
-We predict the compute cost for layer $\ell$ at timestep $t$ using a weighted combination of signals:
+\paragraph{Motivation: Compute Cost Instability under Sparse Attention.}
+Unlike dense attention where all layers have similar compute costs, sparse attention (RAB + BIT) creates highly \emph{non-uniform} layer execution times. Some layers retain high attention density and remain compute-heavy, while others become sparse and execute quickly. Moreover, this distribution \emph{changes} as the diffusion process progresses---early timesteps (high noise) exhibit different sparsity patterns than late timesteps (refinement). Static offloading strategies cannot adapt to these dynamics, leading to suboptimal memory utilization.
+
+PIO addresses this through \textit{Profile-Guided Dynamic Pinning} (PGDP): continuously profiling layer compute times and dynamically adjusting which layers remain pinned on GPU. Heavy layers (high compute-to-transfer ratio) benefit from GPU residency, while light layers can tolerate transfer overhead.
+
+\paragraph{Two-Phase Profiling.}
+PIO operates in two synergistic phases:
+
+\textit{Phase 1 (Warm-up Profiling)}: During the first $T_w$ timesteps, we collect raw timing samples for each layer using CUDA events:
 \begin{equation}
-    \hat{C}^{(\ell, t)} = w_\rho \cdot \rho^{(\ell, t-1)} + w_s \cdot s_{\text{rab}}^{(\ell, t-1)} + w_\tau \cdot \tau^{(\ell, t-1)}
+    \tau^{(\ell)}_{\text{raw}} = \{\tau^{(\ell)}_1, \tau^{(\ell)}_2, \ldots, \tau^{(\ell)}_{T_w}\}
 \end{equation}
-where $\rho$ is attention density from BIT (fraction of full-attention pairs), $s_{\text{rab}}$ is the RAB decision signal (1.0 for full recluster, 0.1 for reuse), and $\tau$ is normalized historical timing. Default weights are $(w_\rho, w_s, w_\tau) = (0.4, 0.3, 0.3)$.
-
-\paragraph{Priority-Based Prefetching.}
-Instead of sequential prefetching, we prioritize layers by predicted compute time:
+After warm-up, we initialize the exponential moving average (EMA) for each layer:
 \begin{equation}
-    \text{Priority}(\ell) = \frac{1}{\text{dist}(\ell, \ell_{\text{current}})} \cdot (1 + 2\hat{C}^{(\ell)})
+    \bar{\tau}^{(\ell)}_0 = \frac{1}{T_w} \sum_{i=1}^{T_w} \tau^{(\ell)}_i
 \end{equation}
-Expensive layers are prefetched earlier, overlapping transfer with compute of current layers. This ensures high-cost layers are ready when needed.
 
-\paragraph{Priority-Based Eviction.}
-When GPU memory is full, we evict layers based on eviction score (lower = evict first):
+\textit{Phase 2 (Continuous Adaptation)}: After warm-up, we continuously update layer costs using EMA smoothing:
 \begin{equation}
-    \text{EvictScore}(\ell) = 0.4 \cdot \text{Recency}(\ell) + 0.3 \cdot \hat{C}^{(\ell)} + 0.3 \cdot \text{Criticality}(\ell)
+    \bar{\tau}^{(\ell)}_{t} = \alpha \cdot \tau^{(\ell)}_t + (1 - \alpha) \cdot \bar{\tau}^{(\ell)}_{t-1}
 \end{equation}
-This keeps expensive and soon-to-be-used layers on GPU, unlike FIFO which ignores compute cost.
+where $\alpha = 0.3$ balances responsiveness and stability. This enables PIO to adapt as sparse attention patterns change layer costs over the denoising trajectory.
 
-\paragraph{Async Transfer with Pinned Memory.}
-We use CUDA streams for asynchronous CPU-to-GPU transfer with pinned (page-locked) memory, achieving $\sim$2$\times$ faster transfers than pageable memory.
+\paragraph{Dynamic Heavy Layer Pinning.}
+Based on profiled compute times, we identify and \textit{pin} the top-$K$ heaviest layers on GPU, preventing them from being evicted:
+\begin{equation}
+    \mathcal{H}_t = \text{TopK}_{\ell}(\bar{\tau}^{(\ell)}_t, K)
+\end{equation}
+where $K$ is typically 6--8 for 24GB GPUs. Crucially, pinning is \textit{dynamic}: every $\Delta_{\text{repin}}$ timesteps, we re-evaluate which layers are heaviest and adjust pinning accordingly:
+\begin{equation}
+    \mathcal{H}_{t+\Delta} = \begin{cases}
+        \mathcal{H}_t & \text{if } \mathcal{H}_t = \text{TopK}(\bar{\tau}_t, K) \\
+        \text{TopK}(\bar{\tau}_t, K) & \text{otherwise (repin)}
+    \end{cases}
+\end{equation}
+
+When the heavy layer set changes, we \textit{unpin} layers that became lighter ($\mathcal{H}_t \setminus \mathcal{H}_{t+\Delta}$) and \textit{pin} newly heavy layers ($\mathcal{H}_{t+\Delta} \setminus \mathcal{H}_t$). This adaptation is critical because sparse attention fundamentally changes layer costs: as BIT increasingly skips or approximates attention blocks, previously compute-heavy layers may become light, while layers that retained full attention become relatively heavier.
+
+\paragraph{StreamBlock Pipelining.}
+Beyond layer-level management, PIO employs \textit{component-level pipelining} to overlap compute with data transfer. Each transformer block consists of attention (Attn, ${\sim}35\%$ of layer weights) and feed-forward (FFN, ${\sim}65\%$ of layer weights) components. We exploit this asymmetry:
+
+\begin{enumerate}
+    \item \textbf{Attention-first loading}: Load Attn component synchronously (smaller, faster transfer)
+    \item \textbf{FFN prefetch during Attn compute}: While Attn executes (compute-bound), async prefetch FFN on a separate CUDA stream
+    \item \textbf{Next-layer prefetch during FFN}: While FFN executes, prefetch next layer's Attn component
+\end{enumerate}
+
+This achieves near-zero GPU idle time by hiding transfer latency behind compute. The key insight is that attention computation is typically compute-bound (especially with sparse attention from BIT), providing sufficient time to overlap with FFN transfer. Figure~\ref{fig:streamblock} illustrates the pipelining.
+
+\begin{figure}[t]
+    \centering
+    \includegraphics[width=\linewidth]{Figures/streamblock.png}
+    \caption{StreamBlock pipelining. While attention computes on GPU, FFN weights transfer from CPU. While FFN computes, the next layer's attention transfers. This overlaps compute with transfer, minimizing GPU idle time.}
+    \label{fig:streamblock}
+\end{figure}
 
 \begin{algorithm}[t]
-\caption{AIO: Attention-Informed Offloading}
+\caption{PIO: Profile-Informed Offloading}
 \label{alg:offload}
 \begin{algorithmic}[1]
-\REQUIRE Layer index $\ell$, GPU window size $W$, predictor $\mathcal{P}$
+\REQUIRE Layer $\ell$, window size $W$, EMA values $\bar{\tau}$, pinned set $\mathcal{H}$
 \ENSURE Layer $\ell$ ready on GPU
 
-\IF{Layer $\ell$ not on GPU}
-    \IF{Prefetch in progress for $\ell$}
-        \STATE WaitForPrefetch($\ell$) \COMMENT{Prefetch hit}
-    \ELSE
-        \STATE SyncLoadToGPU($\ell$) \COMMENT{Prefetch miss}
+\STATE \COMMENT{Phase 1: Warm-up profiling}
+\IF{$t < T_w$}
+    \STATE $\tau^{(\ell)}_t \gets$ MeasureLayerTime($\ell$)
+    \STATE Collect sample for initial EMA
+\ENDIF
+
+\STATE \COMMENT{Phase 2: Continuous adaptation}
+\IF{$t = T_w$}
+    \STATE Initialize $\bar{\tau}^{(\ell)}_0$ from collected samples
+    \STATE $\mathcal{H} \gets \text{TopK}(\bar{\tau}, K)$ \COMMENT{Initial pinning}
+    \STATE PinLayers($\mathcal{H}$)
+\ENDIF
+
+\STATE \COMMENT{Dynamic re-pinning}
+\IF{$t > T_w$ \AND $(t - t_{\text{last\_repin}}) \geq \Delta_{\text{repin}}$}
+    \STATE Update EMA: $\bar{\tau}^{(\ell)}_t \gets \alpha \tau^{(\ell)}_t + (1-\alpha)\bar{\tau}^{(\ell)}_{t-1}$
+    \STATE $\mathcal{H}' \gets \text{TopK}(\bar{\tau}, K)$
+    \IF{$\mathcal{H}' \neq \mathcal{H}$}
+        \STATE UnpinLayers($\mathcal{H} \setminus \mathcal{H}'$)
+        \STATE PinLayers($\mathcal{H}' \setminus \mathcal{H}$)
+        \STATE $\mathcal{H} \gets \mathcal{H}'$
     \ENDIF
 \ENDIF
 
-\STATE \COMMENT{Evict if GPU window full}
-\IF{$|\text{LayersOnGPU}| \geq W$}
-    \STATE $\text{victim} \gets \arg\min_{\ell'} \text{EvictScore}(\ell')$
-    \STATE OffloadToCPU($\text{victim}$)
+\STATE \COMMENT{StreamBlock pipelining}
+\IF{$\ell \in \mathcal{H}$}
+    \STATE \COMMENT{Pinned layer: already on GPU}
+\ELSE
+    \STATE EnsureAttnOnGPU($\ell$)
+    \STATE AsyncPrefetchFFN($\ell$) \COMMENT{Overlap with Attn compute}
 \ENDIF
-
-\STATE \COMMENT{Priority-based prefetching}
-\STATE $\text{targets} \gets \text{TopK}(\text{Priority}, k=2)$
-\FOR{$t \in \text{targets}$}
-    \STATE AsyncPrefetch($t$) \COMMENT{On prefetch stream}
-\ENDFOR
+\STATE ExecuteAttn($\ell$)
+\STATE WaitForFFN($\ell$)
+\STATE ExecuteFFN($\ell$)
+\STATE AsyncPrefetchAttn($\ell + 1$) \COMMENT{Overlap with FFN compute}
 \end{algorithmic}
 \end{algorithm}
 
-\paragraph{Signal Bridge.}
-A lightweight signal bridge connects RAB and BIT to AIO: after each layer completes, the bridge records $(s_{\text{rab}}, \rho, \tau)$ for the predictor. This enables AIO to anticipate compute patterns without additional profiling passes.
-
 \paragraph{Memory Configuration.}
-We keep a sliding window of $W$ transformer blocks on GPU (default $W{=}6$ for 24GB), with remaining blocks on CPU in pinned memory. RAB centroids and assignments reside on CPU to minimize VRAM usage.
+We use a hybrid memory layout: pinned heavy layers ($\mathcal{H}$) persist on GPU, while a sliding window of $W{-}|\mathcal{H}|$ additional layers streams through. CPU-resident layers use page-locked (pinned) memory for ${\sim}2\times$ faster transfers. RAB cache resides on CPU to minimize VRAM usage.
+
+\paragraph{Synergy with Sparse Attention.}
+PIO is designed to synergize with RAB and BIT. During the warm-up phase ($t < T_w$), RAB performs full K-means clustering and BIT uses denser attention. This provides accurate baseline profiling data. After warm-up, as RAB reuses clusters and BIT increases sparsity, layer compute costs change. PIO's continuous EMA tracking and dynamic re-pinning adapt to these changes, ensuring the \emph{currently} heaviest layers remain GPU-resident regardless of which specific layers they are. This closed-loop adaptation is key to achieving optimal memory efficiency under dynamic sparse attention patterns.
 
 \subsection{Implementation Details}
 \label{sec:implementation}
@@ -274,9 +323,12 @@ We keep a sliding window of $W$ transformer blocks on GPU (default $W{=}6$ for 2
 We implement RabbitVideo as drop-in replacements for standard attention in the HunyuanVideo pipeline using PyTorch and Triton. Key implementation choices:
 
 \begin{itemize}
-    \item \textbf{RAB Parameters}: Quality threshold $\tau_q = 0.8$, recluster interval $[\Delta_{\min}, \Delta_{\max}] = [2, 10]$ timesteps, adaptive mode enabled.
-    \item \textbf{BIT Parameters}: $p_{\text{full}} = 0.90$--$0.95$, $p_{\text{total}} = 0.98$--$0.99$, minimum KC ratio $0.05$--$0.10$ for quality-speed tradeoff.
-    \item \textbf{AIO Parameters}: GPU window $W = 6$ layers (24GB), prefetch count 2--4, prediction weights $(w_\rho, w_s, w_\tau) = (0.4, 0.3, 0.3)$, pinned memory enabled.
+    \item \textbf{RAB Parameters}: Quality threshold $\tau_q = 0.8$, recluster interval $[\Delta_{\min}, \Delta_{\max}] = [2, 10]$ timesteps, adaptive mode enabled. Cluster cache resides on CPU to save GPU memory.
+    \item \textbf{BIT Parameters}: $p_{\text{full}} = 0.70$--$0.90$, $p_{\text{total}} = 0.95$--$0.99$, minimum KC ratio $0.05$--$0.10$ for quality-speed tradeoff.
+    \item \textbf{PIO Parameters}: Warm-up timesteps $T_w = 5$, pinned heavy layers $K = 6$ (24GB GPU), EMA smoothing $\alpha = 0.3$, re-pinning interval $\Delta_{\text{repin}} = 5$ timesteps, StreamBlock pipelining enabled by default.
+    \item \textbf{Adaptive Memory Management}: PIO automatically calculates optimal sliding window size based on available GPU memory, video resolution, and estimated activation memory. This eliminates manual tuning and adapts to different hardware configurations.
+    \item \textbf{Lazy VAE Loading}: The VAE decoder (${\sim}300$MB) remains on CPU during transformer inference and is loaded to GPU only when decode is called, maximizing available VRAM for transformer layers.
+    \item \textbf{Sparse Attention Backend}: FlashInfer with VariableBlockSparseAttentionWrapper when available; graceful fallback to Triton-based sparse attention otherwise.
     \item \textbf{Warmup}: First 7.5\% of timesteps and 2.5\% of layers use full precision attention to ensure generation quality.
     \item \textbf{Hardware}: Tested on NVIDIA RTX 4090 (24GB) and A100 (40GB/80GB). RabbitVideo enables 720p, 5-second video generation on consumer GPUs that would otherwise require 40GB+ VRAM.
 \end{itemize}

@@ -48,6 +48,7 @@ import torch.nn as nn
 
 from .logger import logger
 from .timer import time_logging_decorator
+from .compute_cost_model import ComputeCostPredictor, CostModelConfig, StallMinimizingPinner
 
 
 # Safety buffer for memory fragmentation (GB)
@@ -369,6 +370,18 @@ class HybridOffloadManager:
         self._total_repin_events: int = 0
         self._layers_pinned_count: Dict[int, int] = defaultdict(int)  # How often each layer was pinned
 
+        # =====================================================================
+        # Compute Cost Predictor (CMCA Framework)
+        # =====================================================================
+        # The cost predictor uses attention signals (density, CTCA, CTAA) to
+        # predict layer compute costs. This enables:
+        # 1. Smarter prefetching (expensive layers prefetched earlier)
+        # 2. Optimal pinning (pin layers that would cause stalls)
+        # 3. Better eviction (evict cheap layers first)
+        self._cost_predictor: Optional[ComputeCostPredictor] = None
+        self._stall_pinner: Optional[StallMinimizingPinner] = None
+        self._use_cost_model: bool = config.enable_profiling  # Use cost model when profiling enabled
+
         # Statistics
         self.stats = {
             'layer_loads': 0,
@@ -558,14 +571,39 @@ class HybridOffloadManager:
         # Log profiling info if enabled
         if self.config.enable_profiling:
             logger.info("-" * 70)
-            logger.info("[PGDP] Profile-Guided Dynamic Pinning ENABLED")
-            logger.info(f"[PGDP] Initial profiling: {self.config.num_warmup_timesteps} timesteps")
-            logger.info(f"[PGDP] Heavy layers to pin: {self.config.num_pinned_heavy_layers}")
+            logger.info("[CMCA] Compute-Memory Co-Adaptation ENABLED")
+            logger.info(f"[CMCA] Initial profiling: {self.config.num_warmup_timesteps} timesteps")
+            logger.info(f"[CMCA] Heavy layers to pin: {self.config.num_pinned_heavy_layers}")
             if self.config.dynamic_pinning:
-                logger.info(f"[PGDP] Dynamic mode: Re-evaluate every {self.config.repin_interval} timesteps")
-                logger.info(f"[PGDP] EMA alpha: {self.config.ema_alpha} (smoothing factor)")
+                logger.info(f"[CMCA] Dynamic mode: Re-evaluate every {self.config.repin_interval} timesteps")
+                logger.info(f"[CMCA] EMA alpha: {self.config.ema_alpha} (smoothing factor)")
             else:
-                logger.info(f"[PGDP] Static mode: Pinning fixed after warm-up")
+                logger.info(f"[CMCA] Static mode: Pinning fixed after warm-up")
+            
+            # Initialize the compute cost predictor
+            if self._use_cost_model:
+                cost_config = CostModelConfig(
+                    weight_attention=0.40,
+                    weight_clustering=0.30,
+                    weight_timing=0.30,
+                    ema_alpha=self.config.ema_alpha,
+                )
+                self._cost_predictor = ComputeCostPredictor(self.num_layers, cost_config)
+                
+                # Estimate average layer compute time based on memory size
+                avg_layer_mb = sum(info.total_mb for info in self._layer_memory.values()) / max(len(self._layer_memory), 1)
+                # Rough estimate: 1MB takes ~0.5ms on modern GPU
+                avg_compute_ms = avg_layer_mb * 0.5
+                
+                self._stall_pinner = StallMinimizingPinner(
+                    self._cost_predictor,
+                    self.num_layers,
+                    transfer_time_ms=50.0,  # Typical CPU->GPU transfer for layer
+                    avg_compute_time_ms=max(avg_compute_ms, 50.0),
+                )
+                logger.info(f"[CMCA] Cost predictor initialized with attention-aware signals")
+                logger.info(f"[CMCA] Stall-minimizing pinner ready (estimated layer time: {avg_compute_ms:.1f}ms)")
+            
             logger.info("-" * 70)
 
     # =========================================================================
@@ -579,8 +617,15 @@ class HybridOffloadManager:
         Handles both initial profiling and dynamic re-pinning:
         1. After warm-up: Initial pinning based on profiled data
         2. Every repin_interval: Re-evaluate and adjust pinning dynamically
+        
+        Also notifies the cost predictor of timestep change for proper
+        temporal tracking of signals.
         """
         self._current_timestep = timestep_idx
+        
+        # Update cost predictor with new timestep
+        if self._cost_predictor is not None:
+            self._cost_predictor.on_timestep_start(timestep_idx)
 
         if not self.config.enable_profiling:
             return
@@ -607,13 +652,22 @@ class HybridOffloadManager:
 
         self._layer_start_event.record()
 
-    def _end_layer_timing(self, layer_idx: int):
+    def _end_layer_timing(self, layer_idx: int, attention_density: float = 0.5,
+                           ctca_reclustered: bool = False, ctca_quality: float = 1.0):
         """
         End timing for a layer and record result.
 
         Uses different recording strategies:
         - Before initial profiling: Collect raw samples
         - After initial profiling: Update EMA for continuous tracking
+        
+        Also feeds signals to the compute cost predictor (CMCA framework).
+        
+        Args:
+            layer_idx: Layer index
+            attention_density: Fraction of attended token pairs [0, 1]
+            ctca_reclustered: Whether CTCA performed full K-means
+            ctca_quality: Cluster quality score
         """
         if not self.config.enable_profiling:
             return
@@ -640,18 +694,42 @@ class HybridOffloadManager:
             else:
                 # First observation after warm-up
                 self._layer_ema_compute[layer_idx] = elapsed_ms
+        
+        # Feed signals to the compute cost predictor
+        if self._cost_predictor is not None:
+            self._cost_predictor.record_from_attention(
+                layer_idx=layer_idx,
+                timestep=self._current_timestep,
+                attention_density=attention_density,
+                compute_time_ms=elapsed_ms,
+                ctca_reclustered=ctca_reclustered,
+                ctca_quality=ctca_quality,
+            )
 
     def _analyze_and_apply_initial_profiling(self):
         """
         Analyze initial warm-up profiling and do first pinning.
 
-        This establishes the initial EMA values and pins heavy layers.
+        This establishes the initial EMA values and pins heavy layers using
+        either the stall-minimizing pinner (if cost model enabled) or the
+        legacy compute-time-based approach.
+        
+        Stall-Minimizing Pinning (CMCA):
+        --------------------------------
+        Instead of just pinning the computationally heaviest layers, we pin
+        layers that would cause the most memory stalls if not pinned. This
+        considers both compute cost and whether there's enough overlap time
+        to hide the transfer.
+        
+        Stall(layer_l) = max(0, TransferTime - OverlapTime(l-1))
+        
+        Where OverlapTime(l-1) is the compute time of the previous layer.
         """
         if self._initial_profiling_complete:
             return
 
         logger.info("=" * 70)
-        logger.info("[PGDP] Analyzing warm-up profiling results...")
+        logger.info("[CMCA] Analyzing warm-up profiling results...")
         logger.info("=" * 70)
 
         # Initialize EMA from warm-up samples
@@ -663,17 +741,44 @@ class HybridOffloadManager:
             else:
                 self._layer_ema_compute[layer_idx] = 0.0
 
-        # Determine and pin heavy layers
-        heavy_layers = self._identify_heavy_layers()
+        # Determine heavy layers using appropriate method
+        if self._stall_pinner is not None and self._cost_predictor is not None:
+            # CMCA: Use stall-minimizing pinning
+            # This pins layers that would cause the most stalls, not just the heaviest
+            heavy_layers = self._stall_pinner.select_layers_to_pin(
+                self.config.num_pinned_heavy_layers
+            )
+            
+            # Estimate total stall time with and without pinning
+            stall_without_pinning = self._stall_pinner.estimate_total_stall(
+                pinned_layers=set(),
+                num_timesteps=50,
+            )
+            stall_with_pinning = self._stall_pinner.estimate_total_stall(
+                pinned_layers=set(heavy_layers),
+                num_timesteps=50,
+            )
+            stall_reduction = stall_without_pinning - stall_with_pinning
+            
+            logger.info(f"[CMCA] Stall-minimizing pinning selected {len(heavy_layers)} layers")
+            logger.info(f"[CMCA] Estimated stall reduction: {stall_reduction:.1f}ms over 50 timesteps")
+        else:
+            # Legacy: Use compute-time-based selection
+            heavy_layers = self._identify_heavy_layers()
+
         self._pinned_heavy_layers = set(heavy_layers)
 
         # Log profiling results
         sorted_layers = sorted(self._layer_ema_compute.items(), key=lambda x: x[1], reverse=True)
-        logger.info(f"[PGDP] Initial profiling complete: {self.stats['profiling_samples']} samples")
-        logger.info(f"[PGDP] Layer compute times (top 10):")
+        logger.info(f"[CMCA] Initial profiling complete: {self.stats['profiling_samples']} samples")
+        logger.info(f"[CMCA] Layer compute times (top 10):")
         for layer_idx, avg_time in sorted_layers[:10]:
             pin_marker = " [PIN]" if layer_idx in self._pinned_heavy_layers else ""
-            logger.info(f"[PGDP]   Layer {layer_idx:2d}: {avg_time:6.2f}ms{pin_marker}")
+            cost_prediction = ""
+            if self._cost_predictor is not None:
+                predicted_cost = self._cost_predictor.predict_cost(layer_idx)
+                cost_prediction = f" (predicted cost: {predicted_cost:.2f})"
+            logger.info(f"[CMCA]   Layer {layer_idx:2d}: {avg_time:6.2f}ms{pin_marker}{cost_prediction}")
 
         # Pin the heavy layers on GPU
         if self._pinned_heavy_layers:
@@ -710,9 +815,25 @@ class HybridOffloadManager:
 
         This is the key innovation: as sparse attention changes layer costs,
         we adapt pinning to keep the currently-heavy layers on GPU.
+        
+        With CMCA (Compute-Memory Co-Adaptation):
+        -----------------------------------------
+        Instead of just looking at compute times, we use the cost predictor
+        which incorporates attention density and CTCA signals. This allows
+        us to predict which layers will be expensive in upcoming timesteps,
+        not just which were expensive in the past.
         """
-        # Identify current heavy layers based on EMA
-        new_heavy_layers = set(self._identify_heavy_layers())
+        # Identify current heavy layers using appropriate method
+        if self._stall_pinner is not None:
+            # CMCA: Use stall-minimizing selection
+            new_heavy_layers = set(
+                self._stall_pinner.select_layers_to_pin(
+                    self.config.num_pinned_heavy_layers
+                )
+            )
+        else:
+            # Legacy: Use EMA-based selection
+            new_heavy_layers = set(self._identify_heavy_layers())
 
         # Compare with currently pinned layers
         layers_to_unpin = self._pinned_heavy_layers - new_heavy_layers
@@ -720,11 +841,13 @@ class HybridOffloadManager:
 
         if layers_to_unpin or layers_to_pin:
             self._total_repin_events += 1
-            logger.info(f"[PGDP] Dynamic repin at timestep {timestep_idx}:")
+            logger.info(f"[CMCA] Dynamic repin at timestep {timestep_idx}:")
             if layers_to_unpin:
-                logger.info(f"[PGDP]   Unpinning: {sorted(layers_to_unpin)} (became lighter)")
+                reason = "stall potential reduced" if self._stall_pinner else "became lighter"
+                logger.info(f"[CMCA]   Unpinning: {sorted(layers_to_unpin)} ({reason})")
             if layers_to_pin:
-                logger.info(f"[PGDP]   Pinning: {sorted(layers_to_pin)} (became heavier)")
+                reason = "would cause stalls" if self._stall_pinner else "became heavier"
+                logger.info(f"[CMCA]   Pinning: {sorted(layers_to_pin)} ({reason})")
 
             # Apply the changes
             self._apply_pinning_changes(layers_to_unpin, layers_to_pin)
@@ -765,6 +888,49 @@ class HybridOffloadManager:
     def is_layer_pinned(self, layer_idx: int) -> bool:
         """Check if a layer is pinned (should never be offloaded)."""
         return layer_idx in self._pinned_heavy_layers
+    
+    def set_ctca_manager(self, ctca_manager):
+        """
+        Set the CTCA manager for the cost predictor.
+        
+        This enables the cost predictor to access cluster quality signals
+        for more accurate cost predictions. Should be called after CTCA
+        initialization.
+        
+        Args:
+            ctca_manager: The CrossTimestepClusterAmortization instance
+        """
+        if self._cost_predictor is not None:
+            self._cost_predictor.set_ctca_manager(ctca_manager)
+            logger.info("[CMCA] CTCA manager connected to cost predictor")
+    
+    def record_attention_signals(
+        self,
+        layer_idx: int,
+        attention_density: float = 0.5,
+        ctca_reclustered: bool = False,
+        ctca_quality: float = 1.0,
+    ):
+        """
+        Record attention pattern signals for a layer.
+        
+        This is the main interface for the attention processor to feed
+        signals to the cost predictor. Should be called after each layer's
+        forward pass completes.
+        
+        Args:
+            layer_idx: Layer index
+            attention_density: Fraction of attended token pairs [0, 1]
+            ctca_reclustered: Whether CTCA performed full K-means
+            ctca_quality: Cluster quality score
+        """
+        # The timing is recorded by _end_layer_timing
+        # Here we just pass additional signals
+        self._end_layer_timing(layer_idx, attention_density, ctca_reclustered, ctca_quality)
+    
+    def get_cost_predictor(self) -> Optional[ComputeCostPredictor]:
+        """Get the cost predictor for external access."""
+        return self._cost_predictor
 
     def _move_layer_to_cpu(self, layer_idx: int, use_pinned: bool = True):
         """Move entire layer to CPU."""
@@ -1284,7 +1450,7 @@ class HybridOffloadManager:
             print("TIMING:")
             print(f"  Inference time:          {stats['inference_time_seconds']:.1f}s")
         print("=" * 70)
-        print("PROFILE-GUIDED DYNAMIC PINNING (PGDP):")
+        print("COMPUTE-MEMORY CO-ADAPTATION (CMCA):")
         if self.config.enable_profiling and self._initial_profiling_complete:
             print(f"  Mode:                    {'Dynamic' if self.config.dynamic_pinning else 'Static'}")
             print(f"  Profiling samples:       {stats['profiling_samples']}")
@@ -1294,13 +1460,30 @@ class HybridOffloadManager:
                 print(f"  Repin events:            {self._total_repin_events}")
                 print(f"  Repin interval:          Every {self.config.repin_interval} timesteps")
                 print(f"  EMA alpha:               {self.config.ema_alpha}")
+            
+            # Cost predictor statistics
+            if self._cost_predictor is not None:
+                cost_stats = self._cost_predictor.get_statistics()
+                print("-" * 70)
+                print("COST PREDICTOR (Attention-Informed):")
+                print(f"  Total samples:           {cost_stats['total_samples']}")
+                print(f"  Avg predicted cost:      {cost_stats['avg_predicted_cost']:.3f}")
+                print(f"  Global avg density:      {cost_stats['global_avg_density']:.3f}")
+                print(f"  Global avg timing:       {cost_stats['global_avg_timing_ms']:.1f}ms")
+                print(f"  Heavy layers (by cost):  {cost_stats['heavy_layers'][:5]}")
+            
             if self._layer_ema_compute:
+                print("-" * 70)
                 top_layers = sorted(self._layer_ema_compute.items(), key=lambda x: x[1], reverse=True)[:5]
-                print(f"  Top-5 heavy layers (current EMA):")
+                print(f"  Top-5 heavy layers (by compute time):")
                 for layer_idx, avg_time in top_layers:
                     pin_marker = " [PINNED]" if layer_idx in self._pinned_heavy_layers else ""
                     pin_count = self._layers_pinned_count.get(layer_idx, 0)
-                    print(f"    Layer {layer_idx:2d}: {avg_time:6.2f}ms{pin_marker} (pinned {pin_count}x)")
+                    cost_info = ""
+                    if self._cost_predictor is not None:
+                        predicted_cost = self._cost_predictor.predict_cost(layer_idx)
+                        cost_info = f" (cost: {predicted_cost:.2f})"
+                    print(f"    Layer {layer_idx:2d}: {avg_time:6.2f}ms{pin_marker} (pinned {pin_count}x){cost_info}")
         else:
             print(f"  Status: {'Disabled' if not self.config.enable_profiling else 'Not yet complete'}")
         print("=" * 70)
@@ -1329,7 +1512,7 @@ class HybridOffloadManager:
         self._start_time = None
         self._end_time = None
 
-        # Reset PGDP state for new profiling run
+        # Reset CMCA state for new profiling run
         self._current_timestep = 0
         self._last_repin_timestep = 0
         self._initial_profiling_complete = False
@@ -1337,6 +1520,11 @@ class HybridOffloadManager:
         self._layer_ema_compute.clear()
         self._total_repin_events = 0
         self._layers_pinned_count.clear()
+        
+        # Reset cost predictor
+        if self._cost_predictor is not None:
+            self._cost_predictor.reset()
+        
         # Note: Keep pinned layers for warm start - they'll be re-evaluated
         # during the first repin interval of the new run
 
@@ -1652,6 +1840,29 @@ def enable_component_offloading(
     # Store global reference for external access (benchmarking, stats)
     global _global_offload_manager
     _global_offload_manager = manager
+    
+    # Set up CMCA signal callback to feed attention signals to the cost predictor
+    # This closes the loop: sparse attention → density signals → cost prediction → pinning
+    if manager._cost_predictor is not None:
+        try:
+            from .models.hyvideo.attention import set_cmca_signal_callback
+            
+            def cmca_signal_handler(layer_idx: int, density: float, ctca_reclustered: bool, ctca_quality: float):
+                """Handle attention signals from the sparse attention processor."""
+                if manager._cost_predictor is not None:
+                    manager._cost_predictor.record_from_attention(
+                        layer_idx=layer_idx,
+                        timestep=manager._current_timestep,
+                        attention_density=density,
+                        compute_time_ms=0.0,  # Timing is recorded separately
+                        ctca_reclustered=ctca_reclustered,
+                        ctca_quality=ctca_quality,
+                    )
+            
+            set_cmca_signal_callback(cmca_signal_handler)
+            logger.info("[CMCA] Attention signal callback registered - closed-loop adaptation enabled")
+        except ImportError:
+            logger.warning("[CMCA] Could not import attention module for signal callback")
 
     # Start memory tracking
     manager.start_tracking()

@@ -89,6 +89,32 @@ from ...kmeans_utils import (
 from ...ctca import CrossTimestepClusterAmortization, CTCAConfig, create_ctca
 from ...logger import logger
 from ...timer import time_logging_decorator
+
+# Global callback for CMCA (Compute-Memory Co-Adaptation)
+# This allows attention processors to feed signals to the offload manager
+_cmca_signal_callback = None
+
+def set_cmca_signal_callback(callback):
+    """
+    Set the callback function for CMCA signal reporting.
+    
+    The callback should have signature:
+        callback(layer_idx: int, density: float, ctca_reclustered: bool, ctca_quality: float)
+    
+    This is called after each sparse attention layer completes to feed
+    attention pattern signals to the offload manager's cost predictor.
+    """
+    global _cmca_signal_callback
+    _cmca_signal_callback = callback
+
+def report_cmca_signal(layer_idx: int, density: float, ctca_reclustered: bool = False, ctca_quality: float = 1.0):
+    """Report attention signals to the CMCA framework."""
+    global _cmca_signal_callback
+    if _cmca_signal_callback is not None:
+        try:
+            _cmca_signal_callback(layer_idx, density, ctca_reclustered, ctca_quality)
+        except Exception:
+            pass  # Don't let callback errors break attention
 from ...utils.misc import Color
 from .placement import (
     hunyuan_hidden_states_placement,
@@ -1213,15 +1239,27 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
 
             attn_output = apply_inverse_permutation_triton(output_permuted, q_sorted_indices, dim=2)
 
+            # Calculate density for CMCA and logging
+            densities = density_calculation(dyn_map, qc_sz_s, kc_sz_s)
+            avg_density = densities.mean().item()
+            
+            # Get CTCA stats
+            ctca_stats = self.get_ctca_statistics()
+            ctca_reclustered = False  # Will be set based on cache stats
+            ctca_quality = 1.0
+            
+            if self.ctca_manager is not None:
+                cache = self.ctca_manager.get_cache(layer_idx)
+                if cache is not None:
+                    ctca_quality = cache.get_average_quality()
+                    # Check if this call triggered a recluster (quality was low or hit max interval)
+                    ctca_reclustered = cache.calls_since_full_cluster == 0
+            
+            # Report signals to CMCA framework for cost prediction
+            report_cmca_signal(layer_idx, avg_density, ctca_reclustered, ctca_quality)
+
             # Save time, layer, density information to logging file
             if self.logging_file is not None:
-                densities = density_calculation(dyn_map, qc_sz_s, kc_sz_s)
-
-                avg_density = densities.mean().item()
-
-                # Include CTCA stats in log
-                ctca_stats = self.get_ctca_statistics()
-
                 log_entry = {
                     "timestep": timestep[0].item(),
                     "layer": layer_idx,
