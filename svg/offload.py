@@ -334,10 +334,15 @@ class LayerOffloadManager:
         Args:
             keep_layer_idx: The layer we're about to use (must stay on GPU)
         """
+        # If num_layers_on_gpu is None, default to 10 layers
+        num_layers_on_gpu = self.config.num_layers_on_gpu
+        if num_layers_on_gpu is None:
+            num_layers_on_gpu = min(10, self.num_layers)  # Default sliding window of 10 layers
+
         # Calculate the window bounds
         # Window should cover [keep_layer_idx - num_layers_on_gpu + 1, keep_layer_idx]
         window_end = keep_layer_idx
-        window_start = max(0, keep_layer_idx - self.config.num_layers_on_gpu + 1)
+        window_start = max(0, keep_layer_idx - num_layers_on_gpu + 1)
 
         # Find layers outside the window (both BEFORE start AND AFTER end)
         # This handles the wrap-around case when we loop back to layer 0
