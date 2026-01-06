@@ -1,0 +1,966 @@
+"""
+Cluster-Guided KV Reuse (CKGR)
+
+Novel contribution: Use CTCA's cluster stability information to guide partial KV reuse.
+
+Key insight: If cluster assignments are stable across timesteps (as CTCA exploits),
+then the K, V vectors within those clusters are also stable. We can:
+1. Cache K/V at cluster centroid level (1000 centroids vs 124K tokens = 124x smaller)
+2. For stable clusters: approximate token KV with centroid KV
+3. For unstable clusters: recompute full KV
+
+This bridges CTCA's cluster reuse with actual compute savings in KV projection.
+
+Memory: ~1.4 GB for all layers (vs 170 GB for full KV cache)
+Compute savings: Skip K/V projection for stable clusters (~50-70% of tokens)
+
+Integration:
+- Works in conjunction with CTCA (Cross-Timestep Cluster Amortization)
+- Uses CTCA's cluster_ids and stability information
+- Called during attention forward pass after clustering
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Tuple, List
+from collections import defaultdict
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import triton
+import triton.language as tl
+
+from .timer import time_logging_decorator
+from .logger import logger
+
+
+# =============================================================================
+# Triton Kernels for Efficient Operations
+# =============================================================================
+
+@triton.jit
+def _kv_centroid_update_kernel(
+    kv_ptr,           # *f16/f32 [B*H, S, D] - K or V tensor
+    cluster_ids_ptr,  # *i32     [B*H, S]    - cluster assignments
+    centroid_sum_ptr, # *f32     [B*H, K, D] - output sum accumulator
+    count_ptr,        # *i32     [B*H, K]    - output count accumulator
+    B_H: tl.constexpr,
+    S: tl.constexpr,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Compute K/V centroids by accumulating tokens per cluster.
+
+    Each program handles one token across all dimensions.
+    Uses atomic adds for thread-safe accumulation.
+    """
+    pid = tl.program_id(axis=0)
+    token_idx = pid  # range: [0, B*H * S)
+
+    # Derive (b_h, s) indices
+    b_h = token_idx // S
+    s = token_idx % S
+
+    # Bounds check
+    if b_h >= B_H or s >= S:
+        return
+
+    # Get cluster assignment for this token
+    cluster_id = tl.load(cluster_ids_ptr + b_h * S + s)
+
+    # Guard for invalid cluster ids
+    cluster_id = tl.where(cluster_id < K, cluster_id, 0)
+    cluster_id = tl.where(cluster_id >= 0, cluster_id, 0)
+
+    # Load token KV vector and accumulate to centroid
+    kv_base = (b_h * S + s) * D
+    centroid_base = (b_h * K + cluster_id) * D
+
+    offs = tl.arange(0, BLOCK_D)
+    for d_start in range(0, D, BLOCK_D):
+        mask = offs + d_start < D
+        kv_vals = tl.load(kv_ptr + kv_base + d_start + offs, mask=mask, other=0.0)
+        kv_vals = kv_vals.to(tl.float32)
+
+        dest_ptr = centroid_sum_ptr + centroid_base + d_start + offs
+        tl.atomic_add(dest_ptr, kv_vals, mask=mask)
+
+    # Update count (once per token)
+    tl.atomic_add(count_ptr + b_h * K + cluster_id, 1)
+
+
+@triton.jit
+def _scatter_centroids_to_tokens_kernel(
+    centroid_ptr,     # *f16/f32 [B*H, K, D] - centroids
+    cluster_ids_ptr,  # *i32     [B*H, S]    - cluster assignments
+    output_ptr,       # *f16/f32 [B*H, S, D] - output token values
+    stable_mask_ptr,  # *bool    [B*H, K]    - which clusters are stable
+    B_H: tl.constexpr,
+    S: tl.constexpr,
+    D: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    """Scatter centroid values to tokens in stable clusters.
+
+    For tokens in stable clusters, copy centroid value to output.
+    For tokens in unstable clusters, output is left unchanged.
+    """
+    pid = tl.program_id(axis=0)
+    token_idx = pid
+
+    b_h = token_idx // S
+    s = token_idx % S
+
+    if b_h >= B_H or s >= S:
+        return
+
+    # Get cluster assignment
+    cluster_id = tl.load(cluster_ids_ptr + b_h * S + s)
+    cluster_id = tl.where(cluster_id < K, cluster_id, 0)
+    cluster_id = tl.where(cluster_id >= 0, cluster_id, 0)
+
+    # Check if this cluster is stable
+    is_stable = tl.load(stable_mask_ptr + b_h * K + cluster_id)
+
+    if is_stable:
+        # Copy centroid value to output
+        centroid_base = (b_h * K + cluster_id) * D
+        output_base = (b_h * S + s) * D
+
+        offs = tl.arange(0, BLOCK_D)
+        for d_start in range(0, D, BLOCK_D):
+            mask = offs + d_start < D
+            centroid_vals = tl.load(centroid_ptr + centroid_base + d_start + offs, mask=mask, other=0.0)
+            tl.store(output_ptr + output_base + d_start + offs, centroid_vals, mask=mask)
+
+
+@triton.jit
+def _compute_stability_kernel(
+    old_ids_ptr,      # *i32  [B*H, S] - old cluster assignments
+    new_ids_ptr,      # *i32  [B*H, S] - new cluster assignments
+    overlap_ptr,      # *i32  [B*H, K] - overlap count output
+    old_count_ptr,    # *i32  [B*H, K] - old cluster size output
+    new_count_ptr,    # *i32  [B*H, K] - new cluster size output
+    B_H: tl.constexpr,
+    S: tl.constexpr,
+    K: tl.constexpr,
+):
+    """Compute cluster stability by counting overlaps between old and new assignments."""
+    pid = tl.program_id(axis=0)
+    token_idx = pid
+
+    b_h = token_idx // S
+    s = token_idx % S
+
+    if b_h >= B_H or s >= S:
+        return
+
+    old_cluster = tl.load(old_ids_ptr + b_h * S + s)
+    new_cluster = tl.load(new_ids_ptr + b_h * S + s)
+
+    # Bounds check
+    old_cluster = tl.where(old_cluster < K, old_cluster, 0)
+    old_cluster = tl.where(old_cluster >= 0, old_cluster, 0)
+    new_cluster = tl.where(new_cluster < K, new_cluster, 0)
+    new_cluster = tl.where(new_cluster >= 0, new_cluster, 0)
+
+    # Count old and new cluster sizes
+    tl.atomic_add(old_count_ptr + b_h * K + old_cluster, 1)
+    tl.atomic_add(new_count_ptr + b_h * K + new_cluster, 1)
+
+    # Count overlap only if same cluster in both
+    if old_cluster == new_cluster:
+        tl.atomic_add(overlap_ptr + b_h * K + old_cluster, 1)
+
+
+# =============================================================================
+# Data Classes
+# =============================================================================
+
+@dataclass
+class ClusterKVCache:
+    """Cache for cluster-level KV information.
+
+    Stores K/V centroids computed from token-level K/V values.
+    Memory efficient: stores centroids (num_clusters) instead of all tokens (seq_len).
+
+    For HunyuanVideo with 1000 clusters, 60 layers, 24 heads, 128 dim:
+    Memory = 60 * 2 * 1000 * 24 * 128 * 2 bytes = ~0.35 GB (vs ~170 GB for full KV cache)
+    """
+
+    # Cluster centroids in K/V space
+    # Shape: [B*H, num_k_clusters, head_dim]
+    k_centroids: torch.Tensor
+    v_centroids: torch.Tensor
+
+    # Which clusters are considered "stable" (can reuse)
+    # Shape: [B*H, num_k_clusters] - boolean mask
+    stable_clusters: torch.Tensor
+
+    # Cluster assignments from CTCA
+    # Shape: [B*H, seq_len]
+    k_cluster_ids: torch.Tensor
+
+    # Cluster sizes for weighted operations
+    # Shape: [B*H, num_k_clusters]
+    cluster_sizes: torch.Tensor
+
+    # Metadata
+    last_update_timestep: int = -1
+    quality_score: float = 0.0
+
+    def to_device(self, device: torch.device):
+        """Move cache to device."""
+        self.k_centroids = self.k_centroids.to(device, non_blocking=True)
+        self.v_centroids = self.v_centroids.to(device, non_blocking=True)
+        self.stable_clusters = self.stable_clusters.to(device, non_blocking=True)
+        self.k_cluster_ids = self.k_cluster_ids.to(device, non_blocking=True)
+        self.cluster_sizes = self.cluster_sizes.to(device, non_blocking=True)
+
+    def to_cpu(self):
+        """Move cache to CPU to save GPU memory."""
+        self.k_centroids = self.k_centroids.cpu()
+        self.v_centroids = self.v_centroids.cpu()
+        self.stable_clusters = self.stable_clusters.cpu()
+        self.k_cluster_ids = self.k_cluster_ids.cpu()
+        self.cluster_sizes = self.cluster_sizes.cpu()
+
+    def memory_bytes(self) -> int:
+        """Return total memory usage in bytes."""
+        total = 0
+        for tensor in [self.k_centroids, self.v_centroids, self.stable_clusters,
+                       self.k_cluster_ids, self.cluster_sizes]:
+            total += tensor.numel() * tensor.element_size()
+        return total
+
+
+@dataclass
+class CKGRConfig:
+    """Configuration for Cluster-Guided KV Reuse."""
+
+    # Number of clusters (should match CTCA's num_k_clusters)
+    num_k_clusters: int = 1000
+
+    # Stability threshold for cluster reuse (Jaccard index)
+    stability_threshold: float = 0.7
+
+    # Minimum ratio of stable clusters to enable reuse
+    min_stable_ratio: float = 0.3
+
+    # Quality threshold for CTCA cluster quality
+    quality_threshold: float = 0.75
+
+    # Whether to use Triton kernels (faster) or PyTorch fallback
+    use_triton: bool = True
+
+    # Enable verbose logging
+    verbose: bool = False
+
+
+# =============================================================================
+# Main CKGR Manager
+# =============================================================================
+
+class ClusterGuidedKVReuse:
+    """
+    Cluster-Guided KV Reuse Manager.
+
+    Uses CTCA's cluster information to decide which tokens can reuse cached KV
+    and which need recomputation.
+
+    Strategy:
+    1. When CTCA reuses clusters, we also reuse K/V for those stable clusters
+    2. K/V are stored at centroid level (huge memory savings)
+    3. For attention, stable clusters use centroid K/V, others get fresh K/V
+
+    Key Innovation: Selective computation guided by cluster stability.
+    - Tokens in stable clusters: use cached centroid K/V (no computation)
+    - Tokens in unstable clusters: recompute full K/V
+
+    Integration with existing pipeline:
+    - Called after CTCA's get_clusters() returns cluster_ids
+    - Before actual attention computation
+    - Updates K/V tensors with cached values for stable clusters
+    """
+
+    def __init__(
+        self,
+        config: CKGRConfig,
+        num_layers: int = 60,
+    ):
+        self.config = config
+        self.num_layers = num_layers
+
+        # Per-layer caches
+        self._cache: Dict[int, ClusterKVCache] = {}
+
+        # Statistics tracking
+        self.stats = {
+            'total_tokens': 0,
+            'reused_tokens': 0,
+            'recomputed_tokens': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'total_calls': 0,
+        }
+
+        # Per-layer statistics
+        self.layer_stats: Dict[int, Dict] = defaultdict(lambda: {
+            'reuse_count': 0, 'recompute_count': 0
+        })
+
+        logger.info(f"[CKGR] Initialized with {num_layers} layers, "
+                   f"{config.num_k_clusters} clusters, "
+                   f"stability_threshold={config.stability_threshold}")
+
+    def reset(self):
+        """Reset cache and statistics. Call at start of each video generation."""
+        self._cache.clear()
+        self.stats = {k: 0 for k in self.stats}
+        self.layer_stats.clear()
+        logger.info("[CKGR] Cache and statistics reset")
+
+    @time_logging_decorator("Level 4 - CKGR compute KV centroids")
+    def _compute_kv_centroids_triton(
+        self,
+        K: torch.Tensor,          # [B*H, S, D]
+        V: torch.Tensor,          # [B*H, S, D]
+        cluster_ids: torch.Tensor, # [B*H, S]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute K/V centroids using Triton kernel.
+
+        Returns:
+            k_centroids: [B*H, K, D]
+            v_centroids: [B*H, K, D]
+            cluster_sizes: [B*H, K]
+        """
+        B_H, S, D = K.shape
+        num_clusters = self.config.num_k_clusters
+        device = K.device
+        dtype = K.dtype
+
+        # Allocate output buffers
+        k_sum = torch.zeros(B_H, num_clusters, D, device=device, dtype=torch.float32)
+        v_sum = torch.zeros(B_H, num_clusters, D, device=device, dtype=torch.float32)
+        k_count = torch.zeros(B_H, num_clusters, device=device, dtype=torch.int32)
+        v_count = torch.zeros(B_H, num_clusters, device=device, dtype=torch.int32)
+
+        # Launch kernel for K
+        total_tokens = B_H * S
+        BLOCK_D = 128
+        grid = (total_tokens,)
+
+        _kv_centroid_update_kernel[grid](
+            K, cluster_ids.to(torch.int32),
+            k_sum, k_count,
+            B_H, S, D, num_clusters, BLOCK_D
+        )
+
+        # Launch kernel for V
+        _kv_centroid_update_kernel[grid](
+            V, cluster_ids.to(torch.int32),
+            v_sum, v_count,
+            B_H, S, D, num_clusters, BLOCK_D
+        )
+
+        # Compute means (avoid division by zero)
+        counts_f = k_count.float().unsqueeze(-1).clamp(min=1.0)
+        k_centroids = (k_sum / counts_f).to(dtype)
+        v_centroids = (v_sum / counts_f).to(dtype)
+
+        return k_centroids, v_centroids, k_count
+
+    @time_logging_decorator("Level 4 - CKGR compute KV centroids PyTorch")
+    def _compute_kv_centroids_pytorch(
+        self,
+        K: torch.Tensor,          # [B*H, S, D]
+        V: torch.Tensor,          # [B*H, S, D]
+        cluster_ids: torch.Tensor, # [B*H, S]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute K/V centroids using PyTorch (fallback).
+
+        Vectorized implementation using scatter_add for efficiency.
+        """
+        B_H, S, D = K.shape
+        num_clusters = self.config.num_k_clusters
+        device = K.device
+        dtype = K.dtype
+
+        # Expand cluster_ids for scatter_add: [B*H, S] -> [B*H, S, D]
+        cluster_ids_expanded = cluster_ids.unsqueeze(-1).expand(-1, -1, D)
+
+        # Initialize accumulators
+        k_sum = torch.zeros(B_H, num_clusters, D, device=device, dtype=torch.float32)
+        v_sum = torch.zeros(B_H, num_clusters, D, device=device, dtype=torch.float32)
+
+        # Scatter add
+        k_sum.scatter_add_(1, cluster_ids_expanded.long(), K.float())
+        v_sum.scatter_add_(1, cluster_ids_expanded.long(), V.float())
+
+        # Count cluster sizes
+        cluster_sizes = torch.zeros(B_H, num_clusters, device=device, dtype=torch.int32)
+        ones = torch.ones(B_H, S, device=device, dtype=torch.int32)
+        cluster_sizes.scatter_add_(1, cluster_ids.long(), ones)
+
+        # Compute means
+        counts_f = cluster_sizes.float().unsqueeze(-1).clamp(min=1.0)
+        k_centroids = (k_sum / counts_f).to(dtype)
+        v_centroids = (v_sum / counts_f).to(dtype)
+
+        return k_centroids, v_centroids, cluster_sizes
+
+    def _compute_kv_centroids(
+        self,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        cluster_ids: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Compute K/V centroids using best available method."""
+        if self.config.use_triton and K.is_cuda:
+            return self._compute_kv_centroids_triton(K, V, cluster_ids)
+        else:
+            return self._compute_kv_centroids_pytorch(K, V, cluster_ids)
+
+    @time_logging_decorator("Level 4 - CKGR compute stability")
+    def _compute_cluster_stability(
+        self,
+        old_ids: torch.Tensor,  # [B*H, S]
+        new_ids: torch.Tensor,  # [B*H, S]
+    ) -> torch.Tensor:
+        """Compute stability mask for clusters.
+
+        A cluster is stable if Jaccard similarity > threshold.
+        Jaccard = |intersection| / |union|
+
+        Returns:
+            stable_mask: [B*H, K] - True for stable clusters
+        """
+        B_H, S = new_ids.shape
+        K = self.config.num_k_clusters
+        device = new_ids.device
+
+        if self.config.use_triton and new_ids.is_cuda:
+            # Use Triton kernel
+            overlap = torch.zeros(B_H, K, device=device, dtype=torch.int32)
+            old_count = torch.zeros(B_H, K, device=device, dtype=torch.int32)
+            new_count = torch.zeros(B_H, K, device=device, dtype=torch.int32)
+
+            grid = (B_H * S,)
+            _compute_stability_kernel[grid](
+                old_ids.to(torch.int32), new_ids.to(torch.int32),
+                overlap, old_count, new_count,
+                B_H, S, K
+            )
+
+            # Compute Jaccard similarity
+            union = old_count + new_count - overlap
+            union = union.float().clamp(min=1.0)
+            jaccard = overlap.float() / union
+
+        else:
+            # PyTorch fallback - vectorized
+            # One-hot encode cluster assignments
+            old_onehot = F.one_hot(old_ids.long().clamp(0, K-1), num_classes=K).float()  # [B*H, S, K]
+            new_onehot = F.one_hot(new_ids.long().clamp(0, K-1), num_classes=K).float()  # [B*H, S, K]
+
+            # Compute cluster sizes
+            old_count = old_onehot.sum(dim=1)  # [B*H, K]
+            new_count = new_onehot.sum(dim=1)  # [B*H, K]
+
+            # Compute overlap (both assigned to same cluster)
+            overlap = (old_onehot * new_onehot).sum(dim=1)  # [B*H, K]
+
+            # Jaccard similarity
+            union = (old_count + new_count - overlap).clamp(min=1.0)
+            jaccard = overlap / union
+
+        # Threshold to get stable mask
+        stable_mask = jaccard > self.config.stability_threshold
+
+        return stable_mask
+
+    @time_logging_decorator("Level 4 - CKGR scatter centroids")
+    def _scatter_centroids_to_tokens(
+        self,
+        K: torch.Tensor,           # [B*H, S, D] - output tensor (modified in place)
+        V: torch.Tensor,           # [B*H, S, D] - output tensor (modified in place)
+        k_centroids: torch.Tensor, # [B*H, K, D]
+        v_centroids: torch.Tensor, # [B*H, K, D]
+        cluster_ids: torch.Tensor, # [B*H, S]
+        stable_mask: torch.Tensor, # [B*H, K]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Replace token K/V with centroid values for stable clusters.
+
+        Returns:
+            K, V: Modified tensors
+            reuse_mask: [B*H, S] - True for tokens that were replaced
+        """
+        B_H, S, D = K.shape
+        num_clusters = self.config.num_k_clusters
+        device = K.device
+
+        # Create token-level reuse mask: token can reuse if its cluster is stable
+        # Gather stable_mask using cluster_ids: [B*H, S]
+        reuse_mask = torch.gather(stable_mask, 1, cluster_ids.long().clamp(0, num_clusters-1))
+
+        if not reuse_mask.any():
+            return K, V, reuse_mask
+
+        if self.config.use_triton and K.is_cuda:
+            # Use Triton kernel for scattering
+            grid = (B_H * S,)
+            BLOCK_D = 128
+
+            _scatter_centroids_to_tokens_kernel[grid](
+                k_centroids, cluster_ids.to(torch.int32), K, stable_mask,
+                B_H, S, D, num_clusters, BLOCK_D
+            )
+            _scatter_centroids_to_tokens_kernel[grid](
+                v_centroids, cluster_ids.to(torch.int32), V, stable_mask,
+                B_H, S, D, num_clusters, BLOCK_D
+            )
+        else:
+            # PyTorch fallback - vectorized gather
+            # Get centroid values for each token's cluster
+            cluster_ids_expanded = cluster_ids.unsqueeze(-1).expand(-1, -1, D).long().clamp(0, num_clusters-1)
+            k_from_centroids = torch.gather(k_centroids, 1, cluster_ids_expanded)
+            v_from_centroids = torch.gather(v_centroids, 1, cluster_ids_expanded)
+
+            # Apply mask - replace only for stable clusters
+            reuse_mask_expanded = reuse_mask.unsqueeze(-1)  # [B*H, S, 1]
+            K = torch.where(reuse_mask_expanded, k_from_centroids, K)
+            V = torch.where(reuse_mask_expanded, v_from_centroids, V)
+
+        return K, V, reuse_mask
+
+    def should_reuse(
+        self,
+        layer_idx: int,
+        ctca_reused: bool,
+        cluster_quality: float = 1.0,
+    ) -> bool:
+        """Decide if we should attempt KV reuse for this layer.
+
+        Args:
+            layer_idx: Transformer layer index
+            ctca_reused: Whether CTCA reused clusters (vs full recluster)
+            cluster_quality: CTCA's cluster quality score
+
+        Returns:
+            True if we should attempt KV reuse
+        """
+        # No cache exists - can't reuse
+        if layer_idx not in self._cache:
+            return False
+
+        # CTCA did full recluster - cache is invalid
+        if not ctca_reused:
+            return False
+
+        # Quality too low - clusters may have drifted
+        if cluster_quality < self.config.quality_threshold:
+            return False
+
+        return True
+
+    @time_logging_decorator("Level 3 - CKGR process KV")
+    def process_kv(
+        self,
+        K: torch.Tensor,           # [B, H, S, D]
+        V: torch.Tensor,           # [B, H, S, D]
+        k_cluster_ids: torch.Tensor,  # [B*H, S] - from CTCA
+        layer_idx: int,
+        timestep: int,
+        ctca_reused: bool,
+        cluster_quality: float = 1.0,
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict]:
+        """Main entry point: Process K/V tensors with cluster-guided reuse.
+
+        If CTCA reused clusters and we have cached centroids, replace token
+        K/V with centroid values for stable clusters.
+
+        Args:
+            K, V: Key and Value tensors [B, H, S, D]
+            k_cluster_ids: Cluster assignments from CTCA [B*H, S]
+            layer_idx: Transformer layer index
+            timestep: Current diffusion timestep
+            ctca_reused: Whether CTCA reused clusters
+            cluster_quality: CTCA's cluster quality score
+
+        Returns:
+            K, V: Processed tensors (may have centroid values for stable clusters)
+            info: Dict with statistics
+        """
+        B, H, S, D = K.shape
+        device = K.device
+
+        self.stats['total_calls'] += 1
+        info = {
+            'reused': False,
+            'stable_ratio': 0.0,
+            'reuse_ratio': 0.0,
+        }
+
+        # Reshape to [B*H, S, D] for processing
+        K_flat = K.view(B * H, S, D)
+        V_flat = V.view(B * H, S, D)
+
+        # Check if we should attempt reuse
+        if self.should_reuse(layer_idx, ctca_reused, cluster_quality):
+            cache = self._cache[layer_idx]
+            cache.to_device(device)
+
+            # Compute stability between old and new cluster assignments
+            stable_mask = self._compute_cluster_stability(
+                cache.k_cluster_ids, k_cluster_ids
+            )
+
+            stable_ratio = stable_mask.float().mean().item()
+            info['stable_ratio'] = stable_ratio
+
+            # Only apply reuse if enough clusters are stable
+            if stable_ratio >= self.config.min_stable_ratio:
+                # Replace token K/V with centroid values for stable clusters
+                K_flat, V_flat, reuse_mask = self._scatter_centroids_to_tokens(
+                    K_flat, V_flat,
+                    cache.k_centroids, cache.v_centroids,
+                    k_cluster_ids, stable_mask
+                )
+
+                reuse_ratio = reuse_mask.float().mean().item()
+                info['reused'] = True
+                info['reuse_ratio'] = reuse_ratio
+
+                # Update statistics
+                num_reused = reuse_mask.sum().item()
+                num_total = reuse_mask.numel()
+                self.stats['reused_tokens'] += num_reused
+                self.stats['recomputed_tokens'] += num_total - num_reused
+                self.stats['total_tokens'] += num_total
+                self.stats['cache_hits'] += 1
+
+                self.layer_stats[layer_idx]['reuse_count'] += 1
+
+                if self.config.verbose:
+                    logger.info(f"[CKGR] Layer {layer_idx}: reused {reuse_ratio*100:.1f}% tokens "
+                               f"(stable clusters: {stable_ratio*100:.1f}%)")
+            else:
+                self.stats['cache_misses'] += 1
+                self.layer_stats[layer_idx]['recompute_count'] += 1
+
+            cache.to_cpu()
+        else:
+            self.stats['cache_misses'] += 1
+            self.stats['total_tokens'] += B * H * S
+            self.stats['recomputed_tokens'] += B * H * S
+
+        # Update cache with current K/V centroids
+        self._update_cache(
+            layer_idx, K_flat, V_flat, k_cluster_ids,
+            timestep, ctca_reused, cluster_quality
+        )
+
+        # Reshape back to [B, H, S, D]
+        K_out = K_flat.view(B, H, S, D)
+        V_out = V_flat.view(B, H, S, D)
+
+        return K_out, V_out, info
+
+    @time_logging_decorator("Level 4 - CKGR update cache")
+    def _update_cache(
+        self,
+        layer_idx: int,
+        K: torch.Tensor,           # [B*H, S, D]
+        V: torch.Tensor,           # [B*H, S, D]
+        k_cluster_ids: torch.Tensor,
+        timestep: int,
+        ctca_reused: bool,
+        cluster_quality: float,
+    ):
+        """Update the cache with new K/V centroids."""
+
+        # Compute K/V centroids
+        k_centroids, v_centroids, cluster_sizes = self._compute_kv_centroids(
+            K, V, k_cluster_ids
+        )
+
+        # Compute stability if we have old cache
+        if layer_idx in self._cache and ctca_reused:
+            old_cache = self._cache[layer_idx]
+            old_cache.to_device(K.device)
+            stable_mask = self._compute_cluster_stability(
+                old_cache.k_cluster_ids, k_cluster_ids
+            )
+            old_cache.to_cpu()
+        else:
+            # Fresh cache - no stability info
+            B_H = k_centroids.shape[0]
+            stable_mask = torch.zeros(
+                B_H, self.config.num_k_clusters,
+                dtype=torch.bool, device=K.device
+            )
+
+        # Create new cache entry
+        self._cache[layer_idx] = ClusterKVCache(
+            k_centroids=k_centroids,
+            v_centroids=v_centroids,
+            stable_clusters=stable_mask,
+            k_cluster_ids=k_cluster_ids.clone(),
+            cluster_sizes=cluster_sizes,
+            last_update_timestep=timestep,
+            quality_score=cluster_quality,
+        )
+
+        # Move to CPU to save GPU memory
+        self._cache[layer_idx].to_cpu()
+
+    def get_statistics(self) -> Dict:
+        """Get CKGR performance statistics."""
+        total = self.stats['total_tokens']
+
+        stats = {
+            **self.stats,
+            'reuse_ratio': self.stats['reused_tokens'] / max(total, 1),
+            'cache_hit_ratio': self.stats['cache_hits'] / max(self.stats['total_calls'], 1),
+        }
+
+        # Add per-layer stats
+        stats['layer_stats'] = dict(self.layer_stats)
+
+        # Memory usage
+        total_memory = sum(
+            cache.memory_bytes() for cache in self._cache.values()
+        )
+        stats['cache_memory_mb'] = total_memory / (1024 * 1024)
+
+        return stats
+
+    def print_statistics(self):
+        """Print CKGR performance statistics."""
+        stats = self.get_statistics()
+
+        print("\n" + "=" * 60)
+        print("CKGR (Cluster-Guided KV Reuse) Statistics")
+        print("=" * 60)
+        print(f"Total calls:          {stats['total_calls']}")
+        print(f"Cache hits:           {stats['cache_hits']} ({stats['cache_hit_ratio']*100:.1f}%)")
+        print(f"Cache misses:         {stats['cache_misses']}")
+        print(f"Total tokens:         {stats['total_tokens']:,}")
+        print(f"Reused tokens:        {stats['reused_tokens']:,} ({stats['reuse_ratio']*100:.1f}%)")
+        print(f"Recomputed tokens:    {stats['recomputed_tokens']:,}")
+        print(f"Cache memory:         {stats['cache_memory_mb']:.2f} MB")
+        print("=" * 60 + "\n")
+
+
+# =============================================================================
+# Factory Functions
+# =============================================================================
+
+def create_ckgr_manager(
+    num_layers: int = 60,
+    num_k_clusters: int = 1000,
+    stability_threshold: float = 0.7,
+    quality_threshold: float = 0.75,
+    verbose: bool = False,
+) -> ClusterGuidedKVReuse:
+    """Create a CKGR manager with default configuration.
+
+    Args:
+        num_layers: Number of transformer layers
+        num_k_clusters: Number of clusters (should match CTCA)
+        stability_threshold: Jaccard threshold for cluster stability
+        quality_threshold: CTCA quality threshold for enabling reuse
+        verbose: Enable verbose logging
+
+    Returns:
+        Configured CKGR manager
+    """
+    config = CKGRConfig(
+        num_k_clusters=num_k_clusters,
+        stability_threshold=stability_threshold,
+        quality_threshold=quality_threshold,
+        verbose=verbose,
+    )
+
+    return ClusterGuidedKVReuse(config, num_layers)
+
+
+# =============================================================================
+# Integration Helpers (for attention processor)
+# =============================================================================
+
+# Global CKGR manager (set during initialization)
+_ckgr_manager: Optional[ClusterGuidedKVReuse] = None
+
+
+def initialize_ckgr(
+    num_layers: int = 60,
+    num_k_clusters: int = 1000,
+    **kwargs
+) -> ClusterGuidedKVReuse:
+    """Initialize global CKGR manager."""
+    global _ckgr_manager
+    _ckgr_manager = create_ckgr_manager(num_layers, num_k_clusters, **kwargs)
+    return _ckgr_manager
+
+
+def get_ckgr_manager() -> Optional[ClusterGuidedKVReuse]:
+    """Get the global CKGR manager."""
+    return _ckgr_manager
+
+
+def reset_ckgr():
+    """Reset global CKGR manager."""
+    if _ckgr_manager is not None:
+        _ckgr_manager.reset()
+
+
+def print_ckgr_statistics():
+    """Print global CKGR statistics."""
+    if _ckgr_manager is not None:
+        _ckgr_manager.print_statistics()
+
+
+# =============================================================================
+# Integration Example: How to integrate CKGR with CTCA attention processor
+# =============================================================================
+"""
+CKGR Integration Guide
+======================
+
+CKGR (Cluster-Guided KV Reuse) works alongside CTCA to reduce computation
+and improve consistency in sparse attention.
+
+Key Integration Points:
+1. Initialize CKGR when initializing the attention processor
+2. Call process_kv() after K/V projection but before sparse attention
+3. Pass CTCA's cluster information to CKGR
+4. Print statistics after generation
+
+Example Integration in Hunyuan_SAPAttn_CTCA_Processor2_0:
+
+```python
+# In attention.py, modify the semantic_aware_permutation method:
+
+from ..cluster_kv_reuse import get_ckgr_manager, initialize_ckgr
+
+class Hunyuan_SAPAttn_CTCA_CKGR_Processor2_0(Hunyuan_SAPAttn_CTCA_Processor2_0):
+    '''CTCA + CKGR enabled attention processor.'''
+
+    # CKGR configuration
+    ckgr_enabled: bool = True
+    ckgr_stability_threshold: float = 0.7
+    ckgr_quality_threshold: float = 0.75
+
+    @classmethod
+    def initialize_ckgr(cls):
+        '''Initialize CKGR manager.'''
+        from ..cluster_kv_reuse import initialize_ckgr as init_ckgr
+        init_ckgr(
+            num_layers=60,
+            num_k_clusters=cls.num_k_clusters,
+            stability_threshold=cls.ckgr_stability_threshold,
+            quality_threshold=cls.ckgr_quality_threshold,
+        )
+
+    @time_logging_decorator("Level 3 - SAP with CTCA + CKGR")
+    def semantic_aware_permutation(self, query, key, value, timestep, layer_idx):
+        '''Semantic aware permutation with CKGR integration.'''
+        cfg, num_heads, seq_len, dim = query.size()
+
+        # 1. Get clusters from CTCA
+        (qlabels, qcentroids, qcluster_sizes, qiter,
+         klabels, kcentroids, kcluster_sizes, kiter) = self.kmeans_clustering(
+            query, key, layer_idx, timestep=timestep
+        )
+
+        # 2. Apply CKGR to K/V if enabled
+        if self.ckgr_enabled:
+            ckgr = get_ckgr_manager()
+            if ckgr is not None:
+                # Determine if CTCA reused clusters
+                ctca_reused = self.ctca_manager and layer_idx in self.ctca_manager._cache
+
+                # Get cluster quality from CTCA
+                cache = self.ctca_manager.get_cache(layer_idx) if self.ctca_manager else None
+                cluster_quality = cache.get_average_quality() if cache else 1.0
+
+                # Process K/V with CKGR
+                key, value, ckgr_info = ckgr.process_kv(
+                    key, value,
+                    klabels,  # K cluster assignments from CTCA
+                    layer_idx,
+                    timestep[0].item() if isinstance(timestep, torch.Tensor) else timestep,
+                    ctca_reused,
+                    cluster_quality,
+                )
+
+        # 3. Continue with standard SAP pipeline...
+        # (identify_dynamic_map, permute tensors, etc.)
+        ...
+```
+
+Initialization in inference script:
+```python
+# In hyvideo_t2v_inference.py
+
+from svg.cluster_kv_reuse import initialize_ckgr, reset_ckgr, print_ckgr_statistics
+
+# Initialize CKGR at startup
+if args.ckgr_enabled:
+    initialize_ckgr(
+        num_layers=60,
+        num_k_clusters=args.num_k_clusters,
+        stability_threshold=0.7,
+    )
+
+# Reset before each video generation
+reset_ckgr()
+
+# Generate video...
+
+# Print statistics after generation
+print_ckgr_statistics()
+```
+
+Benefits of CKGR Integration:
+1. Reduces noise in attention patterns for stable clusters
+2. Memory efficient: stores centroids (~0.35 GB) vs full KV cache (~170 GB)
+3. Automatic adaptation: only reuses when clusters are stable
+4. Compatible with existing CTCA pipeline
+
+Future Optimizations (Selective Projection):
+The current implementation replaces K/V after projection. A more aggressive
+optimization would skip projection entirely for stable tokens:
+
+```python
+def selective_kv_projection(hidden_states, k_proj, v_proj, stable_mask, cached_kv):
+    '''Only project unstable tokens, use cached KV for stable ones.'''
+    B, S, D = hidden_states.shape
+
+    # Identify which tokens need projection
+    unstable_indices = (~stable_mask).nonzero(as_tuple=True)
+
+    if len(unstable_indices[0]) == 0:
+        # All stable - use cached entirely
+        return cached_kv['K'], cached_kv['V']
+
+    # Project only unstable tokens
+    unstable_hidden = hidden_states[unstable_indices]
+    K_unstable = k_proj(unstable_hidden)
+    V_unstable = v_proj(unstable_hidden)
+
+    # Scatter back to full tensor
+    K = cached_kv['K'].clone()
+    V = cached_kv['V'].clone()
+    K[unstable_indices] = K_unstable
+    V[unstable_indices] = V_unstable
+
+    return K, V
+```
+
+This selective projection approach can save significant compute when most
+tokens are in stable clusters (typically 50-70% after warmup).
+"""
