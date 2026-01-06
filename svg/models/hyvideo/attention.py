@@ -949,14 +949,14 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
 
         initialize_ckgr(
             num_layers=60,  # HunyuanVideo has 60 layers
-            num_k_clusters=cls.num_k_clusters,
+            num_k_clusters=cls.num_k_centroids,  # Use num_k_centroids (SAP naming)
             stability_threshold=cls.ckgr_stability_threshold,
             quality_threshold=cls.ckgr_quality_threshold,
             verbose=cls.ckgr_verbose,
         )
 
         logger.info(f"{Color.green}CKGR initialized: "
-                    f"K clusters={cls.num_k_clusters}, "
+                    f"K clusters={cls.num_k_centroids}, "
                     f"stability_threshold={cls.ckgr_stability_threshold}, "
                     f"quality_threshold={cls.ckgr_quality_threshold}{Color.reset}")
 
