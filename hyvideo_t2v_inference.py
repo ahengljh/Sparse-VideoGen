@@ -19,8 +19,10 @@ from svg.models.hyvideo.inference import (
     replace_hyvideo_attention,
     print_ctca_statistics,
     print_ctaa_statistics,
+    print_ckgr_statistics,
     reset_ctca,
     reset_ctaa_statistics,
+    reset_ckgr,
 )
 from svg.models.hyvideo.utils import get_prompt_length
 from svg.offload import enable_offloading, pre_encode_and_offload, OffloadConfig
@@ -73,6 +75,12 @@ if __name__ == "__main__":
     parser.add_argument("--ctca_min_interval", type=int, default=2, help="Minimum timesteps between re-clustering.")
     parser.add_argument("--ctca_max_interval", type=int, default=10, help="Maximum timesteps to reuse clusters before forced refresh.")
     parser.add_argument("--ctca_verbose", action="store_true", help="Enable verbose CTCA logging.")
+
+    # CKGR (Cluster-Guided KV Reuse) specific - only for SAP_CTCA pattern
+    parser.add_argument("--ckgr_enabled", action="store_true", help="Enable Cluster-Guided KV Reuse for stable clusters.")
+    parser.add_argument("--ckgr_stability_threshold", type=float, default=0.7, help="Jaccard threshold for cluster stability (0-1). Higher = stricter stability requirement.")
+    parser.add_argument("--ckgr_quality_threshold", type=float, default=0.75, help="CTCA quality threshold for enabling KV reuse (0-1).")
+    parser.add_argument("--ckgr_verbose", action="store_true", help="Enable verbose CKGR logging.")
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
@@ -314,6 +322,11 @@ if __name__ == "__main__":
             ctca_min_interval=args.ctca_min_interval,
             ctca_max_interval=args.ctca_max_interval,
             ctca_verbose=args.ctca_verbose,
+            # CKGR specific
+            ckgr_enabled=args.ckgr_enabled,
+            ckgr_stability_threshold=args.ckgr_stability_threshold,
+            ckgr_quality_threshold=args.ckgr_quality_threshold,
+            ckgr_verbose=args.ckgr_verbose,
         )
     else:
         assert args.pattern == "dense", f"Invalid pattern: {args.pattern}"
@@ -327,8 +340,10 @@ if __name__ == "__main__":
     #########################################################
     # Generate the video
     #########################################################
-    # Reset CTAA statistics for fresh tracking
+    # Reset statistics for fresh tracking
     reset_ctaa_statistics()
+    if args.pattern == "SAP_CTCA" and args.ckgr_enabled:
+        reset_ckgr()
 
     if pre_encoded_embeds is not None:
         # Use pre-computed embeddings (offload mode)
@@ -363,10 +378,12 @@ if __name__ == "__main__":
 
     export_to_video(output, args.output_file, fps=24)
 
-    # Print CTCA and CTAA statistics if using SAP_CTCA pattern
+    # Print CTCA, CTAA, and CKGR statistics if using SAP_CTCA pattern
     if args.pattern == "SAP_CTCA":
         print_ctca_statistics()
         print_ctaa_statistics()
+        if args.ckgr_enabled:
+            print_ckgr_statistics()
 
     # Print offloading statistics if enabled
     if offload_manager is not None:

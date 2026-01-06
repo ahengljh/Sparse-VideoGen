@@ -87,6 +87,15 @@ from ...kmeans_utils import (
     reset_ctaa_statistics,
 )
 from ...ctca import CrossTimestepClusterAmortization, CTCAConfig, create_ctca
+from ...cluster_kv_reuse import (
+    ClusterGuidedKVReuse,
+    CKGRConfig,
+    create_ckgr_manager,
+    initialize_ckgr,
+    get_ckgr_manager,
+    reset_ckgr,
+    print_ckgr_statistics,
+)
 from ...logger import logger
 from ...timer import time_logging_decorator
 from ...utils.misc import Color
@@ -924,6 +933,43 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
     ctaa_p_full: float = 0.7    # Top-p for full token attention
     ctaa_p_total: float = 0.95  # Top-p including centroid attention
 
+    # CKGR configuration (Cluster-Guided KV Reuse)
+    ckgr_enabled: bool = False  # Enable KV reuse based on cluster stability
+    ckgr_stability_threshold: float = 0.7  # Jaccard threshold for cluster stability
+    ckgr_quality_threshold: float = 0.75   # CTCA quality threshold for enabling reuse
+    ckgr_verbose: bool = False
+
+    @classmethod
+    def initialize_ckgr(cls):
+        """
+        Initialize the CKGR manager. Call this when ckgr_enabled is True.
+        """
+        if not cls.ckgr_enabled:
+            return
+
+        initialize_ckgr(
+            num_layers=60,  # HunyuanVideo has 60 layers
+            num_k_clusters=cls.num_k_clusters,
+            stability_threshold=cls.ckgr_stability_threshold,
+            quality_threshold=cls.ckgr_quality_threshold,
+            verbose=cls.ckgr_verbose,
+        )
+
+        logger.info(f"{Color.green}CKGR initialized: "
+                    f"K clusters={cls.num_k_clusters}, "
+                    f"stability_threshold={cls.ckgr_stability_threshold}, "
+                    f"quality_threshold={cls.ckgr_quality_threshold}{Color.reset}")
+
+    @classmethod
+    def reset_ckgr(cls):
+        """Reset CKGR state. Call at the start of each new video generation."""
+        reset_ckgr()
+
+    @classmethod
+    def print_ckgr_statistics(cls):
+        """Print CKGR performance statistics."""
+        print_ckgr_statistics()
+
     @classmethod
     def initialize_ctca(cls):
         """
@@ -1030,6 +1076,7 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         """
         Override to pass timestep to kmeans_clustering for CTCA.
         Supports CTAA hierarchical attention when enabled.
+        Supports CKGR cluster-guided KV reuse when enabled.
         """
         cfg, num_heads, seq_len, dim = query.size()
 
@@ -1037,6 +1084,37 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter = self.kmeans_clustering(
             query, key, layer_idx, timestep=timestep
         )
+
+        # 1.5. Apply CKGR (Cluster-Guided KV Reuse) if enabled
+        if self.ckgr_enabled:
+            ckgr = get_ckgr_manager()
+            if ckgr is not None:
+                # Determine if CTCA reused clusters (vs full recluster)
+                ctca_reused = False
+                cluster_quality = 1.0
+                if self.ctca_manager is not None:
+                    cache = self.ctca_manager.get_cache(layer_idx)
+                    if cache is not None:
+                        # Check if this was a reuse (update_only) vs full recluster
+                        # by examining the stats - a hack but works
+                        ctca_reused = cache.calls_since_full_cluster > 0
+                        cluster_quality = cache.get_average_quality()
+
+                # Get timestep value
+                if isinstance(timestep, torch.Tensor):
+                    timestep_val = timestep[0].item() if timestep.numel() > 0 else timestep.item()
+                else:
+                    timestep_val = timestep
+
+                # Process K/V with CKGR - replaces stable cluster tokens with centroids
+                key, value, ckgr_info = ckgr.process_kv(
+                    key, value,
+                    klabels,  # K cluster assignments from CTCA
+                    layer_idx,
+                    timestep_val,
+                    ctca_reused,
+                    cluster_quality,
+                )
 
         # 2. Identify dynamic map
         q_cluster_sizes = qcluster_sizes.view(cfg, num_heads, self.num_q_centroids)

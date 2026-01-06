@@ -59,6 +59,11 @@ def replace_hyvideo_attention(
     ctca_min_interval=2,
     ctca_max_interval=10,
     ctca_verbose=False,
+    # CKGR (Cluster-Guided KV Reuse) specific args
+    ckgr_enabled=False,
+    ckgr_stability_threshold=0.7,
+    ckgr_quality_threshold=0.75,
+    ckgr_verbose=False,
 ):
 
     cfg_size, num_head, head_dim, dtype, device = 1, 24, 128, torch.bfloat16, "cuda"
@@ -215,8 +220,18 @@ def replace_hyvideo_attention(
         AttnModule.ctca_max_interval = ctca_max_interval
         AttnModule.ctca_verbose = ctca_verbose
 
+        # CKGR-specific configuration
+        AttnModule.ckgr_enabled = ckgr_enabled
+        AttnModule.ckgr_stability_threshold = ckgr_stability_threshold
+        AttnModule.ckgr_quality_threshold = ckgr_quality_threshold
+        AttnModule.ckgr_verbose = ckgr_verbose
+
         # Initialize CTCA manager (shared across all layers)
         AttnModule.initialize_ctca()
+
+        # Initialize CKGR manager if enabled
+        if ckgr_enabled:
+            AttnModule.initialize_ckgr()
 
         replace_sparse_forward()
 
@@ -267,3 +282,14 @@ def reset_ctaa_statistics():
     """Reset CTAA statistics for a new video generation."""
     from ...kmeans_utils import reset_ctaa_statistics as _reset_ctaa_statistics
     _reset_ctaa_statistics()
+
+
+# CKGR (Cluster-Guided KV Reuse) helper functions
+def reset_ckgr():
+    """Reset CKGR state for a new video generation."""
+    Hunyuan_SAPAttn_CTCA_Processor2_0.reset_ckgr()
+
+
+def print_ckgr_statistics():
+    """Print CKGR performance statistics."""
+    Hunyuan_SAPAttn_CTCA_Processor2_0.print_ckgr_statistics()
