@@ -252,6 +252,15 @@ class CKGRConfig:
     # Quality threshold for CTCA cluster quality
     quality_threshold: float = 0.75
 
+    # Which projections to reuse
+    # Reusing V is typically safer for quality than reusing K
+    reuse_k: bool = False
+    reuse_v: bool = True
+
+    # Minimum fraction of heads that must agree on reuse for a token
+    # 1.0 = all heads, 0.5 = majority vote
+    min_head_reuse_ratio: float = 1.0
+
     # Whether to use Triton kernels (faster) or PyTorch fallback
     use_triton: bool = True
 
@@ -321,6 +330,10 @@ class ClusterGuidedKVReuse:
         self.stats = {k: 0 for k in self.stats}
         self.layer_stats.clear()
         logger.info("[CKGR] Cache and statistics reset")
+
+    def get_cache(self, layer_idx: int) -> Optional[ClusterKVCache]:
+        """Get cached centroids and cluster assignments for a layer."""
+        return self._cache.get(layer_idx)
 
     @time_logging_decorator("Level 4 - CKGR compute KV centroids")
     def _compute_kv_centroids_triton(
@@ -535,6 +548,42 @@ class ClusterGuidedKVReuse:
 
         return K, V, reuse_mask
 
+    @time_logging_decorator("Level 4 - CKGR scatter centroids single")
+    def _scatter_centroids_to_tokens_single(
+        self,
+        X: torch.Tensor,           # [B*H, S, D] - output tensor (modified in place)
+        centroids: torch.Tensor,   # [B*H, K, D]
+        cluster_ids: torch.Tensor, # [B*H, S]
+        stable_mask: torch.Tensor, # [B*H, K]
+        reuse_mask_override: Optional[torch.Tensor] = None,  # [B*H, S]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Replace token values with centroid values for stable clusters."""
+        B_H, S, D = X.shape
+        num_clusters = self.config.num_k_clusters
+
+        # Token-level reuse mask
+        reuse_mask = torch.gather(stable_mask, 1, cluster_ids.long().clamp(0, num_clusters - 1))
+        if reuse_mask_override is not None:
+            reuse_mask = reuse_mask & reuse_mask_override
+
+        if not reuse_mask.any():
+            return X, reuse_mask
+
+        if self.config.use_triton and X.is_cuda:
+            grid = (B_H * S,)
+            BLOCK_D = 128
+            _scatter_centroids_to_tokens_kernel[grid](
+                centroids, cluster_ids.to(torch.int32), X, stable_mask,
+                B_H, S, D, num_clusters, BLOCK_D
+            )
+        else:
+            cluster_ids_expanded = cluster_ids.unsqueeze(-1).expand(-1, -1, D).long().clamp(0, num_clusters - 1)
+            from_centroids = torch.gather(centroids, 1, cluster_ids_expanded)
+            reuse_mask_expanded = reuse_mask.unsqueeze(-1)  # [B*H, S, 1]
+            X = torch.where(reuse_mask_expanded, from_centroids, X)
+
+        return X, reuse_mask
+
     def should_reuse(
         self,
         layer_idx: int,
@@ -565,6 +614,120 @@ class ClusterGuidedKVReuse:
 
         return True
 
+    def compute_reuse_masks(
+        self,
+        layer_idx: int,
+        k_cluster_ids: torch.Tensor,
+        ctca_reused: bool,
+        cluster_quality: float = 1.0,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict, Optional[ClusterKVCache]]:
+        """Compute cluster-level and token-level reuse masks.
+
+        Returns:
+            stable_mask: [B*H, K] or None
+            reuse_mask: [B*H, S] or None
+            info: Dict with reuse metadata
+            cache: ClusterKVCache moved to device, or None
+        """
+        info = {
+            'reused': False,
+            'stable_ratio': 0.0,
+            'reuse_ratio': 0.0,
+        }
+
+        # If reuse is disabled entirely, skip
+        if not (self.config.reuse_k or self.config.reuse_v):
+            return None, None, info, None
+
+        # Check if we should attempt reuse
+        if not self.should_reuse(layer_idx, ctca_reused, cluster_quality):
+            return None, None, info, None
+
+        cache = self._cache[layer_idx]
+        cache.to_device(k_cluster_ids.device)
+
+        # Compute stability between old and new cluster assignments
+        stable_mask = self._compute_cluster_stability(
+            cache.k_cluster_ids, k_cluster_ids
+        )
+
+        stable_ratio = stable_mask.float().mean().item()
+        info['stable_ratio'] = stable_ratio
+
+        # Only apply reuse if enough clusters are stable
+        if stable_ratio < self.config.min_stable_ratio:
+            return stable_mask, None, info, cache
+
+        reuse_mask = torch.gather(
+            stable_mask,
+            1,
+            k_cluster_ids.long().clamp(0, self.config.num_k_clusters - 1)
+        )
+
+        reuse_ratio = reuse_mask.float().mean().item()
+        info['reused'] = True
+        info['reuse_ratio'] = reuse_ratio
+
+        return stable_mask, reuse_mask, info, cache
+
+    def reduce_reuse_mask(
+        self,
+        reuse_mask: Optional[torch.Tensor],
+        batch_size: int,
+        num_heads: int,
+    ) -> Optional[torch.Tensor]:
+        """Reduce per-head reuse mask to token-level mask."""
+        if reuse_mask is None:
+            return None
+
+        reuse_mask = reuse_mask.view(batch_size, num_heads, -1)
+
+        if self.config.min_head_reuse_ratio >= 1.0:
+            return reuse_mask.all(dim=1)
+
+        head_ratio = reuse_mask.float().mean(dim=1)
+        return head_ratio >= self.config.min_head_reuse_ratio
+
+    def record_reuse(
+        self,
+        layer_idx: int,
+        reuse_mask: Optional[torch.Tensor],
+        total_tokens: int,
+        reused: bool,
+    ):
+        """Update CKGR statistics for a call."""
+        self.stats['total_calls'] += 1
+
+        if reused and reuse_mask is not None:
+            num_reused = reuse_mask.sum().item()
+            num_total = reuse_mask.numel()
+            self.stats['reused_tokens'] += num_reused
+            self.stats['recomputed_tokens'] += num_total - num_reused
+            self.stats['total_tokens'] += num_total
+            self.stats['cache_hits'] += 1
+            self.layer_stats[layer_idx]['reuse_count'] += 1
+        else:
+            self.stats['cache_misses'] += 1
+            self.stats['total_tokens'] += total_tokens
+            self.stats['recomputed_tokens'] += total_tokens
+            self.layer_stats[layer_idx]['recompute_count'] += 1
+
+    def update_cache(
+        self,
+        layer_idx: int,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        k_cluster_ids: torch.Tensor,
+        timestep: int,
+        ctca_reused: bool,
+        cluster_quality: float,
+    ):
+        """Public wrapper to update CKGR cache."""
+        self._update_cache(
+            layer_idx, K, V, k_cluster_ids,
+            timestep, ctca_reused, cluster_quality
+        )
+
     @time_logging_decorator("Level 3 - CKGR process KV")
     def process_kv(
         self,
@@ -594,9 +757,6 @@ class ClusterGuidedKVReuse:
             info: Dict with statistics
         """
         B, H, S, D = K.shape
-        device = K.device
-
-        self.stats['total_calls'] += 1
         info = {
             'reused': False,
             'stable_ratio': 0.0,
@@ -607,57 +767,36 @@ class ClusterGuidedKVReuse:
         K_flat = K.view(B * H, S, D)
         V_flat = V.view(B * H, S, D)
 
-        # Check if we should attempt reuse
-        if self.should_reuse(layer_idx, ctca_reused, cluster_quality):
-            cache = self._cache[layer_idx]
-            cache.to_device(device)
+        # Compute reuse masks
+        stable_mask, reuse_mask, reuse_info, cache = self.compute_reuse_masks(
+            layer_idx, k_cluster_ids, ctca_reused, cluster_quality
+        )
+        info.update(reuse_info)
 
-            # Compute stability between old and new cluster assignments
-            stable_mask = self._compute_cluster_stability(
-                cache.k_cluster_ids, k_cluster_ids
-            )
-
-            stable_ratio = stable_mask.float().mean().item()
-            info['stable_ratio'] = stable_ratio
-
-            # Only apply reuse if enough clusters are stable
-            if stable_ratio >= self.config.min_stable_ratio:
-                # Replace token K/V with centroid values for stable clusters
-                K_flat, V_flat, reuse_mask = self._scatter_centroids_to_tokens(
-                    K_flat, V_flat,
-                    cache.k_centroids, cache.v_centroids,
-                    k_cluster_ids, stable_mask
+        # Apply reuse if enabled and masks available
+        if info['reused'] and reuse_mask is not None and stable_mask is not None and cache is not None:
+            if self.config.reuse_k:
+                K_flat, _ = self._scatter_centroids_to_tokens_single(
+                    K_flat, cache.k_centroids, k_cluster_ids, stable_mask
+                )
+            if self.config.reuse_v:
+                V_flat, _ = self._scatter_centroids_to_tokens_single(
+                    V_flat, cache.v_centroids, k_cluster_ids, stable_mask
                 )
 
-                reuse_ratio = reuse_mask.float().mean().item()
-                info['reused'] = True
-                info['reuse_ratio'] = reuse_ratio
+            if self.config.verbose:
+                logger.info(f"[CKGR] Layer {layer_idx}: reused {info['reuse_ratio']*100:.1f}% tokens "
+                           f"(stable clusters: {info['stable_ratio']*100:.1f}%)")
 
-                # Update statistics
-                num_reused = reuse_mask.sum().item()
-                num_total = reuse_mask.numel()
-                self.stats['reused_tokens'] += num_reused
-                self.stats['recomputed_tokens'] += num_total - num_reused
-                self.stats['total_tokens'] += num_total
-                self.stats['cache_hits'] += 1
+        # Update statistics
+        total_tokens = B * H * S
+        self.record_reuse(layer_idx, reuse_mask, total_tokens, info['reused'])
 
-                self.layer_stats[layer_idx]['reuse_count'] += 1
-
-                if self.config.verbose:
-                    logger.info(f"[CKGR] Layer {layer_idx}: reused {reuse_ratio*100:.1f}% tokens "
-                               f"(stable clusters: {stable_ratio*100:.1f}%)")
-            else:
-                self.stats['cache_misses'] += 1
-                self.layer_stats[layer_idx]['recompute_count'] += 1
-
+        if cache is not None:
             cache.to_cpu()
-        else:
-            self.stats['cache_misses'] += 1
-            self.stats['total_tokens'] += B * H * S
-            self.stats['recomputed_tokens'] += B * H * S
 
         # Update cache with current K/V centroids
-        self._update_cache(
+        self.update_cache(
             layer_idx, K_flat, V_flat, k_cluster_ids,
             timestep, ctca_reused, cluster_quality
         )
@@ -763,6 +902,9 @@ def create_ckgr_manager(
     num_k_clusters: int = 1000,
     stability_threshold: float = 0.7,
     quality_threshold: float = 0.75,
+    reuse_k: bool = False,
+    reuse_v: bool = True,
+    min_head_reuse_ratio: float = 1.0,
     verbose: bool = False,
 ) -> ClusterGuidedKVReuse:
     """Create a CKGR manager with default configuration.
@@ -772,6 +914,9 @@ def create_ckgr_manager(
         num_k_clusters: Number of clusters (should match CTCA)
         stability_threshold: Jaccard threshold for cluster stability
         quality_threshold: CTCA quality threshold for enabling reuse
+        reuse_k: Whether to reuse K via cached centroids
+        reuse_v: Whether to reuse V via cached centroids
+        min_head_reuse_ratio: Token reuse threshold across heads
         verbose: Enable verbose logging
 
     Returns:
@@ -781,6 +926,9 @@ def create_ckgr_manager(
         num_k_clusters=num_k_clusters,
         stability_threshold=stability_threshold,
         quality_threshold=quality_threshold,
+        reuse_k=reuse_k,
+        reuse_v=reuse_v,
+        min_head_reuse_ratio=min_head_reuse_ratio,
         verbose=verbose,
     )
 

@@ -64,6 +64,9 @@ def replace_hyvideo_attention(
     ckgr_stability_threshold=0.7,
     ckgr_quality_threshold=0.75,
     ckgr_verbose=False,
+    ckgr_reuse_k=False,
+    ckgr_reuse_v=True,
+    ckgr_min_head_reuse_ratio=1.0,
 ):
 
     cfg_size, num_head, head_dim, dtype, device = 1, 24, 128, torch.bfloat16, "cuda"
@@ -225,6 +228,9 @@ def replace_hyvideo_attention(
         AttnModule.ckgr_stability_threshold = ckgr_stability_threshold
         AttnModule.ckgr_quality_threshold = ckgr_quality_threshold
         AttnModule.ckgr_verbose = ckgr_verbose
+        AttnModule.ckgr_reuse_k = ckgr_reuse_k
+        AttnModule.ckgr_reuse_v = ckgr_reuse_v
+        AttnModule.ckgr_min_head_reuse_ratio = ckgr_min_head_reuse_ratio
 
         # Initialize CTCA manager (shared across all layers)
         AttnModule.initialize_ctca()

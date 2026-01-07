@@ -81,6 +81,11 @@ if __name__ == "__main__":
     parser.add_argument("--ckgr_stability_threshold", type=float, default=0.7, help="Jaccard threshold for cluster stability (0-1). Higher = stricter stability requirement.")
     parser.add_argument("--ckgr_quality_threshold", type=float, default=0.75, help="CTCA quality threshold for enabling KV reuse (0-1).")
     parser.add_argument("--ckgr_verbose", action="store_true", help="Enable verbose CKGR logging.")
+    parser.add_argument("--ckgr_reuse_k", action="store_true", help="Reuse K centroids (may reduce quality).")
+    parser.add_argument("--ckgr_reuse_v", action="store_true", default=True, help="Reuse V centroids (default on).")
+    parser.add_argument("--ckgr_no_reuse_v", action="store_false", dest="ckgr_reuse_v", help="Disable V reuse.")
+    parser.add_argument("--ckgr_min_head_reuse_ratio", type=float, default=1.0,
+                        help="Minimum fraction of heads that must agree to skip V projection.")
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
@@ -327,6 +332,9 @@ if __name__ == "__main__":
             ckgr_stability_threshold=args.ckgr_stability_threshold,
             ckgr_quality_threshold=args.ckgr_quality_threshold,
             ckgr_verbose=args.ckgr_verbose,
+            ckgr_reuse_k=args.ckgr_reuse_k,
+            ckgr_reuse_v=args.ckgr_reuse_v,
+            ckgr_min_head_reuse_ratio=args.ckgr_min_head_reuse_ratio,
         )
     else:
         assert args.pattern == "dense", f"Invalid pattern: {args.pattern}"

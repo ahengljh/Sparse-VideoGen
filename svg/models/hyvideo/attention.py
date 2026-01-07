@@ -938,6 +938,9 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
     ckgr_stability_threshold: float = 0.7  # Jaccard threshold for cluster stability
     ckgr_quality_threshold: float = 0.75   # CTCA quality threshold for enabling reuse
     ckgr_verbose: bool = False
+    ckgr_reuse_k: bool = False
+    ckgr_reuse_v: bool = True
+    ckgr_min_head_reuse_ratio: float = 1.0
 
     @classmethod
     def initialize_ckgr(cls):
@@ -952,13 +955,18 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
             num_k_clusters=cls.num_k_centroids,  # Use num_k_centroids (SAP naming)
             stability_threshold=cls.ckgr_stability_threshold,
             quality_threshold=cls.ckgr_quality_threshold,
+            reuse_k=cls.ckgr_reuse_k,
+            reuse_v=cls.ckgr_reuse_v,
+            min_head_reuse_ratio=cls.ckgr_min_head_reuse_ratio,
             verbose=cls.ckgr_verbose,
         )
 
         logger.info(f"{Color.green}CKGR initialized: "
                     f"K clusters={cls.num_k_centroids}, "
                     f"stability_threshold={cls.ckgr_stability_threshold}, "
-                    f"quality_threshold={cls.ckgr_quality_threshold}{Color.reset}")
+                    f"quality_threshold={cls.ckgr_quality_threshold}, "
+                    f"reuse_k={cls.ckgr_reuse_k}, reuse_v={cls.ckgr_reuse_v}, "
+                    f"min_head_reuse_ratio={cls.ckgr_min_head_reuse_ratio}{Color.reset}")
 
     @classmethod
     def reset_ckgr(cls):
@@ -1054,6 +1062,14 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         else:
             timestep_val = timestep
 
+        # Use cached clusters if CKGR precomputed them
+        if self.ckgr_enabled:
+            cached = getattr(self, "_ckgr_cached_clusters", None)
+            if cached is not None:
+                if cached.get("layer_idx") == layer_idx and cached.get("timestep") == timestep_val:
+                    self._ckgr_cached_clusters = None
+                    return cached["clusters"]
+
         # Use CTCA to get clusters (may reuse cached assignments)
         (q_cluster_ids, q_centroids, q_cluster_sizes,
          k_cluster_ids, k_centroids, k_cluster_sizes) = self.ctca_manager.get_clusters(
@@ -1086,7 +1102,7 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         )
 
         # 1.5. Apply CKGR (Cluster-Guided KV Reuse) if enabled
-        if self.ckgr_enabled:
+        if self.ckgr_enabled and not getattr(self, "_ckgr_skip_semantic", False):
             ckgr = get_ckgr_manager()
             if ckgr is not None:
                 # Determine if CTCA reused clusters (vs full recluster)
@@ -1158,6 +1174,210 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         v_permuted, _ = permute_tensor_by_labels_triton(value, klabels, dim=2, sorted_indices=k_sorted_indices)
 
         return q_permuted, k_permuted, v_permuted, dynamic_map, q_cluster_sizes, k_cluster_sizes, q_sorted_indices
+
+    def _project_value_selective(self, attn, hidden_states, reuse_mask_tokens):
+        """Project values only for tokens not marked for reuse."""
+        if reuse_mask_tokens is None or not reuse_mask_tokens.any():
+            return attn.to_v(hidden_states)
+
+        batch_size, seq_len, dim = hidden_states.shape
+        flat_hidden = hidden_states.reshape(batch_size * seq_len, dim)
+        flat_mask = reuse_mask_tokens.reshape(batch_size * seq_len)
+
+        out_dim = attn.to_v.out_features
+        value = torch.zeros(
+            batch_size * seq_len,
+            out_dim,
+            device=hidden_states.device,
+            dtype=attn.to_v.weight.dtype,
+        )
+
+        if (~flat_mask).any():
+            projected = attn.to_v(flat_hidden[~flat_mask])
+            value[~flat_mask] = projected
+
+        return value.view(batch_size, seq_len, out_dim)
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        timestep: Optional[int] = None,
+    ) -> torch.Tensor:
+        if not self.ckgr_enabled:
+            return super().__call__(
+                attn,
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                image_rotary_emb=image_rotary_emb,
+                timestep=timestep,
+            )
+
+        ckgr = get_ckgr_manager()
+        if ckgr is None:
+            return super().__call__(
+                attn,
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                image_rotary_emb=image_rotary_emb,
+                timestep=timestep,
+            )
+
+        self._ckgr_cached_clusters = None
+
+        # Determine if we are in full attention mode
+        timestep_val = None
+        if isinstance(timestep, torch.Tensor):
+            timestep_val = timestep[0].item() if timestep.numel() > 0 else timestep.item()
+        elif timestep is not None:
+            timestep_val = timestep
+
+        full_attention_flag = False
+        if self.layer_idx < (self.first_layers_fp or 0):
+            full_attention_flag = True
+        if timestep_val is not None and timestep_val > (self.first_times_fp or 0):
+            full_attention_flag = True
+
+        if full_attention_flag:
+            return super().__call__(
+                attn,
+                hidden_states,
+                encoder_hidden_states=encoder_hidden_states,
+                attention_mask=attention_mask,
+                image_rotary_emb=image_rotary_emb,
+                timestep=timestep,
+            )
+
+        if attn.add_q_proj is None and encoder_hidden_states is not None:
+            hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+
+        # 1. QK projections
+        query = attn.to_q(hidden_states)
+        key = attn.to_k(hidden_states)
+
+        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
+        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
+
+        # 2. QK normalization
+        query, key = self.get_qk_norm(attn, query, key)
+
+        # 3. Rotary embeddings
+        query, key = self.get_rotary_emb(attn, query, key, image_rotary_emb, encoder_hidden_states)
+
+        cfg, num_heads, seq_len, dim = query.size()
+        video_length = self.num_frame * self.frame_size
+
+        # 4. Precompute clusters (used for CKGR and cached for SAP)
+        qlabels, qcentroids, qcluster_sizes, qiter, klabels, kcentroids, kcluster_sizes, kiter = self.kmeans_clustering(
+            query[:, :, :video_length, :].contiguous(),
+            key[:, :, :video_length, :].contiguous(),
+            self.layer_idx,
+            timestep=timestep,
+        )
+
+        if timestep_val is None:
+            if isinstance(timestep, torch.Tensor):
+                timestep_val = timestep[0].item() if timestep.numel() > 0 else timestep.item()
+            else:
+                timestep_val = timestep
+        if timestep_val is None:
+            timestep_val = -1
+
+        self._ckgr_cached_clusters = {
+            "layer_idx": self.layer_idx,
+            "timestep": timestep_val,
+            "clusters": (qlabels, qcentroids, qcluster_sizes, qiter,
+                         klabels, kcentroids, kcluster_sizes, kiter),
+        }
+
+        # 5. CKGR reuse decision
+        ctca_reused = False
+        cluster_quality = 1.0
+        if self.ctca_manager is not None:
+            cache = self.ctca_manager.get_cache(self.layer_idx)
+            if cache is not None:
+                ctca_reused = cache.calls_since_full_cluster > 0
+                cluster_quality = cache.get_average_quality()
+
+        stable_mask, reuse_mask, ckgr_info, ckgr_cache = ckgr.compute_reuse_masks(
+            self.layer_idx, klabels, ctca_reused, cluster_quality
+        )
+
+        token_reuse_mask = ckgr.reduce_reuse_mask(reuse_mask, cfg, num_heads)
+        reuse_mask_tokens = None
+        if token_reuse_mask is not None and token_reuse_mask.any():
+            reuse_mask_tokens = torch.zeros(cfg, seq_len, dtype=torch.bool, device=query.device)
+            reuse_mask_tokens[:, :video_length] = token_reuse_mask
+        effective_reuse = ckgr_info['reused'] and token_reuse_mask is not None and token_reuse_mask.any()
+        ckgr_info['reused'] = effective_reuse
+
+        # 6. Value projection (selective if reuse applies)
+        value = self._project_value_selective(attn, hidden_states, reuse_mask_tokens)
+        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
+
+        # 7. Apply cached centroids for stable clusters (video tokens only)
+        reuse_mask_override = None
+        reuse_mask_effective = None
+        if effective_reuse:
+            reuse_mask_override = token_reuse_mask.unsqueeze(1).expand(-1, num_heads, -1)
+            reuse_mask_override = reuse_mask_override.reshape(cfg * num_heads, video_length)
+
+            reuse_mask_effective = reuse_mask & reuse_mask_override
+            ckgr_info['reuse_ratio'] = reuse_mask_effective.float().mean().item()
+
+        if effective_reuse and stable_mask is not None and ckgr_cache is not None:
+            if ckgr.config.reuse_k:
+                key_video = key[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim)
+                key_video, _ = ckgr._scatter_centroids_to_tokens_single(
+                    key_video, ckgr_cache.k_centroids, klabels, stable_mask,
+                    reuse_mask_override=reuse_mask_override,
+                )
+                key[:, :, :video_length, :] = key_video.view(cfg, num_heads, video_length, dim)
+            if ckgr.config.reuse_v:
+                value_video = value[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim)
+                value_video, _ = ckgr._scatter_centroids_to_tokens_single(
+                    value_video, ckgr_cache.v_centroids, klabels, stable_mask,
+                    reuse_mask_override=reuse_mask_override,
+                )
+                value[:, :, :video_length, :] = value_video.view(cfg, num_heads, video_length, dim)
+
+        # 8. Update CKGR stats and cache
+        total_tokens = cfg * num_heads * video_length
+        ckgr.record_reuse(self.layer_idx, reuse_mask_effective, total_tokens, effective_reuse)
+        ckgr.update_cache(
+            self.layer_idx,
+            key[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim),
+            value[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim),
+            klabels,
+            timestep_val,
+            ctca_reused,
+            cluster_quality,
+        )
+
+        if ckgr_cache is not None:
+            ckgr_cache.to_cpu()
+
+        # 9. Encoder condition and attention
+        query, key, value = self.get_encoder_condition_and_concat(attn, query, key, value, encoder_hidden_states)
+
+        cu_max_seqlens = self.get_cu_max_seqlen(attention_mask, query.device)
+        self._ckgr_skip_semantic = True
+        try:
+            hidden_states = self.attention_core_logic(query, key, value, timestep, self.layer_idx, cu_max_seqlens)
+        finally:
+            self._ckgr_skip_semantic = False
+
+        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        hidden_states = hidden_states.to(query.dtype)
+
+        hidden_states, encoder_hidden_states = self.get_o(attn, hidden_states, encoder_hidden_states)
+
+        return hidden_states, encoder_hidden_states
 
     @time_logging_decorator("Level 2 - attention core logic with CTCA")
     def attention_core_logic(self, query, key, value, timestep, layer_idx, cu_max_seqlens):
