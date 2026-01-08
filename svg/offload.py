@@ -595,25 +595,51 @@ class TextEncoderOffloadManager:
         initial_gpu_mem = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
         logger.info(f"GPU memory before encoding: {initial_gpu_mem:.2f}GB")
 
-        # Move text encoders to GPU for fast encoding
-        logger.info("Moving text encoders to GPU for encoding...")
-        for name, encoder in self._text_encoders.items():
-            encoder.to(device)
+        def _move_text_encoders(target_device: str):
+            for name, encoder in self._text_encoders.items():
+                encoder.to(target_device)
 
-        gpu_after_load = torch.cuda.memory_allocated() / 1024**3
-        logger.info(f"GPU memory after loading encoders: {gpu_after_load:.2f}GB")
+        def _encode_on_device(target_device: str, target_dtype: torch.dtype):
+            with torch.no_grad():
+                return self.pipe.encode_prompt(
+                    prompt=prompt,
+                    prompt_2=prompt_2,
+                    device=target_device,
+                    dtype=target_dtype,
+                    num_videos_per_prompt=num_videos_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                )
 
-        # Encode on GPU (fast!)
-        logger.info("Encoding prompt on GPU...")
-        with torch.no_grad():
-            prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.pipe.encode_prompt(
-                prompt=prompt,
-                prompt_2=prompt_2,
-                device=device,
-                dtype=dtype,
-                num_videos_per_prompt=num_videos_per_prompt,
-                max_sequence_length=max_sequence_length,
-            )
+        device_str = str(device)
+        encoded_on_gpu = False
+        if device_str.startswith("cuda"):
+            try:
+                # Move text encoders to GPU for fast encoding
+                logger.info("Moving text encoders to GPU for encoding...")
+                _move_text_encoders(device)
+
+                gpu_after_load = torch.cuda.memory_allocated() / 1024**3
+                logger.info(f"GPU memory after loading encoders: {gpu_after_load:.2f}GB")
+
+                # Encode on GPU (fast!)
+                logger.info("Encoding prompt on GPU...")
+                prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = _encode_on_device(device, dtype)
+                encoded_on_gpu = True
+            except (torch.OutOfMemoryError, RuntimeError) as exc:
+                if "out of memory" in str(exc).lower():
+                    logger.warning("CUDA OOM during prompt encoding; falling back to CPU.")
+                    _move_text_encoders("cpu")
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
+                    device = "cpu"
+                    dtype = torch.float32
+                else:
+                    raise
+
+        if not encoded_on_gpu:
+            logger.info("Encoding prompt on CPU...")
+            prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = _encode_on_device(device, dtype)
 
         # Clone embeddings to CPU immediately
         prompt_embeds = prompt_embeds.cpu().clone()
