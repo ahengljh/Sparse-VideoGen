@@ -199,6 +199,10 @@ class ClusterKVCache:
     # Shape: [B*H, num_k_clusters] - boolean mask
     stable_clusters: torch.Tensor
 
+    # Consecutive stable step counts per cluster
+    # Shape: [B*H, num_k_clusters]
+    stable_counts: torch.Tensor
+
     # Cluster assignments from CTCA
     # Shape: [B*H, seq_len]
     k_cluster_ids: torch.Tensor
@@ -210,12 +214,14 @@ class ClusterKVCache:
     # Metadata
     last_update_timestep: int = -1
     quality_score: float = 0.0
+    update_count: int = 0
 
     def to_device(self, device: torch.device):
         """Move cache to device."""
         self.k_centroids = self.k_centroids.to(device, non_blocking=True)
         self.v_centroids = self.v_centroids.to(device, non_blocking=True)
         self.stable_clusters = self.stable_clusters.to(device, non_blocking=True)
+        self.stable_counts = self.stable_counts.to(device, non_blocking=True)
         self.k_cluster_ids = self.k_cluster_ids.to(device, non_blocking=True)
         self.cluster_sizes = self.cluster_sizes.to(device, non_blocking=True)
 
@@ -224,6 +230,7 @@ class ClusterKVCache:
         self.k_centroids = self.k_centroids.cpu()
         self.v_centroids = self.v_centroids.cpu()
         self.stable_clusters = self.stable_clusters.cpu()
+        self.stable_counts = self.stable_counts.cpu()
         self.k_cluster_ids = self.k_cluster_ids.cpu()
         self.cluster_sizes = self.cluster_sizes.cpu()
 
@@ -231,7 +238,7 @@ class ClusterKVCache:
         """Return total memory usage in bytes."""
         total = 0
         for tensor in [self.k_centroids, self.v_centroids, self.stable_clusters,
-                       self.k_cluster_ids, self.cluster_sizes]:
+                       self.stable_counts, self.k_cluster_ids, self.cluster_sizes]:
             total += tensor.numel() * tensor.element_size()
         return total
 
@@ -248,6 +255,16 @@ class CKGRConfig:
 
     # Minimum ratio of stable clusters to enable reuse
     min_stable_ratio: float = 0.3
+
+    # Minimum cache update count before allowing reuse (warmup)
+    min_reuse_steps: int = 2
+
+    # Minimum consecutive stable steps required per cluster
+    min_stable_steps: int = 2
+
+    # Minimum cosine similarity between old/new K centroids
+    # Set <= 0.0 to disable centroid drift gating
+    centroid_sim_threshold: float = 0.98
 
     # Quality threshold for CTCA cluster quality
     quality_threshold: float = 0.75
@@ -603,6 +620,7 @@ class ClusterGuidedKVReuse:
         # No cache exists - can't reuse
         if layer_idx not in self._cache:
             return False
+        cache = self._cache[layer_idx]
 
         # CTCA did full recluster - cache is invalid
         if not ctca_reused:
@@ -610,6 +628,10 @@ class ClusterGuidedKVReuse:
 
         # Quality too low - clusters may have drifted
         if cluster_quality < self.config.quality_threshold:
+            return False
+
+        # Warmup: wait for enough updates before reusing
+        if self.config.min_reuse_steps > 0 and cache.update_count < self.config.min_reuse_steps:
             return False
 
         return True
@@ -620,6 +642,7 @@ class ClusterGuidedKVReuse:
         k_cluster_ids: torch.Tensor,
         ctca_reused: bool,
         cluster_quality: float = 1.0,
+        current_k_centroids: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict, Optional[ClusterKVCache]]:
         """Compute cluster-level and token-level reuse masks.
 
@@ -650,6 +673,24 @@ class ClusterGuidedKVReuse:
         stable_mask = self._compute_cluster_stability(
             cache.k_cluster_ids, k_cluster_ids
         )
+
+        # Optional centroid drift gating (less change -> more reuse)
+        if current_k_centroids is not None and self.config.centroid_sim_threshold > 0.0:
+            if current_k_centroids.shape == cache.k_centroids.shape:
+                if current_k_centroids.device != cache.k_centroids.device:
+                    current_k_centroids = current_k_centroids.to(cache.k_centroids.device, non_blocking=True)
+                denom = (
+                    cache.k_centroids.norm(dim=-1) * current_k_centroids.norm(dim=-1)
+                ).clamp(min=1e-6)
+                cos_sim = (cache.k_centroids * current_k_centroids).sum(dim=-1) / denom
+                stable_mask = stable_mask & (cos_sim >= self.config.centroid_sim_threshold)
+            elif self.config.verbose:
+                logger.info("[CKGR] Skipping centroid drift gating due to shape mismatch.")
+
+        # Require clusters to be stable for multiple consecutive steps
+        if self.config.min_stable_steps > 1:
+            stable_steps = cache.stable_counts + 1
+            stable_mask = stable_mask & (stable_steps >= self.config.min_stable_steps)
 
         stable_ratio = stable_mask.float().mean().item()
         info['stable_ratio'] = stable_ratio
@@ -832,6 +873,15 @@ class ClusterGuidedKVReuse:
             stable_mask = self._compute_cluster_stability(
                 old_cache.k_cluster_ids, k_cluster_ids
             )
+            prev_counts = getattr(old_cache, "stable_counts", None)
+            if prev_counts is None:
+                prev_counts = torch.zeros_like(stable_mask, dtype=torch.int32)
+            stable_counts = torch.where(
+                stable_mask,
+                prev_counts + 1,
+                torch.zeros_like(prev_counts),
+            )
+            update_count = getattr(old_cache, "update_count", 0) + 1
             old_cache.to_cpu()
         else:
             # Fresh cache - no stability info
@@ -840,16 +890,23 @@ class ClusterGuidedKVReuse:
                 B_H, self.config.num_k_clusters,
                 dtype=torch.bool, device=K.device
             )
+            stable_counts = torch.zeros(
+                B_H, self.config.num_k_clusters,
+                dtype=torch.int32, device=K.device
+            )
+            update_count = 1
 
         # Create new cache entry
         self._cache[layer_idx] = ClusterKVCache(
             k_centroids=k_centroids,
             v_centroids=v_centroids,
             stable_clusters=stable_mask,
+            stable_counts=stable_counts,
             k_cluster_ids=k_cluster_ids.clone(),
             cluster_sizes=cluster_sizes,
             last_update_timestep=timestep,
             quality_score=cluster_quality,
+            update_count=update_count,
         )
 
         # Move to CPU to save GPU memory
@@ -901,6 +958,9 @@ def create_ckgr_manager(
     num_layers: int = 60,
     num_k_clusters: int = 1000,
     stability_threshold: float = 0.7,
+    min_reuse_steps: int = 2,
+    min_stable_steps: int = 2,
+    centroid_sim_threshold: float = 0.98,
     quality_threshold: float = 0.75,
     reuse_k: bool = False,
     reuse_v: bool = True,
@@ -913,6 +973,9 @@ def create_ckgr_manager(
         num_layers: Number of transformer layers
         num_k_clusters: Number of clusters (should match CTCA)
         stability_threshold: Jaccard threshold for cluster stability
+        min_reuse_steps: Warmup updates before enabling reuse
+        min_stable_steps: Consecutive stable steps required per cluster
+        centroid_sim_threshold: Cosine similarity threshold for centroid drift
         quality_threshold: CTCA quality threshold for enabling reuse
         reuse_k: Whether to reuse K via cached centroids
         reuse_v: Whether to reuse V via cached centroids
@@ -925,6 +988,9 @@ def create_ckgr_manager(
     config = CKGRConfig(
         num_k_clusters=num_k_clusters,
         stability_threshold=stability_threshold,
+        min_reuse_steps=min_reuse_steps,
+        min_stable_steps=min_stable_steps,
+        centroid_sim_threshold=centroid_sim_threshold,
         quality_threshold=quality_threshold,
         reuse_k=reuse_k,
         reuse_v=reuse_v,

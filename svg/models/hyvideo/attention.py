@@ -936,6 +936,9 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
     # CKGR configuration (Cluster-Guided KV Reuse)
     ckgr_enabled: bool = False  # Enable KV reuse based on cluster stability
     ckgr_stability_threshold: float = 0.7  # Jaccard threshold for cluster stability
+    ckgr_min_reuse_steps: int = 2
+    ckgr_min_stable_steps: int = 2
+    ckgr_centroid_sim_threshold: float = 0.98
     ckgr_quality_threshold: float = 0.75   # CTCA quality threshold for enabling reuse
     ckgr_verbose: bool = False
     ckgr_reuse_k: bool = False
@@ -954,6 +957,9 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
             num_layers=60,  # HunyuanVideo has 60 layers
             num_k_clusters=cls.num_k_centroids,  # Use num_k_centroids (SAP naming)
             stability_threshold=cls.ckgr_stability_threshold,
+            min_reuse_steps=cls.ckgr_min_reuse_steps,
+            min_stable_steps=cls.ckgr_min_stable_steps,
+            centroid_sim_threshold=cls.ckgr_centroid_sim_threshold,
             quality_threshold=cls.ckgr_quality_threshold,
             reuse_k=cls.ckgr_reuse_k,
             reuse_v=cls.ckgr_reuse_v,
@@ -964,6 +970,9 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         logger.info(f"{Color.green}CKGR initialized: "
                     f"K clusters={cls.num_k_centroids}, "
                     f"stability_threshold={cls.ckgr_stability_threshold}, "
+                    f"min_reuse_steps={cls.ckgr_min_reuse_steps}, "
+                    f"min_stable_steps={cls.ckgr_min_stable_steps}, "
+                    f"centroid_sim_threshold={cls.ckgr_centroid_sim_threshold}, "
                     f"quality_threshold={cls.ckgr_quality_threshold}, "
                     f"reuse_k={cls.ckgr_reuse_k}, reuse_v={cls.ckgr_reuse_v}, "
                     f"min_head_reuse_ratio={cls.ckgr_min_head_reuse_ratio}{Color.reset}")
@@ -1305,7 +1314,11 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
                 cluster_quality = cache.get_average_quality()
 
         stable_mask, reuse_mask, ckgr_info, ckgr_cache = ckgr.compute_reuse_masks(
-            self.layer_idx, klabels, ctca_reused, cluster_quality
+            self.layer_idx,
+            klabels,
+            ctca_reused,
+            cluster_quality,
+            current_k_centroids=kcentroids,
         )
 
         token_reuse_mask = ckgr.reduce_reuse_mask(reuse_mask, cfg, num_heads)

@@ -79,6 +79,10 @@ if __name__ == "__main__":
     # CKGR (Cluster-Guided KV Reuse) specific - only for SAP_CTCA pattern
     parser.add_argument("--ckgr_enabled", action="store_true", help="Enable Cluster-Guided KV Reuse for stable clusters.")
     parser.add_argument("--ckgr_stability_threshold", type=float, default=0.7, help="Jaccard threshold for cluster stability (0-1). Higher = stricter stability requirement.")
+    parser.add_argument("--ckgr_min_reuse_steps", type=int, default=2, help="Warmup cache updates before enabling reuse.")
+    parser.add_argument("--ckgr_min_stable_steps", type=int, default=2, help="Consecutive stable steps required per cluster.")
+    parser.add_argument("--ckgr_centroid_sim_threshold", type=float, default=0.98,
+                        help="Cosine similarity threshold for centroid drift gating (<=0 disables).")
     parser.add_argument("--ckgr_quality_threshold", type=float, default=0.75, help="CTCA quality threshold for enabling KV reuse (0-1).")
     parser.add_argument("--ckgr_verbose", action="store_true", help="Enable verbose CKGR logging.")
     parser.add_argument("--ckgr_reuse_k", action="store_true", help="Reuse K centroids (may reduce quality).")
@@ -330,6 +334,9 @@ if __name__ == "__main__":
             # CKGR specific
             ckgr_enabled=args.ckgr_enabled,
             ckgr_stability_threshold=args.ckgr_stability_threshold,
+            ckgr_min_reuse_steps=args.ckgr_min_reuse_steps,
+            ckgr_min_stable_steps=args.ckgr_min_stable_steps,
+            ckgr_centroid_sim_threshold=args.ckgr_centroid_sim_threshold,
             ckgr_quality_threshold=args.ckgr_quality_threshold,
             ckgr_verbose=args.ckgr_verbose,
             ckgr_reuse_k=args.ckgr_reuse_k,

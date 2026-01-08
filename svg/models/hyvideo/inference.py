@@ -62,6 +62,9 @@ def replace_hyvideo_attention(
     # CKGR (Cluster-Guided KV Reuse) specific args
     ckgr_enabled=False,
     ckgr_stability_threshold=0.7,
+    ckgr_min_reuse_steps=2,
+    ckgr_min_stable_steps=2,
+    ckgr_centroid_sim_threshold=0.98,
     ckgr_quality_threshold=0.75,
     ckgr_verbose=False,
     ckgr_reuse_k=False,
@@ -226,6 +229,9 @@ def replace_hyvideo_attention(
         # CKGR-specific configuration
         AttnModule.ckgr_enabled = ckgr_enabled
         AttnModule.ckgr_stability_threshold = ckgr_stability_threshold
+        AttnModule.ckgr_min_reuse_steps = ckgr_min_reuse_steps
+        AttnModule.ckgr_min_stable_steps = ckgr_min_stable_steps
+        AttnModule.ckgr_centroid_sim_threshold = ckgr_centroid_sim_threshold
         AttnModule.ckgr_quality_threshold = ckgr_quality_threshold
         AttnModule.ckgr_verbose = ckgr_verbose
         AttnModule.ckgr_reuse_k = ckgr_reuse_k
