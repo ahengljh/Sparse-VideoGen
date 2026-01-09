@@ -70,6 +70,15 @@ def replace_hyvideo_attention(
     ckgr_reuse_k=False,
     ckgr_reuse_v=True,
     ckgr_min_head_reuse_ratio=1.0,
+    ckgr_min_reuse_ratio=0.05,
+    ckgr_importance_threshold=None,
+    ckgr_importance_quantile=None,
+    ckgr_importance_reduce="max",
+    ckgr_use_transfer_cost=True,
+    ckgr_transfer_bandwidth_gbps=20.0,
+    ckgr_proj_us_per_token_k=0.35,
+    ckgr_proj_us_per_token_v=0.25,
+    ckgr_min_reuse_score=0.0,
 ):
 
     cfg_size, num_head, head_dim, dtype, device = 1, 24, 128, torch.bfloat16, "cuda"
@@ -237,6 +246,15 @@ def replace_hyvideo_attention(
         AttnModule.ckgr_reuse_k = ckgr_reuse_k
         AttnModule.ckgr_reuse_v = ckgr_reuse_v
         AttnModule.ckgr_min_head_reuse_ratio = ckgr_min_head_reuse_ratio
+        AttnModule.ckgr_min_reuse_ratio = ckgr_min_reuse_ratio
+        AttnModule.ckgr_importance_threshold = ckgr_importance_threshold
+        AttnModule.ckgr_importance_quantile = ckgr_importance_quantile
+        AttnModule.ckgr_importance_reduce = ckgr_importance_reduce
+        AttnModule.ckgr_use_transfer_cost = ckgr_use_transfer_cost
+        AttnModule.ckgr_transfer_bandwidth_gbps = ckgr_transfer_bandwidth_gbps
+        AttnModule.ckgr_proj_us_per_token_k = ckgr_proj_us_per_token_k
+        AttnModule.ckgr_proj_us_per_token_v = ckgr_proj_us_per_token_v
+        AttnModule.ckgr_min_reuse_score = ckgr_min_reuse_score
 
         # Initialize CTCA manager (shared across all layers)
         AttnModule.initialize_ctca()

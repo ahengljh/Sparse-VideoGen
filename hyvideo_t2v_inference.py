@@ -90,6 +90,26 @@ if __name__ == "__main__":
     parser.add_argument("--ckgr_no_reuse_v", action="store_false", dest="ckgr_reuse_v", help="Disable V reuse.")
     parser.add_argument("--ckgr_min_head_reuse_ratio", type=float, default=1.0,
                         help="Minimum fraction of heads that must agree to skip V projection.")
+    parser.add_argument("--ckgr_min_reuse_ratio", type=float, default=0.05,
+                        help="Minimum token reuse ratio to enable reuse.")
+    parser.add_argument("--ckgr_importance_threshold", type=float, default=None,
+                        help="Reuse only clusters with importance <= threshold.")
+    parser.add_argument("--ckgr_importance_quantile", type=float, default=None,
+                        help="Reuse only bottom quantile clusters by importance.")
+    parser.add_argument("--ckgr_importance_reduce", type=str, default="max", choices=["max", "mean"],
+                        help="Reduce mode for QxK importance aggregation.")
+    parser.add_argument("--ckgr_use_transfer_cost", action="store_true", default=True,
+                        help="Enable transfer-vs-compute gating for reuse.")
+    parser.add_argument("--ckgr_no_transfer_cost", action="store_false", dest="ckgr_use_transfer_cost",
+                        help="Disable transfer-vs-compute gating.")
+    parser.add_argument("--ckgr_transfer_bandwidth_gbps", type=float, default=20.0,
+                        help="Estimated CPU->GPU bandwidth for reuse gating.")
+    parser.add_argument("--ckgr_proj_us_per_token_k", type=float, default=0.35,
+                        help="Estimated K projection cost per token (us).")
+    parser.add_argument("--ckgr_proj_us_per_token_v", type=float, default=0.25,
+                        help="Estimated V projection cost per token (us).")
+    parser.add_argument("--ckgr_min_reuse_score", type=float, default=0.0,
+                        help="Minimum (savings - transfer) score to reuse.")
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
@@ -342,6 +362,15 @@ if __name__ == "__main__":
             ckgr_reuse_k=args.ckgr_reuse_k,
             ckgr_reuse_v=args.ckgr_reuse_v,
             ckgr_min_head_reuse_ratio=args.ckgr_min_head_reuse_ratio,
+            ckgr_min_reuse_ratio=args.ckgr_min_reuse_ratio,
+            ckgr_importance_threshold=args.ckgr_importance_threshold,
+            ckgr_importance_quantile=args.ckgr_importance_quantile,
+            ckgr_importance_reduce=args.ckgr_importance_reduce,
+            ckgr_use_transfer_cost=args.ckgr_use_transfer_cost,
+            ckgr_transfer_bandwidth_gbps=args.ckgr_transfer_bandwidth_gbps,
+            ckgr_proj_us_per_token_k=args.ckgr_proj_us_per_token_k,
+            ckgr_proj_us_per_token_v=args.ckgr_proj_us_per_token_v,
+            ckgr_min_reuse_score=args.ckgr_min_reuse_score,
         )
     else:
         assert args.pattern == "dense", f"Invalid pattern: {args.pattern}"

@@ -944,6 +944,15 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
     ckgr_reuse_k: bool = False
     ckgr_reuse_v: bool = True
     ckgr_min_head_reuse_ratio: float = 1.0
+    ckgr_min_reuse_ratio: float = 0.05
+    ckgr_importance_threshold: Optional[float] = None
+    ckgr_importance_quantile: Optional[float] = None
+    ckgr_importance_reduce: str = "max"
+    ckgr_use_transfer_cost: bool = True
+    ckgr_transfer_bandwidth_gbps: float = 20.0
+    ckgr_proj_us_per_token_k: float = 0.35
+    ckgr_proj_us_per_token_v: float = 0.25
+    ckgr_min_reuse_score: float = 0.0
 
     @classmethod
     def initialize_ckgr(cls):
@@ -964,6 +973,15 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
             reuse_k=cls.ckgr_reuse_k,
             reuse_v=cls.ckgr_reuse_v,
             min_head_reuse_ratio=cls.ckgr_min_head_reuse_ratio,
+            min_reuse_ratio=cls.ckgr_min_reuse_ratio,
+            importance_threshold=cls.ckgr_importance_threshold,
+            importance_quantile=cls.ckgr_importance_quantile,
+            importance_reduce=cls.ckgr_importance_reduce,
+            use_transfer_cost=cls.ckgr_use_transfer_cost,
+            transfer_bandwidth_gbps=cls.ckgr_transfer_bandwidth_gbps,
+            proj_us_per_token_k=cls.ckgr_proj_us_per_token_k,
+            proj_us_per_token_v=cls.ckgr_proj_us_per_token_v,
+            min_reuse_score=cls.ckgr_min_reuse_score,
             verbose=cls.ckgr_verbose,
         )
 
@@ -975,7 +993,8 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
                     f"centroid_sim_threshold={cls.ckgr_centroid_sim_threshold}, "
                     f"quality_threshold={cls.ckgr_quality_threshold}, "
                     f"reuse_k={cls.ckgr_reuse_k}, reuse_v={cls.ckgr_reuse_v}, "
-                    f"min_head_reuse_ratio={cls.ckgr_min_head_reuse_ratio}{Color.reset}")
+                    f"min_head_reuse_ratio={cls.ckgr_min_head_reuse_ratio}, "
+                    f"min_reuse_ratio={cls.ckgr_min_reuse_ratio}{Color.reset}")
 
     @classmethod
     def reset_ckgr(cls):
@@ -1313,12 +1332,18 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
                 ctca_reused = cache.calls_since_full_cluster > 0
                 cluster_quality = cache.get_average_quality()
 
+        cluster_importance = None
+        if ckgr.config.importance_threshold is not None or ckgr.config.importance_quantile is not None:
+            denom = kcluster_sizes.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+            cluster_importance = kcluster_sizes.float() / denom
+
         stable_mask, reuse_mask, ckgr_info, ckgr_cache = ckgr.compute_reuse_masks(
             self.layer_idx,
             klabels,
             ctca_reused,
             cluster_quality,
             current_k_centroids=kcentroids,
+            cluster_importance=cluster_importance,
         )
 
         token_reuse_mask = ckgr.reduce_reuse_mask(reuse_mask, cfg, num_heads)

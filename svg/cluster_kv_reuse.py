@@ -216,14 +216,29 @@ class ClusterKVCache:
     quality_score: float = 0.0
     update_count: int = 0
 
-    def to_device(self, device: torch.device):
-        """Move cache to device."""
-        self.k_centroids = self.k_centroids.to(device, non_blocking=True)
-        self.v_centroids = self.v_centroids.to(device, non_blocking=True)
-        self.stable_clusters = self.stable_clusters.to(device, non_blocking=True)
-        self.stable_counts = self.stable_counts.to(device, non_blocking=True)
-        self.k_cluster_ids = self.k_cluster_ids.to(device, non_blocking=True)
-        self.cluster_sizes = self.cluster_sizes.to(device, non_blocking=True)
+    def to_device(
+        self,
+        device: torch.device,
+        move_k_centroids: bool = True,
+        move_v_centroids: bool = True,
+        move_stable_clusters: bool = True,
+        move_stable_counts: bool = True,
+        move_cluster_ids: bool = True,
+        move_cluster_sizes: bool = True,
+    ):
+        """Move cache to device with selective fields."""
+        if move_k_centroids:
+            self.k_centroids = self.k_centroids.to(device, non_blocking=True)
+        if move_v_centroids:
+            self.v_centroids = self.v_centroids.to(device, non_blocking=True)
+        if move_stable_clusters:
+            self.stable_clusters = self.stable_clusters.to(device, non_blocking=True)
+        if move_stable_counts:
+            self.stable_counts = self.stable_counts.to(device, non_blocking=True)
+        if move_cluster_ids:
+            self.k_cluster_ids = self.k_cluster_ids.to(device, non_blocking=True)
+        if move_cluster_sizes:
+            self.cluster_sizes = self.cluster_sizes.to(device, non_blocking=True)
 
     def to_cpu(self):
         """Move cache to CPU to save GPU memory."""
@@ -256,6 +271,9 @@ class CKGRConfig:
     # Minimum ratio of stable clusters to enable reuse
     min_stable_ratio: float = 0.3
 
+    # Minimum token-level reuse ratio to enable reuse
+    min_reuse_ratio: float = 0.05
+
     # Minimum cache update count before allowing reuse (warmup)
     min_reuse_steps: int = 2
 
@@ -277,6 +295,19 @@ class CKGRConfig:
     # Minimum fraction of heads that must agree on reuse for a token
     # 1.0 = all heads, 0.5 = majority vote
     min_head_reuse_ratio: float = 1.0
+
+    # Optional importance gating (lower importance => safer reuse)
+    # If both threshold and quantile are None, importance gating is disabled
+    importance_threshold: Optional[float] = None
+    importance_quantile: Optional[float] = None
+    importance_reduce: str = "max"
+
+    # Transfer vs compute gating
+    use_transfer_cost: bool = True
+    transfer_bandwidth_gbps: float = 20.0
+    proj_us_per_token_k: float = 0.35
+    proj_us_per_token_v: float = 0.25
+    min_reuse_score: float = 0.0
 
     # Whether to use Triton kernels (faster) or PyTorch fallback
     use_triton: bool = True
@@ -636,6 +667,88 @@ class ClusterGuidedKVReuse:
 
         return True
 
+    def _normalize_cluster_importance(
+        self,
+        cluster_importance: torch.Tensor,
+        batch_heads: int,
+        num_clusters: int,
+    ) -> torch.Tensor:
+        """Normalize cluster importance to [B*H, K]."""
+        importance = cluster_importance
+        if importance.dim() == 4:
+            # [B, H, Q, K] -> reduce over Q
+            if self.config.importance_reduce == "mean":
+                importance = importance.mean(dim=2)
+            else:
+                importance = importance.max(dim=2).values
+        if importance.dim() == 3:
+            # [B, H, K] -> [B*H, K]
+            importance = importance.reshape(batch_heads, num_clusters)
+        if importance.dim() != 2:
+            raise ValueError("cluster_importance must be [B*H, K], [B, H, K], or [B, H, Q, K]")
+        return importance
+
+    def _apply_importance_gating(
+        self,
+        stable_mask: torch.Tensor,
+        cluster_importance: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """Gate reuse based on cluster importance."""
+        if cluster_importance is None:
+            return stable_mask
+        if self.config.importance_threshold is None and self.config.importance_quantile is None:
+            return stable_mask
+
+        B_H, K = stable_mask.shape
+        importance = self._normalize_cluster_importance(cluster_importance, B_H, K)
+        if importance.device != stable_mask.device:
+            importance = importance.to(stable_mask.device, non_blocking=True)
+
+        if self.config.importance_quantile is not None:
+            flat = importance.reshape(-1)
+            thresh = torch.quantile(flat, self.config.importance_quantile)
+        else:
+            thresh = self.config.importance_threshold
+
+        if thresh is None:
+            return stable_mask
+
+        return stable_mask & (importance <= thresh)
+
+    def _estimate_transfer_cost_ms(
+        self,
+        cache: ClusterKVCache,
+        reuse_k: bool,
+        reuse_v: bool,
+    ) -> float:
+        """Estimate CPU->GPU transfer time in ms for cached centroids."""
+        if self.config.transfer_bandwidth_gbps <= 0.0:
+            return 0.0
+
+        bytes_to_transfer = 0
+        if reuse_k:
+            bytes_to_transfer += cache.k_centroids.numel() * cache.k_centroids.element_size()
+        if reuse_v:
+            bytes_to_transfer += cache.v_centroids.numel() * cache.v_centroids.element_size()
+
+        transfer_seconds = bytes_to_transfer / (self.config.transfer_bandwidth_gbps * 1e9)
+        return transfer_seconds * 1e3
+
+    def _estimate_compute_savings_ms(
+        self,
+        reuse_tokens: int,
+        reuse_k: bool,
+        reuse_v: bool,
+    ) -> float:
+        """Estimate compute savings in ms from skipping projections."""
+        us_per_token = 0.0
+        if reuse_k:
+            us_per_token += self.config.proj_us_per_token_k
+        if reuse_v:
+            us_per_token += self.config.proj_us_per_token_v
+
+        return (reuse_tokens * us_per_token) / 1e3
+
     def compute_reuse_masks(
         self,
         layer_idx: int,
@@ -643,6 +756,7 @@ class ClusterGuidedKVReuse:
         ctca_reused: bool,
         cluster_quality: float = 1.0,
         current_k_centroids: Optional[torch.Tensor] = None,
+        cluster_importance: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict, Optional[ClusterKVCache]]:
         """Compute cluster-level and token-level reuse masks.
 
@@ -667,30 +781,34 @@ class ClusterGuidedKVReuse:
             return None, None, info, None
 
         cache = self._cache[layer_idx]
-        cache.to_device(k_cluster_ids.device)
+        device = k_cluster_ids.device
 
         # Compute stability between old and new cluster assignments
-        stable_mask = self._compute_cluster_stability(
-            cache.k_cluster_ids, k_cluster_ids
-        )
+        old_cluster_ids = cache.k_cluster_ids.to(device, non_blocking=True)
+        stable_mask = self._compute_cluster_stability(old_cluster_ids, k_cluster_ids)
 
         # Optional centroid drift gating (less change -> more reuse)
         if current_k_centroids is not None and self.config.centroid_sim_threshold > 0.0:
             if current_k_centroids.shape == cache.k_centroids.shape:
-                if current_k_centroids.device != cache.k_centroids.device:
-                    current_k_centroids = current_k_centroids.to(cache.k_centroids.device, non_blocking=True)
+                cached_k_centroids = cache.k_centroids.to(device, non_blocking=True)
+                if current_k_centroids.device != cached_k_centroids.device:
+                    current_k_centroids = current_k_centroids.to(device, non_blocking=True)
                 denom = (
-                    cache.k_centroids.norm(dim=-1) * current_k_centroids.norm(dim=-1)
+                    cached_k_centroids.norm(dim=-1) * current_k_centroids.norm(dim=-1)
                 ).clamp(min=1e-6)
-                cos_sim = (cache.k_centroids * current_k_centroids).sum(dim=-1) / denom
+                cos_sim = (cached_k_centroids * current_k_centroids).sum(dim=-1) / denom
                 stable_mask = stable_mask & (cos_sim >= self.config.centroid_sim_threshold)
             elif self.config.verbose:
                 logger.info("[CKGR] Skipping centroid drift gating due to shape mismatch.")
 
         # Require clusters to be stable for multiple consecutive steps
         if self.config.min_stable_steps > 1:
-            stable_steps = cache.stable_counts + 1
+            stable_counts = cache.stable_counts.to(device, non_blocking=True)
+            stable_steps = stable_counts + 1
             stable_mask = stable_mask & (stable_steps >= self.config.min_stable_steps)
+
+        # Optional importance gating
+        stable_mask = self._apply_importance_gating(stable_mask, cluster_importance)
 
         stable_ratio = stable_mask.float().mean().item()
         info['stable_ratio'] = stable_ratio
@@ -708,6 +826,38 @@ class ClusterGuidedKVReuse:
         reuse_ratio = reuse_mask.float().mean().item()
         info['reused'] = True
         info['reuse_ratio'] = reuse_ratio
+
+        # Minimum token-level reuse ratio
+        if self.config.min_reuse_ratio > 0.0 and reuse_ratio < self.config.min_reuse_ratio:
+            info['reused'] = False
+            return stable_mask, None, info, cache
+
+        # Transfer vs compute gating
+        if self.config.use_transfer_cost:
+            reuse_tokens = int(reuse_mask.sum().item())
+            transfer_ms = self._estimate_transfer_cost_ms(cache, self.config.reuse_k, self.config.reuse_v)
+            savings_ms = self._estimate_compute_savings_ms(reuse_tokens, self.config.reuse_k, self.config.reuse_v)
+            reuse_score = savings_ms - transfer_ms
+
+            info['reuse_tokens'] = reuse_tokens
+            info['transfer_ms'] = transfer_ms
+            info['compute_savings_ms'] = savings_ms
+            info['reuse_score'] = reuse_score
+
+            if reuse_score < self.config.min_reuse_score:
+                info['reused'] = False
+                return stable_mask, None, info, cache
+
+        # Move only required cache fields to device for actual reuse
+        cache.to_device(
+            device,
+            move_k_centroids=self.config.reuse_k,
+            move_v_centroids=self.config.reuse_v,
+            move_stable_clusters=False,
+            move_stable_counts=False,
+            move_cluster_ids=False,
+            move_cluster_sizes=False,
+        )
 
         return stable_mask, reuse_mask, info, cache
 
@@ -965,6 +1115,15 @@ def create_ckgr_manager(
     reuse_k: bool = False,
     reuse_v: bool = True,
     min_head_reuse_ratio: float = 1.0,
+    min_reuse_ratio: float = 0.05,
+    importance_threshold: Optional[float] = None,
+    importance_quantile: Optional[float] = None,
+    importance_reduce: str = "max",
+    use_transfer_cost: bool = True,
+    transfer_bandwidth_gbps: float = 20.0,
+    proj_us_per_token_k: float = 0.35,
+    proj_us_per_token_v: float = 0.25,
+    min_reuse_score: float = 0.0,
     verbose: bool = False,
 ) -> ClusterGuidedKVReuse:
     """Create a CKGR manager with default configuration.
@@ -980,6 +1139,15 @@ def create_ckgr_manager(
         reuse_k: Whether to reuse K via cached centroids
         reuse_v: Whether to reuse V via cached centroids
         min_head_reuse_ratio: Token reuse threshold across heads
+        min_reuse_ratio: Minimum token reuse ratio to enable reuse
+        importance_threshold: Absolute importance threshold for reuse gating
+        importance_quantile: Quantile threshold for reuse gating
+        importance_reduce: Reduce mode for QxK importance ("max" or "mean")
+        use_transfer_cost: Whether to gate reuse by transfer vs compute cost
+        transfer_bandwidth_gbps: Estimated CPU->GPU bandwidth
+        proj_us_per_token_k: Estimated K projection cost (microseconds)
+        proj_us_per_token_v: Estimated V projection cost (microseconds)
+        min_reuse_score: Minimum (savings - transfer) score to reuse
         verbose: Enable verbose logging
 
     Returns:
@@ -995,6 +1163,15 @@ def create_ckgr_manager(
         reuse_k=reuse_k,
         reuse_v=reuse_v,
         min_head_reuse_ratio=min_head_reuse_ratio,
+        min_reuse_ratio=min_reuse_ratio,
+        importance_threshold=importance_threshold,
+        importance_quantile=importance_quantile,
+        importance_reduce=importance_reduce,
+        use_transfer_cost=use_transfer_cost,
+        transfer_bandwidth_gbps=transfer_bandwidth_gbps,
+        proj_us_per_token_k=proj_us_per_token_k,
+        proj_us_per_token_v=proj_us_per_token_v,
+        min_reuse_score=min_reuse_score,
         verbose=verbose,
     )
 
