@@ -215,6 +215,7 @@ class ClusterKVCache:
     last_update_timestep: int = -1
     quality_score: float = 0.0
     update_count: int = 0
+    token_energy: Optional[torch.Tensor] = None
 
     def to_device(
         self,
@@ -225,6 +226,7 @@ class ClusterKVCache:
         move_stable_counts: bool = True,
         move_cluster_ids: bool = True,
         move_cluster_sizes: bool = True,
+        move_token_energy: bool = True,
     ):
         """Move cache to device with selective fields."""
         if move_k_centroids:
@@ -239,6 +241,8 @@ class ClusterKVCache:
             self.k_cluster_ids = self.k_cluster_ids.to(device, non_blocking=True)
         if move_cluster_sizes:
             self.cluster_sizes = self.cluster_sizes.to(device, non_blocking=True)
+        if move_token_energy and self.token_energy is not None:
+            self.token_energy = self.token_energy.to(device, non_blocking=True)
 
     def to_cpu(self):
         """Move cache to CPU to save GPU memory."""
@@ -248,12 +252,23 @@ class ClusterKVCache:
         self.stable_counts = self.stable_counts.cpu()
         self.k_cluster_ids = self.k_cluster_ids.cpu()
         self.cluster_sizes = self.cluster_sizes.cpu()
+        if self.token_energy is not None:
+            self.token_energy = self.token_energy.cpu()
 
     def memory_bytes(self) -> int:
         """Return total memory usage in bytes."""
         total = 0
-        for tensor in [self.k_centroids, self.v_centroids, self.stable_clusters,
-                       self.stable_counts, self.k_cluster_ids, self.cluster_sizes]:
+        tensors = [
+            self.k_centroids,
+            self.v_centroids,
+            self.stable_clusters,
+            self.stable_counts,
+            self.k_cluster_ids,
+            self.cluster_sizes,
+        ]
+        if self.token_energy is not None:
+            tensors.append(self.token_energy)
+        for tensor in tensors:
             total += tensor.numel() * tensor.element_size()
         return total
 
@@ -283,6 +298,11 @@ class CKGRConfig:
     # Minimum cosine similarity between old/new K centroids
     # Set <= 0.0 to disable centroid drift gating
     centroid_sim_threshold: float = 0.98
+
+    # Token-level stability gating (pixel-level proxy)
+    # If both are None, token gating is disabled
+    token_delta_threshold: Optional[float] = 0.05
+    token_delta_quantile: Optional[float] = None
 
     # Quality threshold for CTCA cluster quality
     quality_threshold: float = 0.75
@@ -757,6 +777,7 @@ class ClusterGuidedKVReuse:
         cluster_quality: float = 1.0,
         current_k_centroids: Optional[torch.Tensor] = None,
         cluster_importance: Optional[torch.Tensor] = None,
+        token_reuse_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Dict, Optional[ClusterKVCache]]:
         """Compute cluster-level and token-level reuse masks.
 
@@ -823,6 +844,18 @@ class ClusterGuidedKVReuse:
             k_cluster_ids.long().clamp(0, self.config.num_k_clusters - 1)
         )
 
+        if token_reuse_mask is not None:
+            if token_reuse_mask.dim() != 2:
+                raise ValueError("token_reuse_mask must be [B, S] or [B*H, S]")
+            if token_reuse_mask.shape[0] != reuse_mask.shape[0]:
+                repeat = reuse_mask.shape[0] // token_reuse_mask.shape[0]
+                if token_reuse_mask.shape[0] * repeat != reuse_mask.shape[0]:
+                    raise ValueError("token_reuse_mask batch does not match B*H")
+                token_reuse_mask = token_reuse_mask.repeat_interleave(repeat, dim=0)
+            if token_reuse_mask.device != reuse_mask.device:
+                token_reuse_mask = token_reuse_mask.to(reuse_mask.device, non_blocking=True)
+            reuse_mask = reuse_mask & token_reuse_mask
+
         reuse_ratio = reuse_mask.float().mean().item()
         info['reused'] = True
         info['reuse_ratio'] = reuse_ratio
@@ -857,6 +890,7 @@ class ClusterGuidedKVReuse:
             move_stable_counts=False,
             move_cluster_ids=False,
             move_cluster_sizes=False,
+            move_token_energy=False,
         )
 
         return stable_mask, reuse_mask, info, cache
@@ -912,11 +946,13 @@ class ClusterGuidedKVReuse:
         timestep: int,
         ctca_reused: bool,
         cluster_quality: float,
+        token_energy: Optional[torch.Tensor] = None,
     ):
         """Public wrapper to update CKGR cache."""
         self._update_cache(
             layer_idx, K, V, k_cluster_ids,
-            timestep, ctca_reused, cluster_quality
+            timestep, ctca_reused, cluster_quality,
+            token_energy=token_energy,
         )
 
     @time_logging_decorator("Level 3 - CKGR process KV")
@@ -1008,6 +1044,7 @@ class ClusterGuidedKVReuse:
         timestep: int,
         ctca_reused: bool,
         cluster_quality: float,
+        token_energy: Optional[torch.Tensor] = None,
     ):
         """Update the cache with new K/V centroids."""
 
@@ -1057,6 +1094,7 @@ class ClusterGuidedKVReuse:
             last_update_timestep=timestep,
             quality_score=cluster_quality,
             update_count=update_count,
+            token_energy=token_energy.detach().float().cpu() if token_energy is not None else None,
         )
 
         # Move to CPU to save GPU memory
@@ -1116,6 +1154,8 @@ def create_ckgr_manager(
     reuse_v: bool = True,
     min_head_reuse_ratio: float = 1.0,
     min_reuse_ratio: float = 0.05,
+    token_delta_threshold: Optional[float] = 0.05,
+    token_delta_quantile: Optional[float] = None,
     importance_threshold: Optional[float] = None,
     importance_quantile: Optional[float] = None,
     importance_reduce: str = "max",
@@ -1140,6 +1180,8 @@ def create_ckgr_manager(
         reuse_v: Whether to reuse V via cached centroids
         min_head_reuse_ratio: Token reuse threshold across heads
         min_reuse_ratio: Minimum token reuse ratio to enable reuse
+        token_delta_threshold: Relative token change threshold for reuse
+        token_delta_quantile: Quantile threshold for reuse
         importance_threshold: Absolute importance threshold for reuse gating
         importance_quantile: Quantile threshold for reuse gating
         importance_reduce: Reduce mode for QxK importance ("max" or "mean")
@@ -1164,6 +1206,8 @@ def create_ckgr_manager(
         reuse_v=reuse_v,
         min_head_reuse_ratio=min_head_reuse_ratio,
         min_reuse_ratio=min_reuse_ratio,
+        token_delta_threshold=token_delta_threshold,
+        token_delta_quantile=token_delta_quantile,
         importance_threshold=importance_threshold,
         importance_quantile=importance_quantile,
         importance_reduce=importance_reduce,

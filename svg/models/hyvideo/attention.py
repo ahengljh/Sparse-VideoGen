@@ -1332,6 +1332,28 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
                 ctca_reused = cache.calls_since_full_cluster > 0
                 cluster_quality = cache.get_average_quality()
 
+        token_energy = None
+        token_reuse_mask = None
+        ckgr_prev_cache = ckgr.get_cache(self.layer_idx)
+        if ckgr.config.token_delta_threshold is not None or ckgr.config.token_delta_quantile is not None:
+            token_energy = hidden_states[:, :video_length, :].float().abs().mean(dim=-1)
+            if ckgr_prev_cache is not None and ckgr_prev_cache.token_energy is not None:
+                prev_energy = ckgr_prev_cache.token_energy.to(token_energy.device, non_blocking=True)
+                if prev_energy.shape == token_energy.shape:
+                    delta = (token_energy - prev_energy).abs() / (prev_energy + 1e-6)
+                    if hasattr(self, "frame_h_tokens") and hasattr(self, "frame_w_tokens"):
+                        h_tokens = self.frame_h_tokens
+                        w_tokens = self.frame_w_tokens
+                        if h_tokens * w_tokens * self.num_frame == video_length:
+                            delta_2d = delta.view(cfg * self.num_frame, 1, h_tokens, w_tokens)
+                            delta_2d = F.avg_pool2d(delta_2d, kernel_size=3, stride=1, padding=1)
+                            delta = delta_2d.view(cfg, video_length)
+                    threshold = ckgr.config.token_delta_threshold
+                    if ckgr.config.token_delta_quantile is not None:
+                        threshold = torch.quantile(delta.flatten(), ckgr.config.token_delta_quantile)
+                    if threshold is not None:
+                        token_reuse_mask = delta <= threshold
+
         cluster_importance = None
         if ckgr.config.importance_threshold is not None or ckgr.config.importance_quantile is not None:
             denom = kcluster_sizes.float().sum(dim=1, keepdim=True).clamp(min=1.0)
@@ -1344,14 +1366,15 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
             cluster_quality,
             current_k_centroids=kcentroids,
             cluster_importance=cluster_importance,
+            token_reuse_mask=token_reuse_mask,
         )
 
-        token_reuse_mask = ckgr.reduce_reuse_mask(reuse_mask, cfg, num_heads)
+        token_reuse_mask_heads = ckgr.reduce_reuse_mask(reuse_mask, cfg, num_heads)
         reuse_mask_tokens = None
-        if token_reuse_mask is not None and token_reuse_mask.any():
+        if token_reuse_mask_heads is not None and token_reuse_mask_heads.any():
             reuse_mask_tokens = torch.zeros(cfg, seq_len, dtype=torch.bool, device=query.device)
-            reuse_mask_tokens[:, :video_length] = token_reuse_mask
-        effective_reuse = ckgr_info['reused'] and token_reuse_mask is not None and token_reuse_mask.any()
+            reuse_mask_tokens[:, :video_length] = token_reuse_mask_heads
+        effective_reuse = ckgr_info['reused'] and token_reuse_mask_heads is not None and token_reuse_mask_heads.any()
         ckgr_info['reused'] = effective_reuse
 
         # 6. Value projection (selective if reuse applies)
@@ -1362,7 +1385,7 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         reuse_mask_override = None
         reuse_mask_effective = None
         if effective_reuse:
-            reuse_mask_override = token_reuse_mask.unsqueeze(1).expand(-1, num_heads, -1)
+            reuse_mask_override = token_reuse_mask_heads.unsqueeze(1).expand(-1, num_heads, -1)
             reuse_mask_override = reuse_mask_override.reshape(cfg * num_heads, video_length)
 
             reuse_mask_effective = reuse_mask & reuse_mask_override
@@ -1395,6 +1418,7 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
             timestep_val,
             ctca_reused,
             cluster_quality,
+            token_energy=token_energy,
         )
 
         if ckgr_cache is not None:

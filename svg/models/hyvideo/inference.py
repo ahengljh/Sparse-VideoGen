@@ -166,6 +166,8 @@ def replace_hyvideo_attention(
         AttnModule.context_length = context_length
         AttnModule.num_frame = num_frame
         AttnModule.frame_size = frame_size
+        AttnModule.frame_h_tokens = max(height // 16, 1)
+        AttnModule.frame_w_tokens = max(width // 16, 1)
 
         AttnModule.num_q_centroids = num_q_centroids
         AttnModule.num_k_centroids = num_k_centroids
@@ -219,6 +221,8 @@ def replace_hyvideo_attention(
         AttnModule.context_length = context_length
         AttnModule.num_frame = num_frame
         AttnModule.frame_size = frame_size
+        AttnModule.frame_h_tokens = max(height // 16, 1)
+        AttnModule.frame_w_tokens = max(width // 16, 1)
 
         AttnModule.num_q_centroids = num_q_centroids
         AttnModule.num_k_centroids = num_k_centroids
