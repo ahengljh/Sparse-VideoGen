@@ -189,6 +189,7 @@ class ClusterKVCache:
     For HunyuanVideo with 1000 clusters, 60 layers, 24 heads, 128 dim:
     Memory = 60 * 2 * 1000 * 24 * 128 * 2 bytes = ~0.35 GB (vs ~170 GB for full KV cache)
     """
+    # In token reuse mode, centroids may be empty and token_indices/v_tokens store sparse caches.
 
     # Cluster centroids in K/V space
     # Shape: [B*H, num_k_clusters, head_dim]
@@ -216,6 +217,10 @@ class ClusterKVCache:
     quality_score: float = 0.0
     update_count: int = 0
     token_energy: Optional[torch.Tensor] = None
+    token_indices: Optional[torch.Tensor] = None
+    token_valid: Optional[torch.Tensor] = None
+    v_tokens: Optional[torch.Tensor] = None
+    k_tokens: Optional[torch.Tensor] = None
 
     def to_device(
         self,
@@ -227,6 +232,10 @@ class ClusterKVCache:
         move_cluster_ids: bool = True,
         move_cluster_sizes: bool = True,
         move_token_energy: bool = True,
+        move_token_indices: bool = True,
+        move_token_valid: bool = True,
+        move_v_tokens: bool = True,
+        move_k_tokens: bool = True,
     ):
         """Move cache to device with selective fields."""
         if move_k_centroids:
@@ -243,6 +252,14 @@ class ClusterKVCache:
             self.cluster_sizes = self.cluster_sizes.to(device, non_blocking=True)
         if move_token_energy and self.token_energy is not None:
             self.token_energy = self.token_energy.to(device, non_blocking=True)
+        if move_token_indices and self.token_indices is not None:
+            self.token_indices = self.token_indices.to(device, non_blocking=True)
+        if move_token_valid and self.token_valid is not None:
+            self.token_valid = self.token_valid.to(device, non_blocking=True)
+        if move_v_tokens and self.v_tokens is not None:
+            self.v_tokens = self.v_tokens.to(device, non_blocking=True)
+        if move_k_tokens and self.k_tokens is not None:
+            self.k_tokens = self.k_tokens.to(device, non_blocking=True)
 
     def to_cpu(self):
         """Move cache to CPU to save GPU memory."""
@@ -254,6 +271,14 @@ class ClusterKVCache:
         self.cluster_sizes = self.cluster_sizes.cpu()
         if self.token_energy is not None:
             self.token_energy = self.token_energy.cpu()
+        if self.token_indices is not None:
+            self.token_indices = self.token_indices.cpu()
+        if self.token_valid is not None:
+            self.token_valid = self.token_valid.cpu()
+        if self.v_tokens is not None:
+            self.v_tokens = self.v_tokens.cpu()
+        if self.k_tokens is not None:
+            self.k_tokens = self.k_tokens.cpu()
 
     def memory_bytes(self) -> int:
         """Return total memory usage in bytes."""
@@ -268,6 +293,14 @@ class ClusterKVCache:
         ]
         if self.token_energy is not None:
             tensors.append(self.token_energy)
+        if self.token_indices is not None:
+            tensors.append(self.token_indices)
+        if self.token_valid is not None:
+            tensors.append(self.token_valid)
+        if self.v_tokens is not None:
+            tensors.append(self.v_tokens)
+        if self.k_tokens is not None:
+            tensors.append(self.k_tokens)
         for tensor in tensors:
             total += tensor.numel() * tensor.element_size()
         return total
@@ -288,6 +321,16 @@ class CKGRConfig:
 
     # Minimum token-level reuse ratio to enable reuse
     min_reuse_ratio: float = 0.05
+
+    # Reuse mode: "cluster" (centroid-based) or "token" (sparse token cache)
+    reuse_mode: str = "token"
+
+    # Token cache settings (token mode only)
+    token_cache_ratio: float = 0.1
+    token_cache_max_tokens: int = 1024
+    token_energy_quantile: float = 0.5
+    token_delta_smooth_kernel: int = 3
+    token_delta_dilate_kernel: int = 3
 
     # Minimum cache update count before allowing reuse (warmup)
     min_reuse_steps: int = 2
@@ -390,6 +433,7 @@ class ClusterGuidedKVReuse:
 
         logger.info(f"[CKGR] Initialized with {num_layers} layers, "
                    f"{config.num_k_clusters} clusters, "
+                   f"reuse_mode={config.reuse_mode}, "
                    f"stability_threshold={config.stability_threshold}")
 
     def reset(self):
@@ -673,6 +717,14 @@ class ClusterGuidedKVReuse:
             return False
         cache = self._cache[layer_idx]
 
+        if self.config.reuse_mode == "token":
+            # Warmup: wait for enough updates before reusing
+            if self.config.min_reuse_steps > 0 and cache.update_count < self.config.min_reuse_steps:
+                return False
+            if cache.token_indices is None or cache.v_tokens is None:
+                return False
+            return True
+
         # CTCA did full recluster - cache is invalid
         if not ctca_reused:
             return False
@@ -746,10 +798,16 @@ class ClusterGuidedKVReuse:
             return 0.0
 
         bytes_to_transfer = 0
-        if reuse_k:
-            bytes_to_transfer += cache.k_centroids.numel() * cache.k_centroids.element_size()
-        if reuse_v:
-            bytes_to_transfer += cache.v_centroids.numel() * cache.v_centroids.element_size()
+        if self.config.reuse_mode == "token":
+            if reuse_k and cache.k_tokens is not None:
+                bytes_to_transfer += cache.k_tokens.numel() * cache.k_tokens.element_size()
+            if reuse_v and cache.v_tokens is not None:
+                bytes_to_transfer += cache.v_tokens.numel() * cache.v_tokens.element_size()
+        else:
+            if reuse_k:
+                bytes_to_transfer += cache.k_centroids.numel() * cache.k_centroids.element_size()
+            if reuse_v:
+                bytes_to_transfer += cache.v_centroids.numel() * cache.v_centroids.element_size()
 
         transfer_seconds = bytes_to_transfer / (self.config.transfer_bandwidth_gbps * 1e9)
         return transfer_seconds * 1e3
@@ -768,6 +826,67 @@ class ClusterGuidedKVReuse:
             us_per_token += self.config.proj_us_per_token_v
 
         return (reuse_tokens * us_per_token) / 1e3
+
+    def _select_token_cache(
+        self,
+        token_mask: Optional[torch.Tensor],
+        token_scores: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Select token indices for sparse reuse cache."""
+        if token_scores is None:
+            return None, None
+
+        scores = token_scores.float()
+        if token_mask is None:
+            token_mask = torch.isfinite(scores)
+        if token_mask.shape != scores.shape:
+            raise ValueError("token_mask must match token_scores shape")
+
+        seq_len = scores.shape[1]
+        max_tokens = int(seq_len * self.config.token_cache_ratio)
+        if self.config.token_cache_max_tokens > 0:
+            max_tokens = min(max_tokens, self.config.token_cache_max_tokens)
+        if max_tokens <= 0:
+            return None, None
+        max_tokens = max(1, max_tokens)
+
+        masked_scores = scores.masked_fill(~token_mask, float("inf"))
+        k = min(max_tokens, seq_len)
+        values, indices = torch.topk(masked_scores, k, dim=1, largest=False)
+        valid = torch.isfinite(values)
+        if not valid.any():
+            return None, None
+
+        return indices, valid
+
+    def _build_token_cache(
+        self,
+        K: torch.Tensor,
+        V: torch.Tensor,
+        token_mask: Optional[torch.Tensor],
+        token_scores: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Gather sparse token cache values for reuse."""
+        token_indices, token_valid = self._select_token_cache(token_mask, token_scores)
+        if token_indices is None:
+            return None, None, None, None
+
+        batch_size, num_heads, _, head_dim = V.shape
+        num_tokens = token_indices.shape[1]
+        index = token_indices.clamp(min=0)
+        gather_index = index[:, None, :, None].expand(batch_size, num_heads, num_tokens, head_dim)
+
+        v_tokens = torch.gather(V, 2, gather_index)
+        if token_valid is not None:
+            v_tokens = v_tokens * token_valid[:, None, :, None].to(v_tokens.dtype)
+
+        k_tokens = None
+        if self.config.reuse_k:
+            k_tokens = torch.gather(K, 2, gather_index)
+            if token_valid is not None:
+                k_tokens = k_tokens * token_valid[:, None, :, None].to(k_tokens.dtype)
+
+        return token_indices, token_valid, v_tokens, k_tokens
 
     def compute_reuse_masks(
         self,
@@ -796,6 +915,58 @@ class ClusterGuidedKVReuse:
         # If reuse is disabled entirely, skip
         if not (self.config.reuse_k or self.config.reuse_v):
             return None, None, info, None
+
+        if self.config.reuse_mode == "token":
+            if not self.should_reuse(layer_idx, ctca_reused, cluster_quality):
+                return None, None, info, None
+            if token_reuse_mask is None:
+                return None, None, info, None
+            if token_reuse_mask.dim() != 2:
+                raise ValueError("token_reuse_mask must be [B, S] or [B*H, S]")
+
+            cache = self._cache[layer_idx]
+            device = token_reuse_mask.device
+
+            reuse_mask = token_reuse_mask
+            reuse_ratio = reuse_mask.float().mean().item()
+            info['reused'] = True
+            info['reuse_ratio'] = reuse_ratio
+
+            if self.config.min_reuse_ratio > 0.0 and reuse_ratio < self.config.min_reuse_ratio:
+                info['reused'] = False
+                return None, None, info, cache
+
+            if self.config.use_transfer_cost:
+                reuse_tokens = int(reuse_mask.sum().item())
+                transfer_ms = self._estimate_transfer_cost_ms(cache, self.config.reuse_k, self.config.reuse_v)
+                savings_ms = self._estimate_compute_savings_ms(reuse_tokens, self.config.reuse_k, self.config.reuse_v)
+                reuse_score = savings_ms - transfer_ms
+
+                info['reuse_tokens'] = reuse_tokens
+                info['transfer_ms'] = transfer_ms
+                info['compute_savings_ms'] = savings_ms
+                info['reuse_score'] = reuse_score
+
+                if reuse_score < self.config.min_reuse_score:
+                    info['reused'] = False
+                    return None, None, info, cache
+
+            cache.to_device(
+                device,
+                move_k_centroids=False,
+                move_v_centroids=False,
+                move_stable_clusters=False,
+                move_stable_counts=False,
+                move_cluster_ids=False,
+                move_cluster_sizes=False,
+                move_token_energy=False,
+                move_token_indices=True,
+                move_token_valid=True,
+                move_v_tokens=self.config.reuse_v,
+                move_k_tokens=self.config.reuse_k,
+            )
+
+            return None, reuse_mask, info, cache
 
         # Check if we should attempt reuse
         if not self.should_reuse(layer_idx, ctca_reused, cluster_quality):
@@ -947,12 +1118,16 @@ class ClusterGuidedKVReuse:
         ctca_reused: bool,
         cluster_quality: float,
         token_energy: Optional[torch.Tensor] = None,
+        token_reuse_mask: Optional[torch.Tensor] = None,
+        token_scores: Optional[torch.Tensor] = None,
     ):
         """Public wrapper to update CKGR cache."""
         self._update_cache(
             layer_idx, K, V, k_cluster_ids,
             timestep, ctca_reused, cluster_quality,
             token_energy=token_energy,
+            token_reuse_mask=token_reuse_mask,
+            token_scores=token_scores,
         )
 
     @time_logging_decorator("Level 3 - CKGR process KV")
@@ -1045,8 +1220,58 @@ class ClusterGuidedKVReuse:
         ctca_reused: bool,
         cluster_quality: float,
         token_energy: Optional[torch.Tensor] = None,
+        token_reuse_mask: Optional[torch.Tensor] = None,
+        token_scores: Optional[torch.Tensor] = None,
     ):
-        """Update the cache with new K/V centroids."""
+        """Update the cache with new K/V state."""
+
+        if self.config.reuse_mode == "token":
+            if layer_idx in self._cache:
+                update_count = self._cache[layer_idx].update_count + 1
+            else:
+                update_count = 1
+
+            token_indices = None
+            token_valid = None
+            v_tokens = None
+            k_tokens = None
+            if token_reuse_mask is not None:
+                batch_heads, seq_len, head_dim = V.shape
+                batch_size = token_reuse_mask.shape[0]
+                if batch_heads % batch_size != 0:
+                    logger.warning("[CKGR] Token cache update skipped due to batch/head mismatch.")
+                else:
+                    num_heads = max(1, batch_heads // batch_size)
+                    V_view = V.view(batch_size, num_heads, seq_len, head_dim)
+                    K_view = K.view(batch_size, num_heads, seq_len, head_dim)
+
+                    token_indices, token_valid, v_tokens, k_tokens = self._build_token_cache(
+                        K_view, V_view, token_reuse_mask, token_scores
+                    )
+
+            empty_fp = torch.empty(0, device=V.device, dtype=V.dtype)
+            empty_bool = torch.empty(0, device=V.device, dtype=torch.bool)
+            empty_int = torch.empty(0, device=V.device, dtype=torch.int32)
+
+            self._cache[layer_idx] = ClusterKVCache(
+                k_centroids=empty_fp,
+                v_centroids=empty_fp,
+                stable_clusters=empty_bool,
+                stable_counts=empty_int,
+                k_cluster_ids=empty_int,
+                cluster_sizes=empty_int,
+                last_update_timestep=timestep,
+                quality_score=cluster_quality,
+                update_count=update_count,
+                token_energy=token_energy.detach().float().cpu() if token_energy is not None else None,
+                token_indices=token_indices.cpu() if token_indices is not None else None,
+                token_valid=token_valid.cpu() if token_valid is not None else None,
+                v_tokens=v_tokens.cpu() if v_tokens is not None else None,
+                k_tokens=k_tokens.cpu() if k_tokens is not None else None,
+            )
+
+            self._cache[layer_idx].to_cpu()
+            return
 
         # Compute K/V centroids
         k_centroids, v_centroids, cluster_sizes = self._compute_kv_centroids(
@@ -1154,6 +1379,12 @@ def create_ckgr_manager(
     reuse_v: bool = True,
     min_head_reuse_ratio: float = 1.0,
     min_reuse_ratio: float = 0.05,
+    reuse_mode: str = "token",
+    token_cache_ratio: float = 0.1,
+    token_cache_max_tokens: int = 1024,
+    token_energy_quantile: float = 0.5,
+    token_delta_smooth_kernel: int = 3,
+    token_delta_dilate_kernel: int = 3,
     token_delta_threshold: Optional[float] = 0.05,
     token_delta_quantile: Optional[float] = None,
     importance_threshold: Optional[float] = None,
@@ -1180,6 +1411,12 @@ def create_ckgr_manager(
         reuse_v: Whether to reuse V via cached centroids
         min_head_reuse_ratio: Token reuse threshold across heads
         min_reuse_ratio: Minimum token reuse ratio to enable reuse
+        reuse_mode: Reuse mode ("cluster" or "token")
+        token_cache_ratio: Fraction of tokens to cache (token mode)
+        token_cache_max_tokens: Cap on cached tokens (token mode)
+        token_energy_quantile: Quantile for low-energy gating (token mode)
+        token_delta_smooth_kernel: Spatial smoothing kernel size for delta
+        token_delta_dilate_kernel: Spatial dilation kernel size for dynamic mask
         token_delta_threshold: Relative token change threshold for reuse
         token_delta_quantile: Quantile threshold for reuse
         importance_threshold: Absolute importance threshold for reuse gating
@@ -1195,6 +1432,10 @@ def create_ckgr_manager(
     Returns:
         Configured CKGR manager
     """
+    if reuse_mode == "token" and reuse_k:
+        logger.info("[CKGR] Token reuse mode disables K reuse to preserve quality.")
+        reuse_k = False
+
     config = CKGRConfig(
         num_k_clusters=num_k_clusters,
         stability_threshold=stability_threshold,
@@ -1206,6 +1447,12 @@ def create_ckgr_manager(
         reuse_v=reuse_v,
         min_head_reuse_ratio=min_head_reuse_ratio,
         min_reuse_ratio=min_reuse_ratio,
+        reuse_mode=reuse_mode,
+        token_cache_ratio=token_cache_ratio,
+        token_cache_max_tokens=token_cache_max_tokens,
+        token_energy_quantile=token_energy_quantile,
+        token_delta_smooth_kernel=token_delta_smooth_kernel,
+        token_delta_dilate_kernel=token_delta_dilate_kernel,
         token_delta_threshold=token_delta_threshold,
         token_delta_quantile=token_delta_quantile,
         importance_threshold=importance_threshold,

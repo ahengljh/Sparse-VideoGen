@@ -1132,7 +1132,7 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
         # 1.5. Apply CKGR (Cluster-Guided KV Reuse) if enabled
         if self.ckgr_enabled and not getattr(self, "_ckgr_skip_semantic", False):
             ckgr = get_ckgr_manager()
-            if ckgr is not None:
+            if ckgr is not None and ckgr.config.reuse_mode != "token":
                 # Determine if CTCA reused clusters (vs full recluster)
                 ctca_reused = False
                 cluster_quality = 1.0
@@ -1332,97 +1332,224 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
                 ctca_reused = cache.calls_since_full_cluster > 0
                 cluster_quality = cache.get_average_quality()
 
-        token_energy = None
-        token_reuse_mask = None
         ckgr_prev_cache = ckgr.get_cache(self.layer_idx)
-        if ckgr.config.token_delta_threshold is not None or ckgr.config.token_delta_quantile is not None:
+        if ckgr.config.reuse_mode == "token":
             token_energy = hidden_states[:, :video_length, :].float().abs().mean(dim=-1)
-            if ckgr_prev_cache is not None and ckgr_prev_cache.token_energy is not None:
-                prev_energy = ckgr_prev_cache.token_energy.to(token_energy.device, non_blocking=True)
-                if prev_energy.shape == token_energy.shape:
-                    delta = (token_energy - prev_energy).abs() / (prev_energy + 1e-6)
-                    if hasattr(self, "frame_h_tokens") and hasattr(self, "frame_w_tokens"):
-                        h_tokens = self.frame_h_tokens
-                        w_tokens = self.frame_w_tokens
-                        if h_tokens * w_tokens * self.num_frame == video_length:
-                            delta_2d = delta.view(cfg * self.num_frame, 1, h_tokens, w_tokens)
-                            delta_2d = F.avg_pool2d(delta_2d, kernel_size=3, stride=1, padding=1)
-                            delta = delta_2d.view(cfg, video_length)
-                    threshold = ckgr.config.token_delta_threshold
-                    if ckgr.config.token_delta_quantile is not None:
-                        threshold = torch.quantile(delta.flatten(), ckgr.config.token_delta_quantile)
-                    if threshold is not None:
-                        token_reuse_mask = delta <= threshold
+            energy_threshold = None
+            if ckgr.config.token_energy_quantile is not None:
+                energy_threshold = torch.quantile(token_energy.flatten(), ckgr.config.token_energy_quantile)
+            if energy_threshold is None:
+                low_energy_mask = torch.ones_like(token_energy, dtype=torch.bool)
+            else:
+                low_energy_mask = token_energy <= energy_threshold
 
-        cluster_importance = None
-        if ckgr.config.importance_threshold is not None or ckgr.config.importance_quantile is not None:
-            denom = kcluster_sizes.float().sum(dim=1, keepdim=True).clamp(min=1.0)
-            cluster_importance = kcluster_sizes.float() / denom
+            token_cache_mask = low_energy_mask
+            token_delta = None
+            token_reuse_mask = None
+            if (ckgr.config.token_delta_threshold is not None or ckgr.config.token_delta_quantile is not None):
+                if ckgr_prev_cache is not None and ckgr_prev_cache.token_energy is not None:
+                    prev_energy = ckgr_prev_cache.token_energy.to(token_energy.device, non_blocking=True)
+                    if prev_energy.shape == token_energy.shape:
+                        token_delta = (token_energy - prev_energy).abs() / (prev_energy + 1e-6)
+                        delta = token_delta
+                        use_2d = False
+                        if hasattr(self, "frame_h_tokens") and hasattr(self, "frame_w_tokens"):
+                            h_tokens = self.frame_h_tokens
+                            w_tokens = self.frame_w_tokens
+                            if h_tokens * w_tokens * self.num_frame == video_length:
+                                use_2d = True
+                                delta_2d = delta.view(cfg * self.num_frame, 1, h_tokens, w_tokens)
+                                smooth_k = max(1, ckgr.config.token_delta_smooth_kernel)
+                                if smooth_k > 1:
+                                    delta_2d = F.avg_pool2d(
+                                        delta_2d,
+                                        kernel_size=smooth_k,
+                                        stride=1,
+                                        padding=smooth_k // 2,
+                                    )
+                                delta = delta_2d.view(cfg, video_length)
 
-        stable_mask, reuse_mask, ckgr_info, ckgr_cache = ckgr.compute_reuse_masks(
-            self.layer_idx,
-            klabels,
-            ctca_reused,
-            cluster_quality,
-            current_k_centroids=kcentroids,
-            cluster_importance=cluster_importance,
-            token_reuse_mask=token_reuse_mask,
-        )
+                        threshold = ckgr.config.token_delta_threshold
+                        if ckgr.config.token_delta_quantile is not None:
+                            threshold = torch.quantile(delta.flatten(), ckgr.config.token_delta_quantile)
+                        if threshold is not None:
+                            dynamic_mask = delta > threshold
+                            if use_2d and ckgr.config.token_delta_dilate_kernel > 1:
+                                dilate_k = ckgr.config.token_delta_dilate_kernel
+                                dyn_2d = dynamic_mask.view(cfg * self.num_frame, 1, h_tokens, w_tokens)
+                                dyn_2d = F.max_pool2d(
+                                    dyn_2d.float(),
+                                    kernel_size=dilate_k,
+                                    stride=1,
+                                    padding=dilate_k // 2,
+                                ) > 0
+                                dynamic_mask = dyn_2d.view(cfg, video_length)
+                            token_reuse_mask = (~dynamic_mask) & low_energy_mask
+                            token_cache_mask = token_reuse_mask
 
-        token_reuse_mask_heads = ckgr.reduce_reuse_mask(reuse_mask, cfg, num_heads)
-        reuse_mask_tokens = None
-        if token_reuse_mask_heads is not None and token_reuse_mask_heads.any():
-            reuse_mask_tokens = torch.zeros(cfg, seq_len, dtype=torch.bool, device=query.device)
-            reuse_mask_tokens[:, :video_length] = token_reuse_mask_heads
-        effective_reuse = ckgr_info['reused'] and token_reuse_mask_heads is not None and token_reuse_mask_heads.any()
-        ckgr_info['reused'] = effective_reuse
+            token_scores = token_delta if token_delta is not None else token_energy
 
-        # 6. Value projection (selective if reuse applies)
-        value = self._project_value_selective(attn, hidden_states, reuse_mask_tokens)
-        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
+            _, reuse_mask, ckgr_info, ckgr_cache = ckgr.compute_reuse_masks(
+                self.layer_idx,
+                klabels,
+                ctca_reused,
+                cluster_quality,
+                token_reuse_mask=token_reuse_mask,
+            )
 
-        # 7. Apply cached centroids for stable clusters (video tokens only)
-        reuse_mask_override = None
-        reuse_mask_effective = None
-        if effective_reuse:
-            reuse_mask_override = token_reuse_mask_heads.unsqueeze(1).expand(-1, num_heads, -1)
-            reuse_mask_override = reuse_mask_override.reshape(cfg * num_heads, video_length)
+            reuse_mask_tokens = None
+            reuse_mask_effective = None
+            reuse_from_cache = None
+            cache_indices = None
+            if ckgr_info['reused'] and token_reuse_mask is not None and ckgr_cache is not None:
+                cache_indices = ckgr_cache.token_indices
+                cache_valid = ckgr_cache.token_valid
+                if cache_indices is not None:
+                    if cache_valid is None:
+                        cache_valid = torch.ones_like(cache_indices, dtype=torch.bool, device=cache_indices.device)
+                    if cache_indices.device != token_reuse_mask.device:
+                        cache_indices = cache_indices.to(token_reuse_mask.device, non_blocking=True)
+                    if cache_valid.device != token_reuse_mask.device:
+                        cache_valid = cache_valid.to(token_reuse_mask.device, non_blocking=True)
 
-            reuse_mask_effective = reuse_mask & reuse_mask_override
-            ckgr_info['reuse_ratio'] = reuse_mask_effective.float().mean().item()
+                    index = cache_indices.clamp(0, video_length - 1)
+                    reuse_from_cache = cache_valid & token_reuse_mask.gather(1, index)
+                    if reuse_from_cache.any():
+                        reuse_mask_effective = torch.zeros_like(token_reuse_mask, dtype=torch.bool)
+                        reuse_mask_effective.scatter_(1, index, reuse_from_cache)
+                        reuse_mask_tokens = torch.zeros(cfg, seq_len, dtype=torch.bool, device=query.device)
+                        reuse_mask_tokens[:, :video_length] = reuse_mask_effective
 
-        if effective_reuse and stable_mask is not None and ckgr_cache is not None:
-            if ckgr.config.reuse_k:
-                key_video = key[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim)
-                key_video, _ = ckgr._scatter_centroids_to_tokens_single(
-                    key_video, ckgr_cache.k_centroids, klabels, stable_mask,
-                    reuse_mask_override=reuse_mask_override,
-                )
-                key[:, :, :video_length, :] = key_video.view(cfg, num_heads, video_length, dim)
-            if ckgr.config.reuse_v:
-                value_video = value[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim)
-                value_video, _ = ckgr._scatter_centroids_to_tokens_single(
-                    value_video, ckgr_cache.v_centroids, klabels, stable_mask,
-                    reuse_mask_override=reuse_mask_override,
-                )
-                value[:, :, :video_length, :] = value_video.view(cfg, num_heads, video_length, dim)
+            effective_reuse = reuse_mask_tokens is not None and reuse_mask_tokens.any()
 
-        # 8. Update CKGR stats and cache
-        total_tokens = cfg * num_heads * video_length
-        ckgr.record_reuse(self.layer_idx, reuse_mask_effective, total_tokens, effective_reuse)
-        ckgr.update_cache(
-            self.layer_idx,
-            key[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim),
-            value[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim),
-            klabels,
-            timestep_val,
-            ctca_reused,
-            cluster_quality,
-            token_energy=token_energy,
-        )
+            # 6. Value projection (selective if reuse applies)
+            value = self._project_value_selective(attn, hidden_states, reuse_mask_tokens)
+            value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
 
-        if ckgr_cache is not None:
-            ckgr_cache.to_cpu()
+            # 7. Apply cached V tokens for reuse regions
+            if effective_reuse and ckgr_cache is not None and reuse_from_cache is not None:
+                value_video = value[:, :, :video_length, :]
+                for b in range(cfg):
+                    b_mask = reuse_from_cache[b]
+                    if not b_mask.any():
+                        continue
+                    idx = cache_indices[b, b_mask].clamp(0, video_length - 1)
+                    value_video[b, :, idx, :] = ckgr_cache.v_tokens[b, :, b_mask, :]
+                value[:, :, :video_length, :] = value_video
+
+            # 8. Update CKGR stats and cache
+            total_tokens = cfg * num_heads * video_length
+            reuse_mask_heads = None
+            if reuse_mask_effective is not None:
+                reuse_mask_heads = reuse_mask_effective.unsqueeze(1).expand(-1, num_heads, -1)
+                reuse_mask_heads = reuse_mask_heads.reshape(cfg * num_heads, video_length)
+            ckgr.record_reuse(self.layer_idx, reuse_mask_heads, total_tokens, effective_reuse)
+            ckgr.update_cache(
+                self.layer_idx,
+                key[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim),
+                value[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim),
+                klabels,
+                timestep_val,
+                ctca_reused,
+                cluster_quality,
+                token_energy=token_energy,
+                token_reuse_mask=token_cache_mask,
+                token_scores=token_scores,
+            )
+
+            if ckgr_cache is not None:
+                ckgr_cache.to_cpu()
+        else:
+            token_energy = None
+            token_reuse_mask = None
+            if ckgr.config.token_delta_threshold is not None or ckgr.config.token_delta_quantile is not None:
+                token_energy = hidden_states[:, :video_length, :].float().abs().mean(dim=-1)
+                if ckgr_prev_cache is not None and ckgr_prev_cache.token_energy is not None:
+                    prev_energy = ckgr_prev_cache.token_energy.to(token_energy.device, non_blocking=True)
+                    if prev_energy.shape == token_energy.shape:
+                        delta = (token_energy - prev_energy).abs() / (prev_energy + 1e-6)
+                        if hasattr(self, "frame_h_tokens") and hasattr(self, "frame_w_tokens"):
+                            h_tokens = self.frame_h_tokens
+                            w_tokens = self.frame_w_tokens
+                            if h_tokens * w_tokens * self.num_frame == video_length:
+                                delta_2d = delta.view(cfg * self.num_frame, 1, h_tokens, w_tokens)
+                                delta_2d = F.avg_pool2d(delta_2d, kernel_size=3, stride=1, padding=1)
+                                delta = delta_2d.view(cfg, video_length)
+                        threshold = ckgr.config.token_delta_threshold
+                        if ckgr.config.token_delta_quantile is not None:
+                            threshold = torch.quantile(delta.flatten(), ckgr.config.token_delta_quantile)
+                        if threshold is not None:
+                            token_reuse_mask = delta <= threshold
+
+            cluster_importance = None
+            if ckgr.config.importance_threshold is not None or ckgr.config.importance_quantile is not None:
+                denom = kcluster_sizes.float().sum(dim=1, keepdim=True).clamp(min=1.0)
+                cluster_importance = kcluster_sizes.float() / denom
+
+            stable_mask, reuse_mask, ckgr_info, ckgr_cache = ckgr.compute_reuse_masks(
+                self.layer_idx,
+                klabels,
+                ctca_reused,
+                cluster_quality,
+                current_k_centroids=kcentroids,
+                cluster_importance=cluster_importance,
+                token_reuse_mask=token_reuse_mask,
+            )
+
+            token_reuse_mask_heads = ckgr.reduce_reuse_mask(reuse_mask, cfg, num_heads)
+            reuse_mask_tokens = None
+            if token_reuse_mask_heads is not None and token_reuse_mask_heads.any():
+                reuse_mask_tokens = torch.zeros(cfg, seq_len, dtype=torch.bool, device=query.device)
+                reuse_mask_tokens[:, :video_length] = token_reuse_mask_heads
+            effective_reuse = ckgr_info['reused'] and token_reuse_mask_heads is not None and token_reuse_mask_heads.any()
+            ckgr_info['reused'] = effective_reuse
+
+            # 6. Value projection (selective if reuse applies)
+            value = self._project_value_selective(attn, hidden_states, reuse_mask_tokens)
+            value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
+
+            # 7. Apply cached centroids for stable clusters (video tokens only)
+            reuse_mask_override = None
+            reuse_mask_effective = None
+            if effective_reuse:
+                reuse_mask_override = token_reuse_mask_heads.unsqueeze(1).expand(-1, num_heads, -1)
+                reuse_mask_override = reuse_mask_override.reshape(cfg * num_heads, video_length)
+
+                reuse_mask_effective = reuse_mask & reuse_mask_override
+                ckgr_info['reuse_ratio'] = reuse_mask_effective.float().mean().item()
+
+            if effective_reuse and stable_mask is not None and ckgr_cache is not None:
+                if ckgr.config.reuse_k:
+                    key_video = key[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim)
+                    key_video, _ = ckgr._scatter_centroids_to_tokens_single(
+                        key_video, ckgr_cache.k_centroids, klabels, stable_mask,
+                        reuse_mask_override=reuse_mask_override,
+                    )
+                    key[:, :, :video_length, :] = key_video.view(cfg, num_heads, video_length, dim)
+                if ckgr.config.reuse_v:
+                    value_video = value[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim)
+                    value_video, _ = ckgr._scatter_centroids_to_tokens_single(
+                        value_video, ckgr_cache.v_centroids, klabels, stable_mask,
+                        reuse_mask_override=reuse_mask_override,
+                    )
+                    value[:, :, :video_length, :] = value_video.view(cfg, num_heads, video_length, dim)
+
+            # 8. Update CKGR stats and cache
+            total_tokens = cfg * num_heads * video_length
+            ckgr.record_reuse(self.layer_idx, reuse_mask_effective, total_tokens, effective_reuse)
+            ckgr.update_cache(
+                self.layer_idx,
+                key[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim),
+                value[:, :, :video_length, :].contiguous().view(cfg * num_heads, video_length, dim),
+                klabels,
+                timestep_val,
+                ctca_reused,
+                cluster_quality,
+                token_energy=token_energy,
+            )
+
+            if ckgr_cache is not None:
+                ckgr_cache.to_cpu()
 
         # 9. Encoder condition and attention
         query, key, value = self.get_encoder_condition_and_concat(attn, query, key, value, encoder_hidden_states)
