@@ -1346,6 +1346,7 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
             token_cache_mask = low_energy_mask
             token_delta = None
             token_reuse_mask = None
+            edge_mask = None
             if (ckgr.config.token_delta_threshold is not None or ckgr.config.token_delta_quantile is not None):
                 if ckgr_prev_cache is not None and ckgr_prev_cache.token_energy is not None:
                     prev_energy = ckgr_prev_cache.token_energy.to(token_energy.device, non_blocking=True)
@@ -1386,6 +1387,55 @@ class Hunyuan_SAPAttn_CTCA_Processor2_0(Hunyuan_SAPAttn_Processor2_0):
                                 dynamic_mask = dyn_2d.view(cfg, video_length)
                             token_reuse_mask = (~dynamic_mask) & low_energy_mask
                             token_cache_mask = token_reuse_mask
+
+            if hasattr(self, "frame_h_tokens") and hasattr(self, "frame_w_tokens"):
+                h_tokens = self.frame_h_tokens
+                w_tokens = self.frame_w_tokens
+                if h_tokens * w_tokens * self.num_frame == video_length:
+                    energy_2d = token_energy.view(cfg * self.num_frame, 1, h_tokens, w_tokens)
+                    smooth_k = max(1, ckgr.config.token_delta_smooth_kernel)
+                    if smooth_k > 1:
+                        energy_2d = F.avg_pool2d(
+                            energy_2d,
+                            kernel_size=smooth_k,
+                            stride=1,
+                            padding=smooth_k // 2,
+                        )
+                    sobel_x = torch.tensor(
+                        [[-1.0, 0.0, 1.0],
+                         [-2.0, 0.0, 2.0],
+                         [-1.0, 0.0, 1.0]],
+                        device=energy_2d.device,
+                        dtype=energy_2d.dtype,
+                    ).view(1, 1, 3, 3)
+                    sobel_y = torch.tensor(
+                        [[-1.0, -2.0, -1.0],
+                         [0.0, 0.0, 0.0],
+                         [1.0, 2.0, 1.0]],
+                        device=energy_2d.device,
+                        dtype=energy_2d.dtype,
+                    ).view(1, 1, 3, 3)
+                    grad_x = F.conv2d(energy_2d, sobel_x, padding=1)
+                    grad_y = F.conv2d(energy_2d, sobel_y, padding=1)
+                    grad = grad_x.abs() + grad_y.abs()
+                    edge_threshold = torch.quantile(grad.flatten(), 0.7)
+                    edge_mask = grad > edge_threshold
+                    if ckgr.config.token_delta_dilate_kernel > 1:
+                        dilate_k = ckgr.config.token_delta_dilate_kernel
+                        edge_mask = F.max_pool2d(
+                            edge_mask.float(),
+                            kernel_size=dilate_k,
+                            stride=1,
+                            padding=dilate_k // 2,
+                        ) > 0
+                    edge_mask = edge_mask.view(cfg, video_length)
+
+            if edge_mask is not None:
+                if token_reuse_mask is None:
+                    token_reuse_mask = low_energy_mask & (~edge_mask)
+                else:
+                    token_reuse_mask = token_reuse_mask & (~edge_mask)
+                token_cache_mask = token_reuse_mask
 
             token_scores = token_delta if token_delta is not None else token_energy
 
