@@ -1,4 +1,5 @@
 import argparse
+import gc
 import json
 import os
 from glob import glob
@@ -16,6 +17,7 @@ from svg.timer import print_operator_log_data
 from svg.utils.seed import seed_everything
 from svg.models.hyvideo.inference import replace_hyvideo_flashattention, replace_hyvideo_attention
 from svg.models.hyvideo.utils import get_prompt_length
+from svg.offload import enable_offloading, pre_encode_and_offload
 
 from svg.logger import logger
 
@@ -57,6 +59,21 @@ if __name__ == "__main__":
     parser.add_argument("--kmeans_iter_step", type=int, default=0, help="Number of KMeans iterations for other diffusion steps in SAP.")
     parser.add_argument("--zero_step_kmeans_init", action="store_true", help="Initialize the centroids for the first step in SAP, not after warmup.")
 
+    # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
+    parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
+    parser.add_argument("--offload_num_layers", type=int, default=6, help="Number of transformer layers to keep on GPU (sliding window size). Higher=faster but more VRAM. Recommended: 4-8 for 24GB, 10-15 for 40GB+.")
+    parser.add_argument("--offload_max_memory_gb", type=float, default=None, help="Auto-tune num_layers based on memory budget (e.g., 20.0 for 24GB GPU).")
+    parser.add_argument("--offload_pinned_memory", action="store_true", default=True, help="Use pinned CPU memory for faster transfers.")
+    parser.add_argument("--offload_no_pinned_memory", action="store_false", dest="offload_pinned_memory", help="Disable pinned memory.")
+    parser.add_argument("--offload_prefetch", action="store_true", default=True, help="Enable async prefetching of next layer.")
+    parser.add_argument("--offload_no_prefetch", action="store_false", dest="offload_prefetch", help="Disable async prefetching.")
+    parser.add_argument("--offload_verbose", action="store_true", help="Enable verbose offloading logging.")
+    parser.add_argument("--offload_auto", action="store_true", help="Auto-tune offloading window based on available VRAM.")
+    parser.add_argument("--offload_max_fraction", type=float, default=0.90, help="When --offload_auto is set, target this fraction of total VRAM.")
+    parser.add_argument("--offload_activation_reserve_gb", type=float, default=4.0, help="Reserve VRAM for activations/caches when auto-tuning offload.")
+    parser.add_argument("--offload_cuda_overhead_gb", type=float, default=0.5, help="Extra VRAM headroom for CUDA workspaces when auto-tuning offload.")
+    parser.add_argument("--offload_auto_allow_increase", action="store_true", help="Allow auto-tune to increase num_layers_on_gpu above --offload_num_layers.")
+
     args = parser.parse_args()
 
     seed_everything(args.seed)
@@ -72,15 +89,45 @@ if __name__ == "__main__":
     #########################################################
     # Load the model
     #########################################################
+    if args.enable_offload:
+        logger.info("Loading model for offload mode...")
     transformer = HunyuanVideoTransformer3DModel.from_pretrained(
         args.model_id, subfolder="transformer", torch_dtype=torch.bfloat16, revision='refs/pr/18'
     )
     flow_shift = 7.0
     scheduler = FlowMatchEulerDiscreteScheduler(shift=flow_shift)
-    pipe = HunyuanVideoPipeline.from_pretrained(args.model_id, transformer=transformer, scheduler=scheduler, revision='refs/pr/18', torch_dtype=torch.bfloat16)
+    pipe = HunyuanVideoPipeline.from_pretrained(
+        args.model_id, transformer=transformer, scheduler=scheduler,
+        revision='refs/pr/18', torch_dtype=torch.bfloat16
+    )
+    if args.enable_offload:
+        # Immediately move everything to CPU to free GPU memory
+        # This is crucial for 24GB GPUs - diffusers may load to GPU during from_pretrained
+        logger.info("Moving all pipeline components to CPU to free GPU memory...")
+        pipe.to("cpu")
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info(f"Pipeline on CPU. GPU memory: {torch.cuda.memory_allocated()/1024**3:.2f}GB")
     pipe.vae.enable_tiling()
-    pipe.to("cuda")
-    
+
+    #########################################################
+    # Setup device placement (with optional offloading)
+    # Note: If offloading is enabled, we pre-encode the prompt first,
+    # then offload text encoders to CPU to save ~14GB of GPU memory.
+    #########################################################
+    offload_manager = None
+    offload_hooks = None
+    pre_encoded_embeds = None  # Will store pre-computed prompt embeddings if offloading
+
+    if args.enable_offload:
+        # For offloading, we need to:
+        # 1. First move to CUDA to enable text encoding
+        # 2. Pre-encode will be done later after prompt is loaded
+        logger.info("Offload mode: Pipeline will use pre-encoded embeddings")
+    else:
+        # Standard mode: load everything to GPU
+        pipe.to("cuda")
+
     config = pipe.transformer.config
 
     #########################################################
@@ -116,6 +163,37 @@ if __name__ == "__main__":
     
     prompt_length = get_prompt_length(pipe, args.prompt)
     print(f"Prompt length: {prompt_length}")
+
+    #########################################################
+    # Pre-encode prompt and setup offloading (if enabled)
+    # This must happen BEFORE replacing attention
+    #########################################################
+    if args.enable_offload:
+        logger.info("Pre-encoding prompt (text encoders temporarily on GPU)...")
+        # Pre-encode prompt - this moves text encoders to GPU, encodes, then offloads to CPU
+        # Note: HunyuanVideoPipeline.encode_prompt doesn't support negative_prompt
+        pre_encoded_embeds = pre_encode_and_offload(
+            pipe,
+            prompt=args.prompt,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+
+        # Now enable transformer layer offloading (text encoders already on CPU)
+        logger.info("Setting up transformer layer offloading...")
+        offload_manager, offload_hooks = enable_offloading(
+            pipe,
+            use_pinned_memory=args.offload_pinned_memory,
+            enable_prefetch=args.offload_prefetch,
+            num_layers_on_gpu=args.offload_num_layers,
+            max_memory_gb=args.offload_max_memory_gb,
+            auto_tune_layers_on_gpu=args.offload_auto,
+            max_memory_fraction=args.offload_max_fraction,
+            activation_reserve_gb=args.offload_activation_reserve_gb,
+            cuda_overhead_gb=args.offload_cuda_overhead_gb,
+            auto_tune_allow_increase=args.offload_auto_allow_increase,
+            verbose=args.offload_verbose,
+        )
 
     #########################################################
     # Replace the attention
@@ -169,15 +247,31 @@ if __name__ == "__main__":
     #########################################################
     # Generate the video
     #########################################################
-    output = pipe(
-        prompt=args.prompt,
-        negative_prompt=args.negative_prompt,
-        height=args.height,
-        width=args.width,
-        num_frames=args.num_frames,
-        guidance_scale=6.0,
-        num_inference_steps=args.num_inference_steps,
-    ).frames[0]
+    if pre_encoded_embeds is not None:
+        # Use pre-computed embeddings (offload mode)
+        # Note: Embedders will be moved to GPU by the forward pre-hook registered in enable_offloading
+        logger.info("Using pre-computed prompt embeddings...")
+        output = pipe(
+            prompt_embeds=pre_encoded_embeds["prompt_embeds"].cuda(),
+            pooled_prompt_embeds=pre_encoded_embeds["pooled_prompt_embeds"].cuda(),
+            prompt_attention_mask=pre_encoded_embeds["prompt_attention_mask"].cuda(),
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            guidance_scale=6.0,
+            num_inference_steps=args.num_inference_steps,
+        ).frames[0]
+    else:
+        # Standard mode - encode prompt on-the-fly
+        output = pipe(
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            height=args.height,
+            width=args.width,
+            num_frames=args.num_frames,
+            guidance_scale=6.0,
+            num_inference_steps=args.num_inference_steps,
+        ).frames[0]
 
     # Create parent directory for output file if it doesn't exist
     output_dir = os.path.dirname(args.output_file)
@@ -185,3 +279,7 @@ if __name__ == "__main__":
         os.makedirs(output_dir, exist_ok=True)
 
     export_to_video(output, args.output_file, fps=24)
+
+    # Print offloading statistics if enabled
+    if offload_manager is not None:
+        offload_manager.print_statistics()

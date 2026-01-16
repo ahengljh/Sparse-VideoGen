@@ -162,6 +162,44 @@ class HunyuanVideoTransformer3DModel_Sparse(HunyuanVideoTransformer3DModel):
         post_patch_width = width // p
         first_frame_num_tokens = 1 * post_patch_height * post_patch_width
 
+        # Ensure all input tensors are on the correct compute device (CUDA)
+        # The pipeline may pass CPU tensors, but we need everything on GPU for computation
+        # Get target device from embedder weights (which should be on CUDA)
+        if hasattr(self, "time_text_embed"):
+            first_param = next(self.time_text_embed.parameters(), None)
+            if first_param is not None:
+                device = first_param.device
+            else:
+                device = hidden_states.device
+        else:
+            device = hidden_states.device
+
+        # If device is still CPU, force CUDA (this shouldn't happen if setup is correct)
+        if device.type == "cpu":
+            device = torch.device("cuda:0")
+            logger.warning("Forcing device to cuda:0 (embedders were on CPU)")
+
+        # Move ALL inputs to the compute device (silent - happens every step)
+        hidden_states = hidden_states.to(device)
+        timestep = timestep.to(device)
+        if pooled_projections is not None:
+            pooled_projections = pooled_projections.to(device)
+        if guidance is not None:
+            guidance = guidance.to(device)
+        encoder_hidden_states = encoder_hidden_states.to(device)
+        encoder_attention_mask = encoder_attention_mask.to(device)
+
+        # Ensure all embedder modules are on the compute device
+        # (They should already be, but this is a safety check)
+        for module_name in ["time_text_embed", "x_embedder", "context_embedder", "rope", "norm_out", "proj_out"]:
+            if hasattr(self, module_name):
+                module = getattr(self, module_name)
+                if module is not None:
+                    first_param = next(module.parameters(), None)
+                    if first_param is not None and first_param.device != device:
+                        logger.warning(f"{module_name} on {first_param.device}, moving to {device}")
+                        module.to(device)
+
         # 1. RoPE
         image_rotary_emb = self.rope(hidden_states)
 
