@@ -15,6 +15,7 @@ from diffusers.utils import load_image, export_to_video
 from dataloader import load_prompt_or_image
 from svg.timer import print_operator_log_data
 from svg.utils.seed import seed_everything
+from svg.models.hyvideo.attention import KVReuseConfig
 from svg.models.hyvideo.inference import replace_hyvideo_flashattention, replace_hyvideo_attention
 from svg.models.hyvideo.utils import get_prompt_length
 from svg.offload import enable_offloading, pre_encode_and_offload
@@ -58,6 +59,13 @@ if __name__ == "__main__":
     parser.add_argument("--kmeans_iter_init", type=int, default=0, help="Number of KMeans iterations for initialization in SAP.")
     parser.add_argument("--kmeans_iter_step", type=int, default=0, help="Number of KMeans iterations for other diffusion steps in SAP.")
     parser.add_argument("--zero_step_kmeans_init", action="store_true", help="Initialize the centroids for the first step in SAP, not after warmup.")
+
+    # KV reuse (encoder keys) across diffusion steps
+    parser.add_argument("--kv_reuse", action="store_true", help="Reuse encoder keys across steps when stable.")
+    parser.add_argument("--kv_reuse_v", action="store_true", help="Also reuse encoder values (default: reuse keys only).")
+    parser.add_argument("--kv_reuse_interval", type=int, default=2, help="Refresh cached K/V every N steps (reuse in between).")
+    parser.add_argument("--kv_reuse_start_step", type=int, default=4, help="Start KV reuse after this many diffusion steps.")
+    parser.add_argument("--kv_reuse_delta_threshold", type=float, default=0.0, help="Mean-abs change threshold for reuse; 0 disables check.")
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
@@ -198,7 +206,18 @@ if __name__ == "__main__":
     #########################################################
     # Replace the attention
     #########################################################
-    replace_hyvideo_flashattention(pipe)
+    kv_reuse_config = None
+    if args.kv_reuse:
+        kv_reuse_config = KVReuseConfig(
+            enabled=True,
+            reuse_k=True,
+            reuse_v=args.kv_reuse_v,
+            interval=max(1, args.kv_reuse_interval),
+            start_step=max(0, args.kv_reuse_start_step),
+            delta_threshold=max(0.0, args.kv_reuse_delta_threshold),
+        )
+
+    replace_hyvideo_flashattention(pipe, kv_reuse_config=kv_reuse_config)
 
     if args.pattern == "SVG":
         replace_hyvideo_attention(
@@ -210,6 +229,7 @@ if __name__ == "__main__":
             first_layers_fp=args.first_layers_fp,
             first_times_fp=args.first_times_fp,
             pattern=args.pattern,
+            kv_reuse_config=kv_reuse_config,
             # SVG specific
             num_sampled_rows=args.num_sampled_rows,
             sample_mse_max_row=args.sample_mse_max_row,
@@ -225,6 +245,7 @@ if __name__ == "__main__":
             first_layers_fp=args.first_layers_fp,
             first_times_fp=args.first_times_fp,
             pattern=args.pattern,
+            kv_reuse_config=kv_reuse_config,
             # SAP specific
             num_q_centroids=args.num_q_centroids,
             num_k_centroids=args.num_k_centroids,

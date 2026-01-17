@@ -1,9 +1,11 @@
 import os
+from typing import Optional
 
 import torch
 
 from ...logger import logger
 from .attention import (
+    KVReuseConfig,
     Hunyuan_SAPAttn_Processor2_0,
     Hunyuan_SVGAttn_Processor2_0,
     HunyuanVideoAttnProcessor2_0_FlashAttention,
@@ -13,10 +15,13 @@ from .custom_models import replace_sparse_forward
 from .utils import get_attention_mask, sparsity_to_width
 
 
-def replace_hyvideo_flashattention(pipe):
+def replace_hyvideo_flashattention(pipe, kv_reuse_config: Optional[KVReuseConfig] = None):
     """
     Replace the FSDP + masked attention with flash attention + varlen. Crucial for inference efficiency.
     """
+    if kv_reuse_config is not None:
+        HunyuanVideoAttnProcessor2_0_FlashAttention.kv_reuse_cfg = kv_reuse_config
+
     for layer_idx, m in enumerate(pipe.transformer.transformer_blocks):
         self_attn = m.attn
         self_attn.processor = HunyuanVideoAttnProcessor2_0_FlashAttention(layer_idx=layer_idx)
@@ -39,6 +44,7 @@ def replace_hyvideo_attention(
     first_layers_fp,
     first_times_fp,
     pattern="SVG",  # Default to SVG for backward compatibility
+    kv_reuse_config: Optional[KVReuseConfig] = None,
     # SVG specific, but provide defaults for general call signature
     num_sampled_rows=64,
     sample_mse_max_row=10000,
@@ -59,6 +65,9 @@ def replace_hyvideo_attention(
     frame_size = height * width // 256  # TODO: Make it more formal
 
     if pattern == "SVG":
+        if kv_reuse_config is not None:
+            Hunyuan_SVGAttn_Processor2_0.kv_reuse_cfg = kv_reuse_config
+
         masks = ["spatial", "temporal"]
 
         # Calculation
@@ -115,6 +124,8 @@ def replace_hyvideo_attention(
             )
 
     elif pattern in ["SAP"]:
+        if kv_reuse_config is not None:
+            Hunyuan_SAPAttn_Processor2_0.kv_reuse_cfg = kv_reuse_config
 
         # Pass K-means specific parameters to the processor's constructor or set them as attributes
         # The processor itself will handle the K-means logic internally

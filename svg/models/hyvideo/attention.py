@@ -1,4 +1,5 @@
 import json
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import flashinfer
@@ -32,7 +33,113 @@ torch._dynamo.config.cache_size_limit = 192 * 3
 torch._dynamo.config.accumulated_cache_size_limit = 192 * 3
 
 
-class HunyuanVideoAttnProcessor2_0_FlashAttention:
+@dataclass
+class KVReuseConfig:
+    enabled: bool = False
+    reuse_k: bool = True
+    reuse_v: bool = False
+    interval: int = 2
+    start_step: int = 4
+    delta_threshold: float = 0.0
+
+
+class KVReuseMixin:
+    kv_reuse_cfg = KVReuseConfig()
+
+    def _kv_reuse_init(self) -> None:
+        self._kv_reuse_step = -1
+        self._kv_reuse_last_timestep = None
+        self._kv_reuse_key = None
+        self._kv_reuse_value = None
+        self._kv_reuse_sig = None
+        self._kv_reuse_hits = 0
+        self._kv_reuse_misses = 0
+
+    def reset_kv_reuse_state(self) -> None:
+        self._kv_reuse_step = -1
+        self._kv_reuse_last_timestep = None
+        self._kv_reuse_key = None
+        self._kv_reuse_value = None
+        self._kv_reuse_sig = None
+        self._kv_reuse_hits = 0
+        self._kv_reuse_misses = 0
+
+    def _kv_reuse_step_idx(self, timestep: Optional[int]) -> Optional[int]:
+        if timestep is None:
+            return None
+        if isinstance(timestep, torch.Tensor):
+            t_val = int(timestep[0].item()) if timestep.numel() > 0 else int(timestep.item())
+        else:
+            t_val = int(timestep)
+
+        if self._kv_reuse_last_timestep is None or t_val != self._kv_reuse_last_timestep:
+            self._kv_reuse_step += 1
+            self._kv_reuse_last_timestep = t_val
+
+        return self._kv_reuse_step
+
+    def _kv_reuse_signature(self, tensor: torch.Tensor) -> float:
+        return float(tensor.float().abs().mean().item())
+
+    def _kv_reuse_should_reuse(
+        self, encoder_hidden_states: torch.Tensor, timestep: Optional[int]
+    ) -> Tuple[bool, Optional[int], Optional[float]]:
+        cfg = self.kv_reuse_cfg
+        if not cfg.enabled or not cfg.reuse_k:
+            return False, None, None
+
+        step_idx = self._kv_reuse_step_idx(timestep)
+        if step_idx is None or step_idx < cfg.start_step or cfg.interval <= 1:
+            return False, step_idx, None
+
+        if self._kv_reuse_key is None or (step_idx % cfg.interval) == 0:
+            return False, step_idx, None
+        if (
+            self._kv_reuse_key.shape[0] != encoder_hidden_states.shape[0]
+            or self._kv_reuse_key.shape[1] != encoder_hidden_states.shape[1]
+        ):
+            return False, step_idx, None
+
+        if cfg.delta_threshold > 0:
+            sig = self._kv_reuse_signature(encoder_hidden_states)
+            if self._kv_reuse_sig is None or abs(sig - self._kv_reuse_sig) > cfg.delta_threshold:
+                return False, step_idx, sig
+            return True, step_idx, sig
+
+        return True, step_idx, None
+
+    def _kv_reuse_get_encoder_kv(
+        self,
+        encoder_hidden_states: torch.Tensor,
+        k_proj,
+        v_proj,
+        timestep: Optional[int],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        cfg = self.kv_reuse_cfg
+        reuse, _, sig = self._kv_reuse_should_reuse(encoder_hidden_states, timestep)
+
+        if reuse:
+            key = self._kv_reuse_key
+            if cfg.reuse_v and self._kv_reuse_value is not None:
+                value = self._kv_reuse_value
+            else:
+                value = v_proj(encoder_hidden_states)
+            self._kv_reuse_hits += 1
+            return key, value
+
+        key = k_proj(encoder_hidden_states)
+        value = v_proj(encoder_hidden_states)
+
+        if cfg.enabled and cfg.reuse_k:
+            self._kv_reuse_key = key.detach()
+            self._kv_reuse_value = value.detach() if cfg.reuse_v else None
+            self._kv_reuse_sig = sig if sig is not None else self._kv_reuse_signature(encoder_hidden_states)
+        self._kv_reuse_misses += 1
+
+        return key, value
+
+
+class HunyuanVideoAttnProcessor2_0_FlashAttention(KVReuseMixin):
     """
     This is a custom attention processor that replaces the original attention implementation with flash attention.
     The original implementation is based on the FSDP + mask implementation, which is SLOW. We switch to flash attention + varlen for efficiency.
@@ -40,6 +147,7 @@ class HunyuanVideoAttnProcessor2_0_FlashAttention:
 
     def __init__(self, layer_idx):
         self.layer_idx = layer_idx
+        self._kv_reuse_init()
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("WanAttnProcessor2_0 requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0.")
 
@@ -50,14 +158,29 @@ class HunyuanVideoAttnProcessor2_0_FlashAttention:
         encoder_hidden_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         image_rotary_emb: Optional[torch.Tensor] = None,
+        timestep: Optional[int] = None,
     ) -> torch.Tensor:
-        if attn.add_q_proj is None and encoder_hidden_states is not None:
-            hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+        if attn.add_q_proj is None and encoder_hidden_states is not None and self.kv_reuse_cfg.enabled:
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(hidden_states)
+            value = attn.to_v(hidden_states)
 
-        # 1. QKV projections
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
+            encoder_query = attn.to_q(encoder_hidden_states)
+            encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
+                encoder_hidden_states, attn.to_k, attn.to_v, timestep
+            )
+
+            query = torch.cat([query, encoder_query], dim=1)
+            key = torch.cat([key, encoder_key], dim=1)
+            value = torch.cat([value, encoder_value], dim=1)
+        else:
+            if attn.add_q_proj is None and encoder_hidden_states is not None:
+                hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+
+            # 1. QKV projections
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(hidden_states)
+            value = attn.to_v(hidden_states)
 
         query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
@@ -93,8 +216,9 @@ class HunyuanVideoAttnProcessor2_0_FlashAttention:
         # 4. Encoder condition QKV projection and normalization
         if attn.add_q_proj is not None and encoder_hidden_states is not None:
             encoder_query = attn.add_q_proj(encoder_hidden_states)
-            encoder_key = attn.add_k_proj(encoder_hidden_states)
-            encoder_value = attn.add_v_proj(encoder_hidden_states)
+            encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
+                encoder_hidden_states, attn.add_k_proj, attn.add_v_proj, timestep
+            )
 
             encoder_query = encoder_query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
             encoder_key = encoder_key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
@@ -225,7 +349,7 @@ except ImportError:
     logger.info(f"{Color.red}Disable Fast CUDA and Triton Kernels{Color.reset}")
 
 
-class Hunyuan_SVGAttn_Processor2_0:
+class Hunyuan_SVGAttn_Processor2_0(KVReuseMixin):
     """
     Supports Sparse VideoGen.
     """
@@ -246,14 +370,29 @@ class Hunyuan_SVGAttn_Processor2_0:
 
     def __init__(self, layer_idx):
         self.layer_idx = layer_idx
+        self._kv_reuse_init()
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("Hunyuan_SparseAttn requires PyTorch 2.0, please upgrade PyTorch.")
 
     @time_logging_decorator("Level 2 - get_qkv")
-    def get_qkv(self, attn, hidden_states):
-        query = attn.to_q(hidden_states)
-        key = attn.to_k(hidden_states)
-        value = attn.to_v(hidden_states)
+    def get_qkv(self, attn, hidden_states, encoder_hidden_states=None, timestep=None):
+        if encoder_hidden_states is not None and self.kv_reuse_cfg.enabled:
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(hidden_states)
+            value = attn.to_v(hidden_states)
+
+            encoder_query = attn.to_q(encoder_hidden_states)
+            encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
+                encoder_hidden_states, attn.to_k, attn.to_v, timestep
+            )
+
+            query = torch.cat([query, encoder_query], dim=1)
+            key = torch.cat([key, encoder_key], dim=1)
+            value = torch.cat([value, encoder_value], dim=1)
+        else:
+            query = attn.to_q(hidden_states)
+            key = attn.to_k(hidden_states)
+            value = attn.to_v(hidden_states)
 
         return query, key, value
 
@@ -283,12 +422,13 @@ class Hunyuan_SVGAttn_Processor2_0:
         return query, key
 
     @time_logging_decorator("Level 2 - get_encoder_condition_and_concat")
-    def get_encoder_condition_and_concat(self, attn, query, key, value, encoder_hidden_states):
+    def get_encoder_condition_and_concat(self, attn, query, key, value, encoder_hidden_states, timestep=None):
         # 4. Encoder condition QKV projection and normalization
         if attn.add_q_proj is not None and encoder_hidden_states is not None:
             encoder_query = attn.add_q_proj(encoder_hidden_states)
-            encoder_key = attn.add_k_proj(encoder_hidden_states)
-            encoder_value = attn.add_v_proj(encoder_hidden_states)
+            encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
+                encoder_hidden_states, attn.add_k_proj, attn.add_v_proj, timestep
+            )
 
             encoder_query = encoder_query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
             encoder_key = encoder_key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
@@ -341,11 +481,16 @@ class Hunyuan_SVGAttn_Processor2_0:
         image_rotary_emb: Optional[torch.Tensor] = None,
         timestep: Optional[int] = None,
     ) -> torch.Tensor:
-        if attn.add_q_proj is None and encoder_hidden_states is not None:
+        if (
+            attn.add_q_proj is None
+            and encoder_hidden_states is not None
+            and not self.kv_reuse_cfg.enabled
+        ):
             hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
 
         # 1. QKV projections
-        query, key, value = self.get_qkv(attn, hidden_states)
+        encoder_states_for_qkv = encoder_hidden_states if attn.add_q_proj is None else None
+        query, key, value = self.get_qkv(attn, hidden_states, encoder_states_for_qkv, timestep)
 
         query, key, value = self.get_transpose_qkv(attn, query, key, value)
 
@@ -356,7 +501,9 @@ class Hunyuan_SVGAttn_Processor2_0:
         query, key = self.get_rotary_emb(attn, query, key, image_rotary_emb, encoder_hidden_states)
 
         # 4. Encoder condition QKV projection and normalization
-        query, key, value = self.get_encoder_condition_and_concat(attn, query, key, value, encoder_hidden_states)
+        query, key, value = self.get_encoder_condition_and_concat(
+            attn, query, key, value, encoder_hidden_states, timestep
+        )
 
         # 5. Calculate the attention
         # ========================================================================

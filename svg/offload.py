@@ -303,6 +303,12 @@ class LayerOffloadManager:
                 if self.config.verbose:
                     logger.warning(f"Sparsity cache clear skipped for layer {layer_idx}: {e}")
 
+        # Clear KV reuse caches to avoid retaining GPU tensors when offloading.
+        if hasattr(layer, "attn") and hasattr(layer.attn, "processor"):
+            processor = layer.attn.processor
+            if hasattr(processor, "reset_kv_reuse_state"):
+                processor.reset_kv_reuse_state()
+
         if use_pinned:
             # Move to CPU with pinned memory for faster future transfers
             for param in layer.parameters():
