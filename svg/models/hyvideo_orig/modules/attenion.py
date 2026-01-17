@@ -480,6 +480,10 @@ def attention(
         else:
             mode = "SAP"
 
+    # Auto-fallback to torch mode if flash attention is not available
+    if mode == "flash" and flash_attn_varlen_func is None:
+        mode = "torch"
+
     pre_attn_layout, post_attn_layout = MEMORY_LAYOUT[mode]
     q = pre_attn_layout(q)
     k = pre_attn_layout(k)
