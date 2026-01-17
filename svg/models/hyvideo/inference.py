@@ -1,5 +1,5 @@
 import os
-from typing import Optional
+from typing import Optional, Dict, List, Tuple
 
 import torch
 
@@ -175,3 +175,31 @@ def replace_hyvideo_attention(
 
     else:
         assert pattern == "dense", f"Invalid pattern: {pattern}"
+
+
+def collect_kv_reuse_stats(pipe) -> Tuple[Dict[str, int], List[Dict[str, int]]]:
+    totals = {"hits": 0, "misses": 0, "layers": 0}
+    per_layer = []
+
+    def _collect_from_block(block, layer_idx):
+        processor = block.attn.processor
+        if not hasattr(processor, "get_kv_reuse_stats"):
+            return
+        stats = processor.get_kv_reuse_stats()
+        hits = int(stats.get("hits", 0))
+        misses = int(stats.get("misses", 0))
+        if hits == 0 and misses == 0:
+            return
+        totals["hits"] += hits
+        totals["misses"] += misses
+        totals["layers"] += 1
+        per_layer.append({"layer": layer_idx, "hits": hits, "misses": misses})
+
+    for layer_idx, block in enumerate(pipe.transformer.transformer_blocks):
+        _collect_from_block(block, layer_idx)
+
+    offset = len(pipe.transformer.transformer_blocks)
+    for layer_idx, block in enumerate(pipe.transformer.single_transformer_blocks):
+        _collect_from_block(block, layer_idx + offset)
+
+    return totals, per_layer

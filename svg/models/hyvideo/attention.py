@@ -64,6 +64,12 @@ class KVReuseMixin:
         self._kv_reuse_hits = 0
         self._kv_reuse_misses = 0
 
+    def get_kv_reuse_stats(self) -> dict:
+        return {
+            "hits": self._kv_reuse_hits,
+            "misses": self._kv_reuse_misses,
+        }
+
     def _kv_reuse_step_idx(self, timestep: Optional[int]) -> Optional[int]:
         if timestep is None:
             return None

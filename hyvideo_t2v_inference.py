@@ -16,7 +16,7 @@ from dataloader import load_prompt_or_image
 from svg.timer import print_operator_log_data
 from svg.utils.seed import seed_everything
 from svg.models.hyvideo.attention import KVReuseConfig
-from svg.models.hyvideo.inference import replace_hyvideo_flashattention, replace_hyvideo_attention
+from svg.models.hyvideo.inference import collect_kv_reuse_stats, replace_hyvideo_flashattention, replace_hyvideo_attention
 from svg.models.hyvideo.utils import get_prompt_length
 from svg.offload import enable_offloading, pre_encode_and_offload
 
@@ -66,6 +66,7 @@ if __name__ == "__main__":
     parser.add_argument("--kv_reuse_interval", type=int, default=2, help="Refresh cached K/V every N steps (reuse in between).")
     parser.add_argument("--kv_reuse_start_step", type=int, default=4, help="Start KV reuse after this many diffusion steps.")
     parser.add_argument("--kv_reuse_delta_threshold", type=float, default=0.0, help="Mean-abs change threshold for reuse; 0 disables check.")
+    parser.add_argument("--kv_reuse_verbose", action="store_true", help="Print per-layer KV reuse hit/miss counts.")
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
@@ -300,6 +301,21 @@ if __name__ == "__main__":
         os.makedirs(output_dir, exist_ok=True)
 
     export_to_video(output, args.output_file, fps=24)
+
+    # Print KV reuse statistics if enabled
+    if args.kv_reuse:
+        totals, per_layer = collect_kv_reuse_stats(pipe)
+        total_ops = totals["hits"] + totals["misses"]
+        hit_rate = (totals["hits"] / total_ops) * 100 if total_ops > 0 else 0.0
+        logger.info(
+            f"KV reuse stats: hits={totals['hits']} misses={totals['misses']} "
+            f"hit_rate={hit_rate:.1f}% layers={totals['layers']}"
+        )
+        if args.kv_reuse_verbose:
+            for layer in per_layer:
+                logger.info(
+                    f"KV reuse layer {layer['layer']}: hits={layer['hits']} misses={layer['misses']}"
+                )
 
     # Print offloading statistics if enabled
     if offload_manager is not None:
