@@ -1,4 +1,5 @@
 import json
+import math
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
@@ -41,10 +42,31 @@ class KVReuseConfig:
     interval: int = 2
     start_step: int = 4
     delta_threshold: float = 0.0
+    cache_on_cpu: bool = False
+    cache_pin_memory: bool = True
+    keep_cache_on_gpu: bool = False
+
+
+@dataclass
+class VideoKReuseConfig:
+    enabled: bool = False
+    block_size: int = 64
+    max_cached_blocks: int = 64
+    warmup_steps: int = 4
+    start_step: int = 6
+    interval: int = 2
+    delta_threshold: float = 0.0
+    layer_stride: int = 8
+    max_layers: int = 8
+    cache_on_cpu: bool = False
+    cache_pin_memory: bool = True
+    keep_cache_on_gpu: bool = True
+    layer_indices: Optional[Tuple[int, ...]] = None
 
 
 class KVReuseMixin:
     kv_reuse_cfg = KVReuseConfig()
+    video_k_reuse_cfg = VideoKReuseConfig()
 
     def _kv_reuse_init(self) -> None:
         self._kv_reuse_step = -1
@@ -54,6 +76,14 @@ class KVReuseMixin:
         self._kv_reuse_sig = None
         self._kv_reuse_hits = 0
         self._kv_reuse_misses = 0
+        self._video_k_reuse_step = -1
+        self._video_k_reuse_last_timestep = None
+        self._video_k_reuse_prev_sig = None
+        self._video_k_reuse_score = None
+        self._video_k_reuse_stable_blocks = None
+        self._video_k_reuse_cache = {}
+        self._video_k_reuse_hits = 0
+        self._video_k_reuse_misses = 0
 
     def reset_kv_reuse_state(self) -> None:
         self._kv_reuse_step = -1
@@ -63,11 +93,26 @@ class KVReuseMixin:
         self._kv_reuse_sig = None
         self._kv_reuse_hits = 0
         self._kv_reuse_misses = 0
+        self._video_k_reuse_step = -1
+        self._video_k_reuse_last_timestep = None
+        self._video_k_reuse_prev_sig = None
+        self._video_k_reuse_score = None
+        self._video_k_reuse_stable_blocks = None
+        self._video_k_reuse_cache = {}
+        self._video_k_reuse_hits = 0
+        self._video_k_reuse_misses = 0
 
     def get_kv_reuse_stats(self) -> dict:
         return {
             "hits": self._kv_reuse_hits,
             "misses": self._kv_reuse_misses,
+        }
+
+    def get_video_k_reuse_stats(self) -> dict:
+        return {
+            "hits": self._video_k_reuse_hits,
+            "misses": self._video_k_reuse_misses,
+            "cached_blocks": len(self._video_k_reuse_cache),
         }
 
     def _kv_reuse_step_idx(self, timestep: Optional[int]) -> Optional[int]:
@@ -86,6 +131,230 @@ class KVReuseMixin:
 
     def _kv_reuse_signature(self, tensor: torch.Tensor) -> float:
         return float(tensor.float().abs().mean().item())
+
+    def _video_k_reuse_step_idx(self, timestep: Optional[int]) -> Optional[int]:
+        if timestep is None:
+            return None
+        if isinstance(timestep, torch.Tensor):
+            t_val = int(timestep[0].item()) if timestep.numel() > 0 else int(timestep.item())
+        else:
+            t_val = int(timestep)
+
+        if self._video_k_reuse_last_timestep is None or t_val != self._video_k_reuse_last_timestep:
+            self._video_k_reuse_step += 1
+            self._video_k_reuse_last_timestep = t_val
+
+        return self._video_k_reuse_step
+
+    def _video_k_reuse_layer_enabled(self) -> bool:
+        cfg = self.video_k_reuse_cfg
+        if not cfg.enabled:
+            return False
+        if hasattr(self, "layer_idx"):
+            layer_idx = self.layer_idx
+        else:
+            return False
+        if cfg.layer_indices is not None:
+            return layer_idx in cfg.layer_indices
+        if cfg.layer_stride and cfg.layer_stride > 1:
+            if (layer_idx % cfg.layer_stride) != 0:
+                return False
+            if cfg.max_layers and cfg.max_layers > 0:
+                if (layer_idx // cfg.layer_stride) >= cfg.max_layers:
+                    return False
+        return True
+
+    def _video_k_reuse_block_signature(self, video_hidden_states: torch.Tensor, block_size: int) -> torch.Tensor:
+        bsz, seq_len, dim = video_hidden_states.shape
+        num_blocks = int(math.ceil(seq_len / block_size))
+        padded_len = num_blocks * block_size
+        if padded_len != seq_len:
+            pad_len = padded_len - seq_len
+            pad = torch.zeros(
+                bsz,
+                pad_len,
+                dim,
+                device=video_hidden_states.device,
+                dtype=video_hidden_states.dtype,
+            )
+            video_hidden_states = torch.cat([video_hidden_states, pad], dim=1)
+        blocks = video_hidden_states.view(bsz, num_blocks, block_size, dim)
+        sig = blocks.float().abs().mean(dim=(2, 3))
+        return sig.mean(dim=0)
+
+    def _video_k_reuse_update_stability(self, sig: torch.Tensor, step_idx: int) -> None:
+        cfg = self.video_k_reuse_cfg
+        if self._video_k_reuse_prev_sig is None:
+            self._video_k_reuse_prev_sig = sig
+            return
+
+        delta = (sig - self._video_k_reuse_prev_sig).abs()
+        if self._video_k_reuse_score is None:
+            self._video_k_reuse_score = delta
+        else:
+            self._video_k_reuse_score = 0.8 * self._video_k_reuse_score + 0.2 * delta
+        self._video_k_reuse_prev_sig = sig
+
+        if step_idx == max(0, cfg.warmup_steps - 1):
+            score = self._video_k_reuse_score
+            if score is None:
+                return
+            num_blocks = score.numel()
+            max_blocks = cfg.max_cached_blocks if cfg.max_cached_blocks > 0 else num_blocks
+
+            if cfg.delta_threshold > 0:
+                stable = (score <= cfg.delta_threshold).nonzero(as_tuple=False).flatten()
+                if stable.numel() > max_blocks:
+                    _, top_idx = torch.topk(score[stable], k=max_blocks, largest=False)
+                    stable = stable[top_idx]
+            else:
+                k = min(max_blocks, num_blocks)
+                _, stable = torch.topk(score, k=k, largest=False)
+
+            self._video_k_reuse_stable_blocks = tuple(int(x) for x in stable.tolist())
+
+    def _video_k_reuse_cache_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
+        cfg = self.video_k_reuse_cfg
+        if not cfg.cache_on_cpu:
+            return tensor.detach()
+        return self._video_k_reuse_cache_to_cpu(tensor.detach())
+
+    def _video_k_reuse_load_tensor(self, tensor: Optional[torch.Tensor], device: torch.device) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        if not self.video_k_reuse_cfg.cache_on_cpu:
+            return tensor.to(device)
+        return self._kv_reuse_cache_to_device(tensor, device)
+
+    def _video_k_reuse_get_key(self, attn, video_hidden_states: torch.Tensor, timestep: Optional[int]) -> torch.Tensor:
+        cfg = self.video_k_reuse_cfg
+        if not self._video_k_reuse_layer_enabled():
+            return attn.to_k(video_hidden_states)
+
+        step_idx = self._video_k_reuse_step_idx(timestep)
+        if step_idx is None:
+            return attn.to_k(video_hidden_states)
+
+        block_size = max(1, int(cfg.block_size))
+        sig = None
+
+        if step_idx < cfg.warmup_steps:
+            sig = self._video_k_reuse_block_signature(video_hidden_states, block_size)
+            self._video_k_reuse_update_stability(sig, step_idx)
+            return attn.to_k(video_hidden_states)
+
+        if self._video_k_reuse_stable_blocks is None:
+            if sig is None:
+                sig = self._video_k_reuse_block_signature(video_hidden_states, block_size)
+            self._video_k_reuse_update_stability(sig, max(0, cfg.warmup_steps - 1))
+            if self._video_k_reuse_stable_blocks is None:
+                return attn.to_k(video_hidden_states)
+
+        if step_idx < cfg.start_step:
+            return attn.to_k(video_hidden_states)
+
+        refresh = cfg.interval <= 1 or (step_idx % cfg.interval) == 0
+        seq_len = video_hidden_states.shape[1]
+        num_blocks = int(math.ceil(seq_len / block_size))
+
+        if refresh:
+            full_k = attn.to_k(video_hidden_states)
+            for block_id in self._video_k_reuse_stable_blocks:
+                start = block_id * block_size
+                end = min(start + block_size, seq_len)
+                if start >= end:
+                    continue
+                block_k = full_k[:, start:end, :]
+                self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_tensor(block_k)
+            self._video_k_reuse_misses += len(self._video_k_reuse_stable_blocks)
+            return full_k
+
+        stable_set = set(self._video_k_reuse_stable_blocks)
+        unstable_blocks = [b for b in range(num_blocks) if b not in stable_set]
+        if len(unstable_blocks) >= int(0.8 * num_blocks):
+            full_k = attn.to_k(video_hidden_states)
+            for block_id in self._video_k_reuse_stable_blocks:
+                start = block_id * block_size
+                end = min(start + block_size, seq_len)
+                if start >= end:
+                    continue
+                block_k = full_k[:, start:end, :]
+                self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_tensor(block_k)
+            self._video_k_reuse_misses += len(self._video_k_reuse_stable_blocks)
+            return full_k
+
+        key = torch.empty_like(video_hidden_states)
+
+        for block_id in self._video_k_reuse_stable_blocks:
+            start = block_id * block_size
+            end = min(start + block_size, seq_len)
+            if start >= end:
+                continue
+            cached = self._video_k_reuse_load_tensor(self._video_k_reuse_cache.get(block_id), video_hidden_states.device)
+            if cached is None or cached.shape[1] != (end - start):
+                block_k = attn.to_k(video_hidden_states[:, start:end, :])
+                self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_tensor(block_k)
+                key[:, start:end, :] = block_k
+                self._video_k_reuse_misses += 1
+            else:
+                key[:, start:end, :] = cached
+                self._video_k_reuse_hits += 1
+
+        if unstable_blocks:
+            indices = []
+            for block_id in unstable_blocks:
+                start = block_id * block_size
+                end = min(start + block_size, seq_len)
+                if start < end:
+                    indices.extend(range(start, end))
+            idx = torch.tensor(indices, device=video_hidden_states.device, dtype=torch.long)
+            k_sel = attn.to_k(video_hidden_states.index_select(1, idx))
+            key.index_copy_(1, idx, k_sel)
+            self._video_k_reuse_misses += len(unstable_blocks)
+
+        return key
+
+    def _video_k_reuse_cache_to_cpu(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        if tensor.device.type == "cpu":
+            if self.video_k_reuse_cfg.cache_pin_memory and not tensor.is_pinned():
+                pinned = torch.empty_like(tensor, device="cpu", pin_memory=True)
+                pinned.copy_(tensor)
+                return pinned
+            return tensor
+
+        if self.video_k_reuse_cfg.cache_pin_memory:
+            pinned = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            pinned.copy_(tensor, non_blocking=True)
+            return pinned
+
+        return tensor.to("cpu")
+
+    def _kv_reuse_cache_to_cpu(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        if tensor.device.type == "cpu":
+            if self.kv_reuse_cfg.cache_pin_memory and not tensor.is_pinned():
+                pinned = torch.empty_like(tensor, device="cpu", pin_memory=True)
+                pinned.copy_(tensor)
+                return pinned
+            return tensor
+
+        if self.kv_reuse_cfg.cache_pin_memory:
+            pinned = torch.empty_like(tensor, device="cpu", pin_memory=True)
+            pinned.copy_(tensor, non_blocking=True)
+            return pinned
+
+        return tensor.to("cpu")
+
+    def _kv_reuse_cache_to_device(self, tensor: Optional[torch.Tensor], device: torch.device) -> Optional[torch.Tensor]:
+        if tensor is None:
+            return None
+        if tensor.device == device:
+            return tensor
+        non_blocking = tensor.device.type == "cpu" and tensor.is_pinned()
+        return tensor.to(device, non_blocking=non_blocking)
 
     def _kv_reuse_should_reuse(
         self, encoder_hidden_states: torch.Tensor, timestep: Optional[int]
@@ -125,9 +394,9 @@ class KVReuseMixin:
         reuse, _, sig = self._kv_reuse_should_reuse(encoder_hidden_states, timestep)
 
         if reuse:
-            key = self._kv_reuse_key
+            key = self._kv_reuse_cache_to_device(self._kv_reuse_key, encoder_hidden_states.device)
             if cfg.reuse_v and self._kv_reuse_value is not None:
-                value = self._kv_reuse_value
+                value = self._kv_reuse_cache_to_device(self._kv_reuse_value, encoder_hidden_states.device)
             else:
                 value = v_proj(encoder_hidden_states)
             self._kv_reuse_hits += 1
@@ -137,12 +406,35 @@ class KVReuseMixin:
         value = v_proj(encoder_hidden_states)
 
         if cfg.enabled and cfg.reuse_k:
-            self._kv_reuse_key = key.detach()
-            self._kv_reuse_value = value.detach() if cfg.reuse_v else None
+            cached_key = key.detach()
+            cached_value = value.detach() if cfg.reuse_v else None
+            if cfg.cache_on_cpu:
+                cached_key = self._kv_reuse_cache_to_cpu(cached_key)
+                cached_value = self._kv_reuse_cache_to_cpu(cached_value)
+            self._kv_reuse_key = cached_key
+            self._kv_reuse_value = cached_value
             self._kv_reuse_sig = sig if sig is not None else self._kv_reuse_signature(encoder_hidden_states)
         self._kv_reuse_misses += 1
 
         return key, value
+
+    def offload_kv_reuse_cache(self) -> None:
+        if self._kv_reuse_key is None and self._kv_reuse_value is None:
+            return
+        if self.kv_reuse_cfg.keep_cache_on_gpu:
+            return
+        self._kv_reuse_key = self._kv_reuse_cache_to_cpu(self._kv_reuse_key)
+        self._kv_reuse_value = self._kv_reuse_cache_to_cpu(self._kv_reuse_value)
+
+    def offload_video_k_reuse_cache(self) -> None:
+        if not self._video_k_reuse_cache:
+            return
+        if self.video_k_reuse_cfg.keep_cache_on_gpu:
+            return
+        if not self.video_k_reuse_cfg.cache_on_cpu:
+            return
+        for block_id, block_k in list(self._video_k_reuse_cache.items()):
+            self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_to_cpu(block_k)
 
 
 class HunyuanVideoAttnProcessor2_0_FlashAttention(KVReuseMixin):
@@ -166,27 +458,34 @@ class HunyuanVideoAttnProcessor2_0_FlashAttention(KVReuseMixin):
         image_rotary_emb: Optional[torch.Tensor] = None,
         timestep: Optional[int] = None,
     ) -> torch.Tensor:
-        if attn.add_q_proj is None and encoder_hidden_states is not None and self.kv_reuse_cfg.enabled:
-            query = attn.to_q(hidden_states)
-            key = attn.to_k(hidden_states)
-            value = attn.to_v(hidden_states)
+        if attn.add_q_proj is None and encoder_hidden_states is not None:
+            query_video = attn.to_q(hidden_states)
+            value_video = attn.to_v(hidden_states)
+            if self.video_k_reuse_cfg.enabled and self._video_k_reuse_layer_enabled():
+                key_video = self._video_k_reuse_get_key(attn, hidden_states, timestep)
+            else:
+                key_video = attn.to_k(hidden_states)
 
             encoder_query = attn.to_q(encoder_hidden_states)
-            encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
-                encoder_hidden_states, attn.to_k, attn.to_v, timestep
-            )
+            if self.kv_reuse_cfg.enabled:
+                encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
+                    encoder_hidden_states, attn.to_k, attn.to_v, timestep
+                )
+            else:
+                encoder_key = attn.to_k(encoder_hidden_states)
+                encoder_value = attn.to_v(encoder_hidden_states)
 
-            query = torch.cat([query, encoder_query], dim=1)
-            key = torch.cat([key, encoder_key], dim=1)
-            value = torch.cat([value, encoder_value], dim=1)
+            query = torch.cat([query_video, encoder_query], dim=1)
+            key = torch.cat([key_video, encoder_key], dim=1)
+            value = torch.cat([value_video, encoder_value], dim=1)
         else:
-            if attn.add_q_proj is None and encoder_hidden_states is not None:
-                hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
-
             # 1. QKV projections
             query = attn.to_q(hidden_states)
-            key = attn.to_k(hidden_states)
             value = attn.to_v(hidden_states)
+            if self.video_k_reuse_cfg.enabled and self._video_k_reuse_layer_enabled():
+                key = self._video_k_reuse_get_key(attn, hidden_states, timestep)
+            else:
+                key = attn.to_k(hidden_states)
 
         query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
@@ -382,23 +681,33 @@ class Hunyuan_SVGAttn_Processor2_0(KVReuseMixin):
 
     @time_logging_decorator("Level 2 - get_qkv")
     def get_qkv(self, attn, hidden_states, encoder_hidden_states=None, timestep=None):
-        if encoder_hidden_states is not None and self.kv_reuse_cfg.enabled:
-            query = attn.to_q(hidden_states)
-            key = attn.to_k(hidden_states)
-            value = attn.to_v(hidden_states)
+        if encoder_hidden_states is not None:
+            query_video = attn.to_q(hidden_states)
+            value_video = attn.to_v(hidden_states)
+            if self.video_k_reuse_cfg.enabled and self._video_k_reuse_layer_enabled():
+                key_video = self._video_k_reuse_get_key(attn, hidden_states, timestep)
+            else:
+                key_video = attn.to_k(hidden_states)
 
             encoder_query = attn.to_q(encoder_hidden_states)
-            encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
-                encoder_hidden_states, attn.to_k, attn.to_v, timestep
-            )
+            if self.kv_reuse_cfg.enabled:
+                encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
+                    encoder_hidden_states, attn.to_k, attn.to_v, timestep
+                )
+            else:
+                encoder_key = attn.to_k(encoder_hidden_states)
+                encoder_value = attn.to_v(encoder_hidden_states)
 
-            query = torch.cat([query, encoder_query], dim=1)
-            key = torch.cat([key, encoder_key], dim=1)
-            value = torch.cat([value, encoder_value], dim=1)
+            query = torch.cat([query_video, encoder_query], dim=1)
+            key = torch.cat([key_video, encoder_key], dim=1)
+            value = torch.cat([value_video, encoder_value], dim=1)
         else:
             query = attn.to_q(hidden_states)
-            key = attn.to_k(hidden_states)
             value = attn.to_v(hidden_states)
+            if self.video_k_reuse_cfg.enabled and self._video_k_reuse_layer_enabled():
+                key = self._video_k_reuse_get_key(attn, hidden_states, timestep)
+            else:
+                key = attn.to_k(hidden_states)
 
         return query, key, value
 
@@ -487,12 +796,8 @@ class Hunyuan_SVGAttn_Processor2_0(KVReuseMixin):
         image_rotary_emb: Optional[torch.Tensor] = None,
         timestep: Optional[int] = None,
     ) -> torch.Tensor:
-        if (
-            attn.add_q_proj is None
-            and encoder_hidden_states is not None
-            and not self.kv_reuse_cfg.enabled
-        ):
-            hidden_states = torch.cat([hidden_states, encoder_hidden_states], dim=1)
+        # For single-stream blocks, keep video and text streams separate here.
+        # get_qkv will concatenate the projected Q/K/V.
 
         # 1. QKV projections
         encoder_states_for_qkv = encoder_hidden_states if attn.add_q_proj is None else None

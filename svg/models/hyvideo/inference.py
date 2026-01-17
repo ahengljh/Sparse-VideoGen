@@ -6,6 +6,7 @@ import torch
 from ...logger import logger
 from .attention import (
     KVReuseConfig,
+    VideoKReuseConfig,
     Hunyuan_SAPAttn_Processor2_0,
     Hunyuan_SVGAttn_Processor2_0,
     HunyuanVideoAttnProcessor2_0_FlashAttention,
@@ -15,12 +16,18 @@ from .custom_models import replace_sparse_forward
 from .utils import get_attention_mask, sparsity_to_width
 
 
-def replace_hyvideo_flashattention(pipe, kv_reuse_config: Optional[KVReuseConfig] = None):
+def replace_hyvideo_flashattention(
+    pipe,
+    kv_reuse_config: Optional[KVReuseConfig] = None,
+    video_k_reuse_config: Optional[VideoKReuseConfig] = None,
+):
     """
     Replace the FSDP + masked attention with flash attention + varlen. Crucial for inference efficiency.
     """
     if kv_reuse_config is not None:
         HunyuanVideoAttnProcessor2_0_FlashAttention.kv_reuse_cfg = kv_reuse_config
+    if video_k_reuse_config is not None:
+        HunyuanVideoAttnProcessor2_0_FlashAttention.video_k_reuse_cfg = video_k_reuse_config
 
     for layer_idx, m in enumerate(pipe.transformer.transformer_blocks):
         self_attn = m.attn
@@ -45,6 +52,7 @@ def replace_hyvideo_attention(
     first_times_fp,
     pattern="SVG",  # Default to SVG for backward compatibility
     kv_reuse_config: Optional[KVReuseConfig] = None,
+    video_k_reuse_config: Optional[VideoKReuseConfig] = None,
     # SVG specific, but provide defaults for general call signature
     num_sampled_rows=64,
     sample_mse_max_row=10000,
@@ -67,6 +75,8 @@ def replace_hyvideo_attention(
     if pattern == "SVG":
         if kv_reuse_config is not None:
             Hunyuan_SVGAttn_Processor2_0.kv_reuse_cfg = kv_reuse_config
+        if video_k_reuse_config is not None:
+            Hunyuan_SVGAttn_Processor2_0.video_k_reuse_cfg = video_k_reuse_config
 
         masks = ["spatial", "temporal"]
 
@@ -126,6 +136,8 @@ def replace_hyvideo_attention(
     elif pattern in ["SAP"]:
         if kv_reuse_config is not None:
             Hunyuan_SAPAttn_Processor2_0.kv_reuse_cfg = kv_reuse_config
+        if video_k_reuse_config is not None:
+            Hunyuan_SAPAttn_Processor2_0.video_k_reuse_cfg = video_k_reuse_config
 
         # Pass K-means specific parameters to the processor's constructor or set them as attributes
         # The processor itself will handle the K-means logic internally
@@ -194,6 +206,43 @@ def collect_kv_reuse_stats(pipe) -> Tuple[Dict[str, int], List[Dict[str, int]]]:
         totals["misses"] += misses
         totals["layers"] += 1
         per_layer.append({"layer": layer_idx, "hits": hits, "misses": misses})
+
+    for layer_idx, block in enumerate(pipe.transformer.transformer_blocks):
+        _collect_from_block(block, layer_idx)
+
+    offset = len(pipe.transformer.transformer_blocks)
+    for layer_idx, block in enumerate(pipe.transformer.single_transformer_blocks):
+        _collect_from_block(block, layer_idx + offset)
+
+    return totals, per_layer
+
+
+def collect_video_k_reuse_stats(pipe) -> Tuple[Dict[str, int], List[Dict[str, int]]]:
+    totals = {"hits": 0, "misses": 0, "cached_blocks": 0, "layers": 0}
+    per_layer = []
+
+    def _collect_from_block(block, layer_idx):
+        processor = block.attn.processor
+        if not hasattr(processor, "get_video_k_reuse_stats"):
+            return
+        stats = processor.get_video_k_reuse_stats()
+        hits = int(stats.get("hits", 0))
+        misses = int(stats.get("misses", 0))
+        cached_blocks = int(stats.get("cached_blocks", 0))
+        if hits == 0 and misses == 0 and cached_blocks == 0:
+            return
+        totals["hits"] += hits
+        totals["misses"] += misses
+        totals["cached_blocks"] += cached_blocks
+        totals["layers"] += 1
+        per_layer.append(
+            {
+                "layer": layer_idx,
+                "hits": hits,
+                "misses": misses,
+                "cached_blocks": cached_blocks,
+            }
+        )
 
     for layer_idx, block in enumerate(pipe.transformer.transformer_blocks):
         _collect_from_block(block, layer_idx)
