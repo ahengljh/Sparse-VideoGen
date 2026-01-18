@@ -82,6 +82,42 @@ if __name__ == "__main__":
     parser.add_argument("--video_k_reuse_start_step", type=int, default=6, help="Start reusing cached video K after this step.")
     parser.add_argument("--video_k_reuse_interval", type=int, default=2, help="Refresh cached video K every N steps.")
     parser.add_argument("--video_k_reuse_delta_threshold", type=float, default=0.0, help="Stability threshold; 0 uses top-K blocks.")
+    parser.add_argument(
+        "--video_k_reuse_change_ratio",
+        type=float,
+        default=0.0,
+        help="Skip reuse when block signature change ratio exceeds this threshold (0 disables).",
+    )
+    parser.add_argument(
+        "--video_k_reuse_change_delta",
+        type=float,
+        default=0.0,
+        help="Per-block signature delta threshold for change detection (0 uses relative change).",
+    )
+    parser.add_argument(
+        "--video_k_reuse_max_unstable_ratio",
+        type=float,
+        default=0.98,
+        help="Fallback to full K when unstable blocks exceed this ratio (1 disables).",
+    )
+    parser.add_argument(
+        "--video_k_reuse_critical_blocks",
+        type=int,
+        default=0,
+        help="Always recompute this many most-unstable blocks (0 disables).",
+    )
+    parser.add_argument(
+        "--video_k_reuse_critical_ratio",
+        type=float,
+        default=0.0,
+        help="Fraction of most-unstable blocks to always recompute (used when critical_blocks=0).",
+    )
+    parser.add_argument(
+        "--video_k_reuse_ema_alpha",
+        type=float,
+        default=1.0,
+        help="EMA alpha for cached K updates; 1 disables smoothing.",
+    )
     parser.add_argument("--video_k_reuse_layer_stride", type=int, default=8, help="Apply reuse every N layers.")
     parser.add_argument("--video_k_reuse_max_layers", type=int, default=8, help="Cap number of layers that use video K reuse.")
     parser.add_argument("--video_k_reuse_layers", type=str, default=None, help="Comma-separated list of layer indices to reuse.")
@@ -258,6 +294,12 @@ if __name__ == "__main__":
             start_step=start_step,
             interval=max(1, args.video_k_reuse_interval),
             delta_threshold=max(0.0, args.video_k_reuse_delta_threshold),
+            change_ratio_threshold=max(0.0, args.video_k_reuse_change_ratio),
+            change_delta_threshold=max(0.0, args.video_k_reuse_change_delta),
+            max_unstable_ratio=min(1.0, max(0.0, args.video_k_reuse_max_unstable_ratio)),
+            critical_blocks=max(0, args.video_k_reuse_critical_blocks),
+            critical_ratio=max(0.0, args.video_k_reuse_critical_ratio),
+            ema_alpha=min(1.0, max(0.0, args.video_k_reuse_ema_alpha)),
             layer_stride=max(1, args.video_k_reuse_layer_stride),
             max_layers=max(1, args.video_k_reuse_max_layers),
             cache_on_cpu=bool(args.video_k_reuse_cache_on_cpu),
@@ -377,13 +419,15 @@ if __name__ == "__main__":
         hit_rate = (totals["hits"] / total_ops) * 100 if total_ops > 0 else 0.0
         logger.info(
             f"Video K reuse stats: hits={totals['hits']} misses={totals['misses']} "
-            f"hit_rate={hit_rate:.1f}% layers={totals['layers']} cached_blocks={totals['cached_blocks']}"
+            f"hit_rate={hit_rate:.1f}% layers={totals['layers']} cached_blocks={totals['cached_blocks']} "
+            f"stable_blocks={totals['stable_blocks']} critical_blocks={totals['critical_blocks']}"
         )
         if args.video_k_reuse_verbose:
             for layer in per_layer:
                 logger.info(
                     f"Video K reuse layer {layer['layer']}: hits={layer['hits']} misses={layer['misses']} "
-                    f"cached_blocks={layer['cached_blocks']}"
+                    f"cached_blocks={layer['cached_blocks']} stable_blocks={layer['stable_blocks']} "
+                    f"critical_blocks={layer['critical_blocks']}"
                 )
 
     # Print offloading statistics if enabled

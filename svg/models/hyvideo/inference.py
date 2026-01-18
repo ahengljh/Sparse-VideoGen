@@ -218,7 +218,14 @@ def collect_kv_reuse_stats(pipe) -> Tuple[Dict[str, int], List[Dict[str, int]]]:
 
 
 def collect_video_k_reuse_stats(pipe) -> Tuple[Dict[str, int], List[Dict[str, int]]]:
-    totals = {"hits": 0, "misses": 0, "cached_blocks": 0, "layers": 0}
+    totals = {
+        "hits": 0,
+        "misses": 0,
+        "cached_blocks": 0,
+        "stable_blocks": 0,
+        "critical_blocks": 0,
+        "layers": 0,
+    }
     per_layer = []
 
     def _collect_from_block(block, layer_idx):
@@ -229,11 +236,15 @@ def collect_video_k_reuse_stats(pipe) -> Tuple[Dict[str, int], List[Dict[str, in
         hits = int(stats.get("hits", 0))
         misses = int(stats.get("misses", 0))
         cached_blocks = int(stats.get("cached_blocks", 0))
-        if hits == 0 and misses == 0 and cached_blocks == 0:
+        stable_blocks = int(stats.get("stable_blocks", 0))
+        critical_blocks = int(stats.get("critical_blocks", 0))
+        if hits == 0 and misses == 0 and cached_blocks == 0 and stable_blocks == 0 and critical_blocks == 0:
             return
         totals["hits"] += hits
         totals["misses"] += misses
         totals["cached_blocks"] += cached_blocks
+        totals["stable_blocks"] += stable_blocks
+        totals["critical_blocks"] += critical_blocks
         totals["layers"] += 1
         per_layer.append(
             {
@@ -241,6 +252,8 @@ def collect_video_k_reuse_stats(pipe) -> Tuple[Dict[str, int], List[Dict[str, in
                 "hits": hits,
                 "misses": misses,
                 "cached_blocks": cached_blocks,
+                "stable_blocks": stable_blocks,
+                "critical_blocks": critical_blocks,
             }
         )
 

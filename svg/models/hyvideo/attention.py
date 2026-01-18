@@ -56,6 +56,12 @@ class VideoKReuseConfig:
     start_step: int = 6
     interval: int = 2
     delta_threshold: float = 0.0
+    change_ratio_threshold: float = 0.0
+    change_delta_threshold: float = 0.0
+    max_unstable_ratio: float = 0.98
+    critical_blocks: int = 0
+    critical_ratio: float = 0.0
+    ema_alpha: float = 1.0
     layer_stride: int = 8
     max_layers: int = 8
     cache_on_cpu: bool = False
@@ -81,7 +87,9 @@ class KVReuseMixin:
         self._video_k_reuse_prev_sig = None
         self._video_k_reuse_score = None
         self._video_k_reuse_stable_blocks = None
+        self._video_k_reuse_critical_blocks = None
         self._video_k_reuse_cache = {}
+        self._video_k_reuse_change_ratio = None
         self._video_k_reuse_hits = 0
         self._video_k_reuse_misses = 0
 
@@ -98,7 +106,9 @@ class KVReuseMixin:
         self._video_k_reuse_prev_sig = None
         self._video_k_reuse_score = None
         self._video_k_reuse_stable_blocks = None
+        self._video_k_reuse_critical_blocks = None
         self._video_k_reuse_cache = {}
+        self._video_k_reuse_change_ratio = None
         self._video_k_reuse_hits = 0
         self._video_k_reuse_misses = 0
 
@@ -113,6 +123,9 @@ class KVReuseMixin:
             "hits": self._video_k_reuse_hits,
             "misses": self._video_k_reuse_misses,
             "cached_blocks": len(self._video_k_reuse_cache),
+            "stable_blocks": len(self._video_k_reuse_stable_blocks or ()),
+            "critical_blocks": len(self._video_k_reuse_critical_blocks or ()),
+            "change_ratio": self._video_k_reuse_change_ratio,
         }
 
     def _kv_reuse_step_idx(self, timestep: Optional[int]) -> Optional[int]:
@@ -211,7 +224,76 @@ class KVReuseMixin:
                 k = min(max_blocks, num_blocks)
                 _, stable = torch.topk(score, k=k, largest=False)
 
-            self._video_k_reuse_stable_blocks = tuple(int(x) for x in stable.tolist())
+            stable_list = [int(x) for x in stable.tolist()]
+            stable_set = set(stable_list)
+
+            critical_count = 0
+            if cfg.critical_blocks > 0:
+                critical_count = min(cfg.critical_blocks, num_blocks)
+            elif cfg.critical_ratio > 0:
+                critical_count = int(round(cfg.critical_ratio * num_blocks))
+
+            critical_list = []
+            if critical_count > 0:
+                _, sorted_idx = torch.topk(score, k=num_blocks, largest=True)
+                for idx in sorted_idx.tolist():
+                    if idx not in stable_set:
+                        critical_list.append(int(idx))
+                    if len(critical_list) >= critical_count:
+                        break
+
+            critical_set = set(critical_list)
+            if critical_set:
+                stable_list = [idx for idx in stable_list if idx not in critical_set]
+
+            self._video_k_reuse_stable_blocks = tuple(stable_list)
+            self._video_k_reuse_critical_blocks = tuple(critical_list)
+
+    def _video_k_reuse_compute_change(
+        self, sig: torch.Tensor
+    ) -> Tuple[Optional[float], Optional[torch.Tensor]]:
+        cfg = self.video_k_reuse_cfg
+        if self._video_k_reuse_prev_sig is None:
+            self._video_k_reuse_prev_sig = sig
+            self._video_k_reuse_change_ratio = None
+            return None, None
+        if self._video_k_reuse_prev_sig.shape != sig.shape:
+            self._video_k_reuse_prev_sig = sig
+            self._video_k_reuse_change_ratio = None
+            return None, None
+
+        delta = (sig - self._video_k_reuse_prev_sig).abs()
+        self._video_k_reuse_prev_sig = sig
+
+        threshold = None
+        if cfg.change_delta_threshold > 0:
+            threshold = cfg.change_delta_threshold
+        elif cfg.delta_threshold > 0:
+            threshold = cfg.delta_threshold
+
+        change_mask = None
+        if threshold is not None:
+            change_mask = delta <= threshold
+            change_ratio = float((delta > threshold).float().mean().item())
+        else:
+            denom = float(sig.float().abs().mean().item())
+            change_ratio = float(delta.float().mean().item() / (denom + 1e-6))
+
+        self._video_k_reuse_change_ratio = change_ratio
+        return change_ratio, change_mask
+
+    def _video_k_reuse_update_cache_block(self, block_id: int, block_k: torch.Tensor) -> None:
+        cfg = self.video_k_reuse_cfg
+        cached = self._video_k_reuse_cache.get(block_id)
+        alpha = cfg.ema_alpha
+        if alpha < 0.0:
+            alpha = 0.0
+        elif alpha > 1.0:
+            alpha = 1.0
+        if cached is not None and alpha < 1.0:
+            if cached.device == block_k.device and cached.shape == block_k.shape:
+                block_k = cached + alpha * (block_k - cached)
+        self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_tensor(block_k)
 
     def _video_k_reuse_cache_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         cfg = self.video_k_reuse_cfg
@@ -251,41 +333,94 @@ class KVReuseMixin:
                 return attn.to_k(video_hidden_states)
 
         if step_idx < cfg.start_step:
+            if cfg.change_ratio_threshold > 0 or cfg.change_delta_threshold > 0:
+                sig = sig or self._video_k_reuse_block_signature(video_hidden_states, block_size)
+                self._video_k_reuse_compute_change(sig)
             return attn.to_k(video_hidden_states)
 
-        refresh = cfg.interval <= 1 or (step_idx % cfg.interval) == 0
         seq_len = video_hidden_states.shape[1]
         num_blocks = int(math.ceil(seq_len / block_size))
+        cache_blocks = [b for b in (self._video_k_reuse_stable_blocks or ()) if b < num_blocks]
+        critical_set = set(self._video_k_reuse_critical_blocks or ())
+        if critical_set:
+            cache_blocks = [b for b in cache_blocks if b not in critical_set]
+        reuse_blocks = list(cache_blocks)
+
+        change_ratio = None
+        change_mask = None
+        if cfg.change_ratio_threshold > 0 or cfg.change_delta_threshold > 0:
+            sig = sig or self._video_k_reuse_block_signature(video_hidden_states, block_size)
+            change_ratio, change_mask = self._video_k_reuse_compute_change(sig)
+            if change_mask is not None:
+                mask_cpu = change_mask
+                if mask_cpu.device.type != "cpu":
+                    mask_cpu = mask_cpu.to("cpu")
+                reuse_blocks = [b for b in cache_blocks if b < mask_cpu.numel() and mask_cpu[b]]
+            if cfg.change_ratio_threshold > 0 and change_ratio is not None:
+                if change_ratio >= cfg.change_ratio_threshold:
+                    full_k = attn.to_k(video_hidden_states)
+                    for block_id in cache_blocks:
+                        start = block_id * block_size
+                        end = min(start + block_size, seq_len)
+                        if start >= end:
+                            continue
+                        block_k = full_k[:, start:end, :]
+                        self._video_k_reuse_update_cache_block(block_id, block_k)
+                    self._video_k_reuse_misses += len(cache_blocks)
+                    return full_k
+        else:
+            self._video_k_reuse_change_ratio = None
+
+        if not cache_blocks:
+            return attn.to_k(video_hidden_states)
+
+        if not reuse_blocks:
+            full_k = attn.to_k(video_hidden_states)
+            for block_id in cache_blocks:
+                start = block_id * block_size
+                end = min(start + block_size, seq_len)
+                if start >= end:
+                    continue
+                block_k = full_k[:, start:end, :]
+                self._video_k_reuse_update_cache_block(block_id, block_k)
+            self._video_k_reuse_misses += len(cache_blocks)
+            return full_k
+
+        refresh = cfg.interval <= 1 or (step_idx % cfg.interval) == 0
+        if refresh and cfg.change_ratio_threshold > 0 and change_ratio is not None:
+            if change_ratio < cfg.change_ratio_threshold:
+                refresh = False
 
         if refresh:
             full_k = attn.to_k(video_hidden_states)
-            for block_id in self._video_k_reuse_stable_blocks:
+            for block_id in cache_blocks:
                 start = block_id * block_size
                 end = min(start + block_size, seq_len)
                 if start >= end:
                     continue
                 block_k = full_k[:, start:end, :]
-                self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_tensor(block_k)
-            self._video_k_reuse_misses += len(self._video_k_reuse_stable_blocks)
+                self._video_k_reuse_update_cache_block(block_id, block_k)
+            self._video_k_reuse_misses += len(cache_blocks)
             return full_k
 
-        stable_set = set(self._video_k_reuse_stable_blocks)
+        stable_set = set(reuse_blocks)
         unstable_blocks = [b for b in range(num_blocks) if b not in stable_set]
-        if len(unstable_blocks) >= int(0.8 * num_blocks):
+        max_unstable_ratio = min(1.0, max(0.0, cfg.max_unstable_ratio))
+        if max_unstable_ratio < 1.0 and len(unstable_blocks) >= int(math.ceil(max_unstable_ratio * num_blocks)):
             full_k = attn.to_k(video_hidden_states)
-            for block_id in self._video_k_reuse_stable_blocks:
+            for block_id in cache_blocks:
                 start = block_id * block_size
                 end = min(start + block_size, seq_len)
                 if start >= end:
                     continue
                 block_k = full_k[:, start:end, :]
-                self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_tensor(block_k)
-            self._video_k_reuse_misses += len(self._video_k_reuse_stable_blocks)
+                self._video_k_reuse_update_cache_block(block_id, block_k)
+            self._video_k_reuse_misses += len(cache_blocks)
             return full_k
 
         key = torch.empty_like(video_hidden_states)
 
-        for block_id in self._video_k_reuse_stable_blocks:
+        for block_id in reuse_blocks:
             start = block_id * block_size
             end = min(start + block_size, seq_len)
             if start >= end:
@@ -293,7 +428,7 @@ class KVReuseMixin:
             cached = self._video_k_reuse_load_tensor(self._video_k_reuse_cache.get(block_id), video_hidden_states.device)
             if cached is None or cached.shape[1] != (end - start):
                 block_k = attn.to_k(video_hidden_states[:, start:end, :])
-                self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_tensor(block_k)
+                self._video_k_reuse_update_cache_block(block_id, block_k)
                 key[:, start:end, :] = block_k
                 self._video_k_reuse_misses += 1
             else:
