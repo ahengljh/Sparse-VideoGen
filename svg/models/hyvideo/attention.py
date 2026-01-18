@@ -68,6 +68,8 @@ class VideoKReuseConfig:
     cache_pin_memory: bool = True
     keep_cache_on_gpu: bool = True
     layer_indices: Optional[Tuple[int, ...]] = None
+    metrics_enabled: bool = False
+    metrics_stride: int = 1
 
 
 class KVReuseMixin:
@@ -90,6 +92,7 @@ class KVReuseMixin:
         self._video_k_reuse_critical_blocks = None
         self._video_k_reuse_cache = {}
         self._video_k_reuse_change_ratio = None
+        self._video_k_reuse_step_stats = []
         self._video_k_reuse_hits = 0
         self._video_k_reuse_misses = 0
 
@@ -109,6 +112,7 @@ class KVReuseMixin:
         self._video_k_reuse_critical_blocks = None
         self._video_k_reuse_cache = {}
         self._video_k_reuse_change_ratio = None
+        self._video_k_reuse_step_stats = []
         self._video_k_reuse_hits = 0
         self._video_k_reuse_misses = 0
 
@@ -127,6 +131,9 @@ class KVReuseMixin:
             "critical_blocks": len(self._video_k_reuse_critical_blocks or ()),
             "change_ratio": self._video_k_reuse_change_ratio,
         }
+
+    def get_video_k_reuse_step_stats(self) -> list:
+        return list(self._video_k_reuse_step_stats)
 
     def _kv_reuse_step_idx(self, timestep: Optional[int]) -> Optional[int]:
         if timestep is None:
@@ -319,10 +326,71 @@ class KVReuseMixin:
 
         block_size = max(1, int(cfg.block_size))
         sig = None
+        seq_len = video_hidden_states.shape[1]
+        num_blocks = int(math.ceil(seq_len / block_size))
+        record_metrics = False
+        if cfg.metrics_enabled:
+            stride = max(1, int(cfg.metrics_stride))
+            record_metrics = (step_idx % stride) == 0
+
+        def block_tokens(block_id: int) -> int:
+            start = block_id * block_size
+            end = min(start + block_size, seq_len)
+            return max(0, end - start)
+
+        def record_stats(
+            mode: str,
+            hits: int,
+            misses: int,
+            cache_blocks: int,
+            reuse_blocks: int,
+            critical_blocks: int,
+            reused_tokens: int,
+            computed_tokens: int,
+            full_k: bool,
+            refresh: bool,
+            change_ratio: Optional[float],
+            unstable_ratio: Optional[float],
+        ) -> None:
+            if not record_metrics:
+                return
+            self._video_k_reuse_step_stats.append(
+                {
+                    "step": step_idx,
+                    "mode": mode,
+                    "full_k": full_k,
+                    "refresh": refresh,
+                    "change_ratio": change_ratio,
+                    "unstable_ratio": unstable_ratio,
+                    "total_blocks": num_blocks,
+                    "cache_blocks": cache_blocks,
+                    "reuse_blocks": reuse_blocks,
+                    "critical_blocks": critical_blocks,
+                    "hits": hits,
+                    "misses": misses,
+                    "total_tokens": seq_len,
+                    "reused_tokens": reused_tokens,
+                    "computed_tokens": computed_tokens,
+                }
+            )
 
         if step_idx < cfg.warmup_steps:
             sig = self._video_k_reuse_block_signature(video_hidden_states, block_size)
             self._video_k_reuse_update_stability(sig, step_idx)
+            record_stats(
+                mode="warmup",
+                hits=0,
+                misses=num_blocks,
+                cache_blocks=0,
+                reuse_blocks=0,
+                critical_blocks=0,
+                reused_tokens=0,
+                computed_tokens=seq_len,
+                full_k=True,
+                refresh=False,
+                change_ratio=self._video_k_reuse_change_ratio,
+                unstable_ratio=None,
+            )
             return attn.to_k(video_hidden_states)
 
         if self._video_k_reuse_stable_blocks is None:
@@ -330,20 +398,47 @@ class KVReuseMixin:
                 sig = self._video_k_reuse_block_signature(video_hidden_states, block_size)
             self._video_k_reuse_update_stability(sig, max(0, cfg.warmup_steps - 1))
             if self._video_k_reuse_stable_blocks is None:
+                record_stats(
+                    mode="no_stable_blocks",
+                    hits=0,
+                    misses=num_blocks,
+                    cache_blocks=0,
+                    reuse_blocks=0,
+                    critical_blocks=0,
+                    reused_tokens=0,
+                    computed_tokens=seq_len,
+                    full_k=True,
+                    refresh=False,
+                    change_ratio=self._video_k_reuse_change_ratio,
+                    unstable_ratio=None,
+                )
                 return attn.to_k(video_hidden_states)
+
+        cache_blocks = [b for b in (self._video_k_reuse_stable_blocks or ()) if b < num_blocks]
+        critical_set = set(self._video_k_reuse_critical_blocks or ())
+        if critical_set:
+            cache_blocks = [b for b in cache_blocks if b not in critical_set]
 
         if step_idx < cfg.start_step:
             if cfg.change_ratio_threshold > 0 or cfg.change_delta_threshold > 0:
                 sig = sig or self._video_k_reuse_block_signature(video_hidden_states, block_size)
                 self._video_k_reuse_compute_change(sig)
+            record_stats(
+                mode="start_wait",
+                hits=0,
+                misses=num_blocks,
+                cache_blocks=len(cache_blocks),
+                reuse_blocks=len(cache_blocks),
+                critical_blocks=len(critical_set),
+                reused_tokens=0,
+                computed_tokens=seq_len,
+                full_k=True,
+                refresh=False,
+                change_ratio=self._video_k_reuse_change_ratio,
+                unstable_ratio=None,
+            )
             return attn.to_k(video_hidden_states)
 
-        seq_len = video_hidden_states.shape[1]
-        num_blocks = int(math.ceil(seq_len / block_size))
-        cache_blocks = [b for b in (self._video_k_reuse_stable_blocks or ()) if b < num_blocks]
-        critical_set = set(self._video_k_reuse_critical_blocks or ())
-        if critical_set:
-            cache_blocks = [b for b in cache_blocks if b not in critical_set]
         reuse_blocks = list(cache_blocks)
 
         change_ratio = None
@@ -367,11 +462,39 @@ class KVReuseMixin:
                         block_k = full_k[:, start:end, :]
                         self._video_k_reuse_update_cache_block(block_id, block_k)
                     self._video_k_reuse_misses += len(cache_blocks)
+                    record_stats(
+                        mode="change_ratio_full",
+                        hits=0,
+                        misses=num_blocks,
+                        cache_blocks=len(cache_blocks),
+                        reuse_blocks=len(reuse_blocks),
+                        critical_blocks=len(critical_set),
+                        reused_tokens=0,
+                        computed_tokens=seq_len,
+                        full_k=True,
+                        refresh=False,
+                        change_ratio=change_ratio,
+                        unstable_ratio=None,
+                    )
                     return full_k
         else:
             self._video_k_reuse_change_ratio = None
 
         if not cache_blocks:
+            record_stats(
+                mode="no_cache_blocks",
+                hits=0,
+                misses=num_blocks,
+                cache_blocks=0,
+                reuse_blocks=0,
+                critical_blocks=len(critical_set),
+                reused_tokens=0,
+                computed_tokens=seq_len,
+                full_k=True,
+                refresh=False,
+                change_ratio=change_ratio,
+                unstable_ratio=None,
+            )
             return attn.to_k(video_hidden_states)
 
         if not reuse_blocks:
@@ -384,6 +507,20 @@ class KVReuseMixin:
                 block_k = full_k[:, start:end, :]
                 self._video_k_reuse_update_cache_block(block_id, block_k)
             self._video_k_reuse_misses += len(cache_blocks)
+            record_stats(
+                mode="no_reuse_blocks",
+                hits=0,
+                misses=num_blocks,
+                cache_blocks=len(cache_blocks),
+                reuse_blocks=0,
+                critical_blocks=len(critical_set),
+                reused_tokens=0,
+                computed_tokens=seq_len,
+                full_k=True,
+                refresh=False,
+                change_ratio=change_ratio,
+                unstable_ratio=None,
+            )
             return full_k
 
         refresh = cfg.interval <= 1 or (step_idx % cfg.interval) == 0
@@ -401,10 +538,25 @@ class KVReuseMixin:
                 block_k = full_k[:, start:end, :]
                 self._video_k_reuse_update_cache_block(block_id, block_k)
             self._video_k_reuse_misses += len(cache_blocks)
+            record_stats(
+                mode="refresh_full",
+                hits=0,
+                misses=num_blocks,
+                cache_blocks=len(cache_blocks),
+                reuse_blocks=len(reuse_blocks),
+                critical_blocks=len(critical_set),
+                reused_tokens=0,
+                computed_tokens=seq_len,
+                full_k=True,
+                refresh=True,
+                change_ratio=change_ratio,
+                unstable_ratio=None,
+            )
             return full_k
 
         stable_set = set(reuse_blocks)
         unstable_blocks = [b for b in range(num_blocks) if b not in stable_set]
+        unstable_ratio = (len(unstable_blocks) / num_blocks) if num_blocks > 0 else 0.0
         max_unstable_ratio = min(1.0, max(0.0, cfg.max_unstable_ratio))
         if max_unstable_ratio < 1.0 and len(unstable_blocks) >= int(math.ceil(max_unstable_ratio * num_blocks)):
             full_k = attn.to_k(video_hidden_states)
@@ -416,9 +568,28 @@ class KVReuseMixin:
                 block_k = full_k[:, start:end, :]
                 self._video_k_reuse_update_cache_block(block_id, block_k)
             self._video_k_reuse_misses += len(cache_blocks)
+            record_stats(
+                mode="unstable_full",
+                hits=0,
+                misses=num_blocks,
+                cache_blocks=len(cache_blocks),
+                reuse_blocks=len(reuse_blocks),
+                critical_blocks=len(critical_set),
+                reused_tokens=0,
+                computed_tokens=seq_len,
+                full_k=True,
+                refresh=False,
+                change_ratio=change_ratio,
+                unstable_ratio=unstable_ratio,
+            )
             return full_k
 
         key = torch.empty_like(video_hidden_states)
+
+        step_hits = 0
+        step_misses = 0
+        reused_tokens = 0
+        computed_tokens = 0
 
         for block_id in reuse_blocks:
             start = block_id * block_size
@@ -431,9 +602,13 @@ class KVReuseMixin:
                 self._video_k_reuse_update_cache_block(block_id, block_k)
                 key[:, start:end, :] = block_k
                 self._video_k_reuse_misses += 1
+                step_misses += 1
+                computed_tokens += block_tokens(block_id)
             else:
                 key[:, start:end, :] = cached
                 self._video_k_reuse_hits += 1
+                step_hits += 1
+                reused_tokens += block_tokens(block_id)
 
         if unstable_blocks:
             indices = []
@@ -446,6 +621,23 @@ class KVReuseMixin:
             k_sel = attn.to_k(video_hidden_states.index_select(1, idx))
             key.index_copy_(1, idx, k_sel)
             self._video_k_reuse_misses += len(unstable_blocks)
+            step_misses += len(unstable_blocks)
+            computed_tokens += sum(block_tokens(block_id) for block_id in unstable_blocks)
+
+        record_stats(
+            mode="partial_reuse",
+            hits=step_hits,
+            misses=step_misses,
+            cache_blocks=len(cache_blocks),
+            reuse_blocks=len(reuse_blocks),
+            critical_blocks=len(critical_set),
+            reused_tokens=reused_tokens,
+            computed_tokens=computed_tokens,
+            full_k=False,
+            refresh=False,
+            change_ratio=change_ratio,
+            unstable_ratio=unstable_ratio,
+        )
 
         return key
 

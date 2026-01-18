@@ -19,6 +19,7 @@ from svg.models.hyvideo.attention import KVReuseConfig, VideoKReuseConfig
 from svg.models.hyvideo.inference import (
     collect_kv_reuse_stats,
     collect_video_k_reuse_stats,
+    collect_video_k_reuse_metrics,
     replace_hyvideo_flashattention,
     replace_hyvideo_attention,
 )
@@ -123,6 +124,19 @@ if __name__ == "__main__":
     parser.add_argument("--video_k_reuse_layers", type=str, default=None, help="Comma-separated list of layer indices to reuse.")
     parser.add_argument("--video_k_reuse_cache_on_cpu", action="store_true", help="Store cached video K on CPU (slower, lower VRAM).")
     parser.add_argument("--video_k_reuse_verbose", action="store_true", help="Print per-layer video K reuse hit/miss counts.")
+    parser.add_argument("--video_k_reuse_metrics", action="store_true", help="Collect per-step video K reuse metrics.")
+    parser.add_argument(
+        "--video_k_reuse_metrics_stride",
+        type=int,
+        default=1,
+        help="Collect metrics every N steps (1 = all steps).",
+    )
+    parser.add_argument(
+        "--video_k_reuse_metrics_jsonl",
+        type=str,
+        default=None,
+        help="Write per-step metrics as JSONL to this path.",
+    )
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
@@ -305,6 +319,8 @@ if __name__ == "__main__":
             cache_on_cpu=bool(args.video_k_reuse_cache_on_cpu),
             keep_cache_on_gpu=not args.video_k_reuse_cache_on_cpu,
             layer_indices=layer_indices,
+            metrics_enabled=bool(args.video_k_reuse_metrics),
+            metrics_stride=max(1, args.video_k_reuse_metrics_stride),
         )
 
     replace_hyvideo_flashattention(
@@ -429,6 +445,41 @@ if __name__ == "__main__":
                     f"cached_blocks={layer['cached_blocks']} stable_blocks={layer['stable_blocks']} "
                     f"critical_blocks={layer['critical_blocks']}"
                 )
+
+    if args.video_k_reuse and args.video_k_reuse_metrics:
+        metrics = collect_video_k_reuse_metrics(pipe)
+        if metrics:
+            total_tokens = sum(int(m.get("total_tokens", 0)) for m in metrics)
+            reused_tokens = sum(int(m.get("reused_tokens", 0)) for m in metrics)
+            computed_tokens = sum(int(m.get("computed_tokens", 0)) for m in metrics)
+            metric_hits = sum(int(m.get("hits", 0)) for m in metrics)
+            metric_misses = sum(int(m.get("misses", 0)) for m in metrics)
+            total_metric_ops = metric_hits + metric_misses
+            token_reuse_rate = (reused_tokens / total_tokens) * 100 if total_tokens > 0 else 0.0
+            metric_hit_rate = (metric_hits / total_metric_ops) * 100 if total_metric_ops > 0 else 0.0
+            full_k_count = sum(1 for m in metrics if m.get("full_k"))
+            full_k_rate = (full_k_count / len(metrics)) * 100 if metrics else 0.0
+            change_ratios = [m["change_ratio"] for m in metrics if m.get("change_ratio") is not None]
+            avg_change_ratio = (sum(change_ratios) / len(change_ratios)) if change_ratios else 0.0
+            mode_counts = {}
+            for m in metrics:
+                mode = m.get("mode", "unknown")
+                mode_counts[mode] = mode_counts.get(mode, 0) + 1
+            logger.info(
+                "Video K reuse metrics: entries={} token_reuse_rate={:.1f}% hit_rate={:.1f}% "
+                "full_k_rate={:.1f}% avg_change_ratio={:.4f}".format(
+                    len(metrics), token_reuse_rate, metric_hit_rate, full_k_rate, avg_change_ratio
+                )
+            )
+            logger.info(f"Video K reuse modes: {json.dumps(mode_counts, sort_keys=True)}")
+
+        if args.video_k_reuse_metrics_jsonl:
+            metrics_dir = os.path.dirname(args.video_k_reuse_metrics_jsonl)
+            if metrics_dir:
+                os.makedirs(metrics_dir, exist_ok=True)
+            with open(args.video_k_reuse_metrics_jsonl, "w", encoding="utf-8") as handle:
+                for entry in metrics:
+                    handle.write(json.dumps(entry, sort_keys=True) + "\n")
 
     # Print offloading statistics if enabled
     if offload_manager is not None:

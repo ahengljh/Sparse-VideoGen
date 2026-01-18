@@ -265,3 +265,25 @@ def collect_video_k_reuse_stats(pipe) -> Tuple[Dict[str, int], List[Dict[str, in
         _collect_from_block(block, layer_idx + offset)
 
     return totals, per_layer
+
+
+def collect_video_k_reuse_metrics(pipe) -> List[Dict[str, object]]:
+    metrics = []
+
+    def _collect_from_block(block, layer_idx):
+        processor = block.attn.processor
+        if not hasattr(processor, "get_video_k_reuse_step_stats"):
+            return
+        for entry in processor.get_video_k_reuse_step_stats():
+            record = dict(entry)
+            record["layer"] = layer_idx
+            metrics.append(record)
+
+    for layer_idx, block in enumerate(pipe.transformer.transformer_blocks):
+        _collect_from_block(block, layer_idx)
+
+    offset = len(pipe.transformer.transformer_blocks)
+    for layer_idx, block in enumerate(pipe.transformer.single_transformer_blocks):
+        _collect_from_block(block, layer_idx + offset)
+
+    return metrics
