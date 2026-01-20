@@ -673,25 +673,90 @@ class TextEncoderOffloadManager:
         initial_gpu_mem = torch.cuda.memory_allocated() / 1024**3 if torch.cuda.is_available() else 0
         logger.info(f"GPU memory before encoding: {initial_gpu_mem:.2f}GB")
 
-        # Move text encoders to GPU for fast encoding
-        logger.info("Moving text encoders to GPU for encoding...")
-        for name, encoder in self._text_encoders.items():
-            encoder.to(device)
+        def is_cuda_device(dev) -> bool:
+            if isinstance(dev, torch.device):
+                return dev.type == "cuda"
+            return str(dev).startswith("cuda")
 
-        gpu_after_load = torch.cuda.memory_allocated() / 1024**3
-        logger.info(f"GPU memory after loading encoders: {gpu_after_load:.2f}GB")
-
-        # Encode on GPU (fast!)
-        logger.info("Encoding prompt on GPU...")
-        with torch.no_grad():
-            prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.pipe.encode_prompt(
-                prompt=prompt,
-                prompt_2=prompt_2,
-                device=device,
-                dtype=dtype,
-                num_videos_per_prompt=num_videos_per_prompt,
-                max_sequence_length=max_sequence_length,
+        oom_types = tuple(
+            t
+            for t in (
+                getattr(torch, "OutOfMemoryError", None),
+                getattr(torch.cuda, "OutOfMemoryError", None),
             )
+            if t is not None
+        )
+
+        def is_cuda_oom(exc: Exception) -> bool:
+            if oom_types and isinstance(exc, oom_types):
+                return True
+            return "CUDA out of memory" in str(exc)
+
+        encode_device = device
+        encode_dtype = dtype
+        used_cpu_fallback = False
+
+        # Move text encoders to target device for encoding
+        try:
+            if is_cuda_device(encode_device):
+                logger.info("Moving text encoders to GPU for encoding...")
+            else:
+                logger.info("Moving text encoders to CPU for encoding...")
+            for name, encoder in self._text_encoders.items():
+                encoder.to(encode_device)
+        except Exception as exc:
+            if is_cuda_device(encode_device) and is_cuda_oom(exc):
+                logger.warning(
+                    "OOM while moving text encoders to GPU; falling back to CPU encoding."
+                )
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                encode_device = "cpu"
+                encode_dtype = torch.float32
+                used_cpu_fallback = True
+                for name, encoder in self._text_encoders.items():
+                    encoder.to(encode_device)
+            else:
+                raise
+
+        if is_cuda_device(encode_device):
+            gpu_after_load = torch.cuda.memory_allocated() / 1024**3
+            logger.info(f"GPU memory after loading encoders: {gpu_after_load:.2f}GB")
+            logger.info("Encoding prompt on GPU...")
+        else:
+            logger.info("Encoding prompt on CPU...")
+
+        try:
+            with torch.no_grad():
+                prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.pipe.encode_prompt(
+                    prompt=prompt,
+                    prompt_2=prompt_2,
+                    device=encode_device,
+                    dtype=encode_dtype,
+                    num_videos_per_prompt=num_videos_per_prompt,
+                    max_sequence_length=max_sequence_length,
+                )
+        except Exception as exc:
+            if is_cuda_device(encode_device) and is_cuda_oom(exc) and not used_cpu_fallback:
+                logger.warning("OOM during GPU prompt encoding; falling back to CPU encoding.")
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                encode_device = "cpu"
+                encode_dtype = torch.float32
+                used_cpu_fallback = True
+                for name, encoder in self._text_encoders.items():
+                    encoder.to(encode_device)
+                with torch.no_grad():
+                    prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.pipe.encode_prompt(
+                        prompt=prompt,
+                        prompt_2=prompt_2,
+                        device=encode_device,
+                        dtype=encode_dtype,
+                        num_videos_per_prompt=num_videos_per_prompt,
+                        max_sequence_length=max_sequence_length,
+                    )
+            else:
+                raise
 
         # Clone embeddings to CPU immediately
         prompt_embeds = prompt_embeds.cpu().clone()
