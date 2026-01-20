@@ -71,7 +71,12 @@ if __name__ == "__main__":
     parser.add_argument("--kv_reuse_v", action="store_true", help="Also reuse encoder values (default: reuse keys only).")
     parser.add_argument("--kv_reuse_interval", type=int, default=2, help="Refresh cached K/V every N steps (reuse in between).")
     parser.add_argument("--kv_reuse_start_step", type=int, default=4, help="Start KV reuse after this many diffusion steps.")
-    parser.add_argument("--kv_reuse_delta_threshold", type=float, default=0.0, help="Mean-abs change threshold for reuse; 0 disables check.")
+    parser.add_argument(
+        "--kv_reuse_delta_threshold",
+        type=float,
+        default=0.05,
+        help="Relative change floor for KV reuse gating (FastCache-style); 0 uses statistical/adaptive gating only.",
+    )
     parser.add_argument("--kv_reuse_pin_gpu", action="store_true", help="Keep cached encoder K/V on GPU (uses more VRAM).")
     parser.add_argument("--kv_reuse_verbose", action="store_true", help="Print per-layer KV reuse hit/miss counts.")
 
