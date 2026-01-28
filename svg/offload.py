@@ -303,11 +303,9 @@ class LayerOffloadManager:
                 if self.config.verbose:
                     logger.warning(f"Sparsity cache clear skipped for layer {layer_idx}: {e}")
 
-        # Move KV reuse caches to CPU to persist across offload without holding GPU memory.
+        # Move video K reuse caches to CPU to persist across offload without holding GPU memory.
         if hasattr(layer, "attn") and hasattr(layer.attn, "processor"):
             processor = layer.attn.processor
-            if hasattr(processor, "offload_kv_reuse_cache"):
-                processor.offload_kv_reuse_cache()
             if hasattr(processor, "offload_video_k_reuse_cache"):
                 processor.offload_video_k_reuse_cache()
 

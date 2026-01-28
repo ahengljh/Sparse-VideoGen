@@ -15,9 +15,8 @@ from diffusers.utils import load_image, export_to_video
 from dataloader import load_prompt_or_image
 from svg.timer import print_operator_log_data
 from svg.utils.seed import seed_everything
-from svg.models.hyvideo.attention import KVReuseConfig, VideoKReuseConfig
+from svg.models.hyvideo.attention import VideoKReuseConfig
 from svg.models.hyvideo.inference import (
-    collect_kv_reuse_stats,
     collect_video_k_reuse_stats,
     collect_video_k_reuse_metrics,
     replace_hyvideo_flashattention,
@@ -65,20 +64,6 @@ if __name__ == "__main__":
     parser.add_argument("--kmeans_iter_init", type=int, default=0, help="Number of KMeans iterations for initialization in SAP.")
     parser.add_argument("--kmeans_iter_step", type=int, default=0, help="Number of KMeans iterations for other diffusion steps in SAP.")
     parser.add_argument("--zero_step_kmeans_init", action="store_true", help="Initialize the centroids for the first step in SAP, not after warmup.")
-
-    # KV reuse (encoder keys) across diffusion steps
-    parser.add_argument("--kv_reuse", action="store_true", help="Reuse encoder keys across steps when stable.")
-    parser.add_argument("--kv_reuse_v", action="store_true", help="Also reuse encoder values (default: reuse keys only).")
-    parser.add_argument("--kv_reuse_interval", type=int, default=2, help="Refresh cached K/V every N steps (reuse in between).")
-    parser.add_argument("--kv_reuse_start_step", type=int, default=4, help="Start KV reuse after this many diffusion steps.")
-    parser.add_argument(
-        "--kv_reuse_delta_threshold",
-        type=float,
-        default=0.05,
-        help="Relative change floor for KV reuse gating (FastCache-style); 0 uses statistical/adaptive gating only.",
-    )
-    parser.add_argument("--kv_reuse_pin_gpu", action="store_true", help="Keep cached encoder K/V on GPU (uses more VRAM).")
-    parser.add_argument("--kv_reuse_verbose", action="store_true", help="Print per-layer KV reuse hit/miss counts.")
 
     # Video K reuse (stable regions) across diffusion steps
     parser.add_argument("--video_k_reuse", action="store_true", help="Reuse video K for stable regions across steps.")
@@ -282,20 +267,6 @@ if __name__ == "__main__":
     #########################################################
     # Replace the attention
     #########################################################
-    kv_reuse_config = None
-    if args.kv_reuse:
-        cache_on_cpu = bool(args.enable_offload and not args.kv_reuse_pin_gpu)
-        kv_reuse_config = KVReuseConfig(
-            enabled=True,
-            reuse_k=True,
-            reuse_v=args.kv_reuse_v,
-            interval=max(1, args.kv_reuse_interval),
-            start_step=max(0, args.kv_reuse_start_step),
-            delta_threshold=max(0.0, args.kv_reuse_delta_threshold),
-            cache_on_cpu=cache_on_cpu,
-            keep_cache_on_gpu=bool(args.kv_reuse_pin_gpu),
-        )
-
     video_k_reuse_config = None
     if args.video_k_reuse:
         layer_indices = None
@@ -330,7 +301,6 @@ if __name__ == "__main__":
 
     replace_hyvideo_flashattention(
         pipe,
-        kv_reuse_config=kv_reuse_config,
         video_k_reuse_config=video_k_reuse_config,
     )
 
@@ -344,7 +314,6 @@ if __name__ == "__main__":
             first_layers_fp=args.first_layers_fp,
             first_times_fp=args.first_times_fp,
             pattern=args.pattern,
-            kv_reuse_config=kv_reuse_config,
             video_k_reuse_config=video_k_reuse_config,
             # SVG specific
             num_sampled_rows=args.num_sampled_rows,
@@ -361,7 +330,6 @@ if __name__ == "__main__":
             first_layers_fp=args.first_layers_fp,
             first_times_fp=args.first_times_fp,
             pattern=args.pattern,
-            kv_reuse_config=kv_reuse_config,
             video_k_reuse_config=video_k_reuse_config,
             # SAP specific
             num_q_centroids=args.num_q_centroids,
@@ -417,21 +385,6 @@ if __name__ == "__main__":
         os.makedirs(output_dir, exist_ok=True)
 
     export_to_video(output, args.output_file, fps=24)
-
-    # Print KV reuse statistics if enabled
-    if args.kv_reuse:
-        totals, per_layer = collect_kv_reuse_stats(pipe)
-        total_ops = totals["hits"] + totals["misses"]
-        hit_rate = (totals["hits"] / total_ops) * 100 if total_ops > 0 else 0.0
-        logger.info(
-            f"KV reuse stats: hits={totals['hits']} misses={totals['misses']} "
-            f"hit_rate={hit_rate:.1f}% layers={totals['layers']}"
-        )
-        if args.kv_reuse_verbose:
-            for layer in per_layer:
-                logger.info(
-                    f"KV reuse layer {layer['layer']}: hits={layer['hits']} misses={layer['misses']}"
-                )
 
     # Print video K reuse statistics if enabled
     if args.video_k_reuse:

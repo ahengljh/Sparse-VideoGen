@@ -35,27 +35,6 @@ torch._dynamo.config.accumulated_cache_size_limit = 192 * 3
 
 
 @dataclass
-class KVReuseConfig:
-    enabled: bool = False
-    reuse_k: bool = True
-    reuse_v: bool = False
-    interval: int = 2
-    start_step: int = 4
-    delta_threshold: float = 0.05
-    use_relative_change: bool = True
-    use_statistical_threshold: bool = True
-    adaptive_threshold: bool = True
-    z_score: float = 1.96
-    adaptive_beta0: float = 0.01
-    adaptive_beta1: float = 0.5
-    adaptive_beta2: float = -0.002
-    adaptive_beta3: float = 0.00005
-    cache_on_cpu: bool = False
-    cache_pin_memory: bool = True
-    keep_cache_on_gpu: bool = False
-
-
-@dataclass
 class VideoKReuseConfig:
     enabled: bool = False
     block_size: int = 64
@@ -80,19 +59,10 @@ class VideoKReuseConfig:
     metrics_stride: int = 1
 
 
-class KVReuseMixin:
-    kv_reuse_cfg = KVReuseConfig()
+class VideoKReuseMixin:
     video_k_reuse_cfg = VideoKReuseConfig()
 
-    def _kv_reuse_init(self) -> None:
-        self._kv_reuse_step = -1
-        self._kv_reuse_last_timestep = None
-        self._kv_reuse_key = None
-        self._kv_reuse_value = None
-        self._kv_reuse_prev_encoder = None
-        self._kv_reuse_sig = None
-        self._kv_reuse_hits = 0
-        self._kv_reuse_misses = 0
+    def _video_k_reuse_init(self) -> None:
         self._video_k_reuse_step = -1
         self._video_k_reuse_last_timestep = None
         self._video_k_reuse_prev_sig = None
@@ -105,15 +75,7 @@ class KVReuseMixin:
         self._video_k_reuse_hits = 0
         self._video_k_reuse_misses = 0
 
-    def reset_kv_reuse_state(self) -> None:
-        self._kv_reuse_step = -1
-        self._kv_reuse_last_timestep = None
-        self._kv_reuse_key = None
-        self._kv_reuse_value = None
-        self._kv_reuse_prev_encoder = None
-        self._kv_reuse_sig = None
-        self._kv_reuse_hits = 0
-        self._kv_reuse_misses = 0
+    def reset_video_k_reuse_state(self) -> None:
         self._video_k_reuse_step = -1
         self._video_k_reuse_last_timestep = None
         self._video_k_reuse_prev_sig = None
@@ -125,12 +87,6 @@ class KVReuseMixin:
         self._video_k_reuse_step_stats = []
         self._video_k_reuse_hits = 0
         self._video_k_reuse_misses = 0
-
-    def get_kv_reuse_stats(self) -> dict:
-        return {
-            "hits": self._kv_reuse_hits,
-            "misses": self._kv_reuse_misses,
-        }
 
     def get_video_k_reuse_stats(self) -> dict:
         return {
@@ -144,80 +100,6 @@ class KVReuseMixin:
 
     def get_video_k_reuse_step_stats(self) -> list:
         return list(self._video_k_reuse_step_stats)
-
-    def _kv_reuse_step_idx(self, timestep: Optional[int]) -> Optional[int]:
-        if timestep is None:
-            return None
-        if isinstance(timestep, torch.Tensor):
-            t_val = int(timestep[0].item()) if timestep.numel() > 0 else int(timestep.item())
-        else:
-            t_val = int(timestep)
-
-        if self._kv_reuse_last_timestep is None or t_val != self._kv_reuse_last_timestep:
-            self._kv_reuse_step += 1
-            self._kv_reuse_last_timestep = t_val
-
-        return self._kv_reuse_step
-
-    def _kv_reuse_signature(self, tensor: torch.Tensor) -> float:
-        return float(tensor.float().abs().mean().item())
-
-    def _kv_reuse_relative_change(
-        self, current: torch.Tensor, previous: Optional[torch.Tensor]
-    ) -> Optional[float]:
-        if previous is None:
-            return None
-        current_f = current.float()
-        prev_f = previous.float()
-        diff_norm = torch.linalg.vector_norm(current_f - prev_f)
-        prev_norm = torch.linalg.vector_norm(prev_f)
-        if prev_norm == 0:
-            return float("inf")
-        return float((diff_norm / prev_norm).item())
-
-    def _kv_reuse_statistical_threshold(self, seq_len: int, hidden_dim: int) -> float:
-        dof = max(1, int(seq_len * hidden_dim))
-        z_score = float(self.kv_reuse_cfg.z_score)
-        if z_score <= 0:
-            z_score = 1.96
-        chi2_threshold = dof + z_score * math.sqrt(2 * dof)
-        return math.sqrt(chi2_threshold / dof)
-
-    def _kv_reuse_adaptive_threshold(self, delta: float, step_idx: Optional[int]) -> float:
-        cfg = self.kv_reuse_cfg
-        t = float(step_idx or 0)
-        normalized_t = t / 1000.0
-        threshold = (
-            float(cfg.adaptive_beta0)
-            + float(cfg.adaptive_beta1) * float(delta)
-            + float(cfg.adaptive_beta2) * normalized_t
-            + float(cfg.adaptive_beta3) * (normalized_t ** 2)
-        )
-        return max(0.0, threshold)
-
-    def _kv_reuse_effective_threshold(
-        self, delta: float, step_idx: Optional[int], seq_len: int, hidden_dim: int
-    ) -> float:
-        cfg = self.kv_reuse_cfg
-        base = max(0.0, float(cfg.delta_threshold))
-
-        stat_threshold = None
-        if cfg.use_statistical_threshold:
-            stat_threshold = self._kv_reuse_statistical_threshold(seq_len, hidden_dim)
-
-        adaptive_threshold = None
-        if cfg.adaptive_threshold:
-            adaptive_threshold = self._kv_reuse_adaptive_threshold(delta, step_idx)
-
-        if stat_threshold is not None and adaptive_threshold is not None:
-            combined = min(stat_threshold, adaptive_threshold)
-        else:
-            combined = stat_threshold if stat_threshold is not None else adaptive_threshold
-
-        if combined is None:
-            return base
-
-        return max(base, combined)
 
     def _video_k_reuse_step_idx(self, timestep: Optional[int]) -> Optional[int]:
         if timestep is None:
@@ -380,7 +262,7 @@ class KVReuseMixin:
             return None
         if not self.video_k_reuse_cfg.cache_on_cpu:
             return tensor.to(device)
-        return self._kv_reuse_cache_to_device(tensor, device)
+        return self._cache_to_device(tensor, device)
 
     def _video_k_reuse_get_key(self, attn, video_hidden_states: torch.Tensor, timestep: Optional[int]) -> torch.Tensor:
         cfg = self.video_k_reuse_cfg
@@ -725,126 +607,13 @@ class KVReuseMixin:
 
         return tensor.to("cpu")
 
-    def _kv_reuse_cache_to_cpu(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
-        if tensor is None:
-            return None
-        if tensor.device.type == "cpu":
-            if self.kv_reuse_cfg.cache_pin_memory and not tensor.is_pinned():
-                pinned = torch.empty_like(tensor, device="cpu", pin_memory=True)
-                pinned.copy_(tensor)
-                return pinned
-            return tensor
-
-        if self.kv_reuse_cfg.cache_pin_memory:
-            pinned = torch.empty_like(tensor, device="cpu", pin_memory=True)
-            pinned.copy_(tensor, non_blocking=True)
-            return pinned
-
-        return tensor.to("cpu")
-
-    def _kv_reuse_cache_to_device(self, tensor: Optional[torch.Tensor], device: torch.device) -> Optional[torch.Tensor]:
+    def _cache_to_device(self, tensor: Optional[torch.Tensor], device: torch.device) -> Optional[torch.Tensor]:
         if tensor is None:
             return None
         if tensor.device == device:
             return tensor
         non_blocking = tensor.device.type == "cpu" and tensor.is_pinned()
         return tensor.to(device, non_blocking=non_blocking)
-
-    def _kv_reuse_should_reuse(
-        self, encoder_hidden_states: torch.Tensor, timestep: Optional[int]
-    ) -> Tuple[bool, Optional[int], Optional[float]]:
-        cfg = self.kv_reuse_cfg
-        if not cfg.enabled or not cfg.reuse_k:
-            return False, None, None
-
-        step_idx = self._kv_reuse_step_idx(timestep)
-        if step_idx is None or step_idx < cfg.start_step or cfg.interval <= 1:
-            return False, step_idx, None
-
-        if self._kv_reuse_key is None or (step_idx % cfg.interval) == 0:
-            return False, step_idx, None
-        if (
-            self._kv_reuse_key.shape[0] != encoder_hidden_states.shape[0]
-            or self._kv_reuse_key.shape[1] != encoder_hidden_states.shape[1]
-        ):
-            return False, step_idx, None
-
-        if cfg.use_relative_change:
-            prev_states = self._kv_reuse_prev_encoder
-            if prev_states is None:
-                return False, step_idx, None
-            prev_states = self._kv_reuse_cache_to_device(prev_states, encoder_hidden_states.device)
-            delta = self._kv_reuse_relative_change(encoder_hidden_states, prev_states)
-            if delta is None:
-                return False, step_idx, None
-            threshold = self._kv_reuse_effective_threshold(
-                delta,
-                step_idx,
-                encoder_hidden_states.shape[1],
-                encoder_hidden_states.shape[2],
-            )
-            return delta <= threshold, step_idx, delta
-
-        if cfg.delta_threshold > 0:
-            sig = self._kv_reuse_signature(encoder_hidden_states)
-            if self._kv_reuse_sig is None or abs(sig - self._kv_reuse_sig) > cfg.delta_threshold:
-                return False, step_idx, sig
-            return True, step_idx, sig
-
-        return True, step_idx, None
-
-    def _kv_reuse_get_encoder_kv(
-        self,
-        encoder_hidden_states: torch.Tensor,
-        k_proj,
-        v_proj,
-        timestep: Optional[int],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        cfg = self.kv_reuse_cfg
-        reuse, _, sig = self._kv_reuse_should_reuse(encoder_hidden_states, timestep)
-
-        if reuse:
-            key = self._kv_reuse_cache_to_device(self._kv_reuse_key, encoder_hidden_states.device)
-            if cfg.reuse_v and self._kv_reuse_value is not None:
-                value = self._kv_reuse_cache_to_device(self._kv_reuse_value, encoder_hidden_states.device)
-            else:
-                value = v_proj(encoder_hidden_states)
-            self._kv_reuse_hits += 1
-            self._kv_reuse_prev_encoder = encoder_hidden_states.detach()
-            return key, value
-
-        key = k_proj(encoder_hidden_states)
-        value = v_proj(encoder_hidden_states)
-
-        if cfg.enabled and cfg.reuse_k:
-            cached_key = key.detach()
-            cached_value = value.detach() if cfg.reuse_v else None
-            if cfg.cache_on_cpu:
-                cached_key = self._kv_reuse_cache_to_cpu(cached_key)
-                cached_value = self._kv_reuse_cache_to_cpu(cached_value)
-            self._kv_reuse_key = cached_key
-            self._kv_reuse_value = cached_value
-            if cfg.use_relative_change:
-                self._kv_reuse_sig = None
-            else:
-                self._kv_reuse_sig = sig if sig is not None else self._kv_reuse_signature(encoder_hidden_states)
-        self._kv_reuse_misses += 1
-        self._kv_reuse_prev_encoder = encoder_hidden_states.detach()
-
-        return key, value
-
-    def offload_kv_reuse_cache(self) -> None:
-        if self.kv_reuse_cfg.keep_cache_on_gpu:
-            return
-        if (
-            self._kv_reuse_key is None
-            and self._kv_reuse_value is None
-            and self._kv_reuse_prev_encoder is None
-        ):
-            return
-        self._kv_reuse_key = self._kv_reuse_cache_to_cpu(self._kv_reuse_key)
-        self._kv_reuse_value = self._kv_reuse_cache_to_cpu(self._kv_reuse_value)
-        self._kv_reuse_prev_encoder = self._kv_reuse_cache_to_cpu(self._kv_reuse_prev_encoder)
 
     def offload_video_k_reuse_cache(self) -> None:
         if not self._video_k_reuse_cache:
@@ -857,7 +626,7 @@ class KVReuseMixin:
             self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_to_cpu(block_k)
 
 
-class HunyuanVideoAttnProcessor2_0_FlashAttention(KVReuseMixin):
+class HunyuanVideoAttnProcessor2_0_FlashAttention(VideoKReuseMixin):
     """
     This is a custom attention processor that replaces the original attention implementation with flash attention.
     The original implementation is based on the FSDP + mask implementation, which is SLOW. We switch to flash attention + varlen for efficiency.
@@ -865,7 +634,7 @@ class HunyuanVideoAttnProcessor2_0_FlashAttention(KVReuseMixin):
 
     def __init__(self, layer_idx):
         self.layer_idx = layer_idx
-        self._kv_reuse_init()
+        self._video_k_reuse_init()
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("WanAttnProcessor2_0 requires PyTorch 2.0. To use it, please upgrade PyTorch to 2.0.")
 
@@ -887,13 +656,8 @@ class HunyuanVideoAttnProcessor2_0_FlashAttention(KVReuseMixin):
                 key_video = attn.to_k(hidden_states)
 
             encoder_query = attn.to_q(encoder_hidden_states)
-            if self.kv_reuse_cfg.enabled:
-                encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
-                    encoder_hidden_states, attn.to_k, attn.to_v, timestep
-                )
-            else:
-                encoder_key = attn.to_k(encoder_hidden_states)
-                encoder_value = attn.to_v(encoder_hidden_states)
+            encoder_key = attn.to_k(encoder_hidden_states)
+            encoder_value = attn.to_v(encoder_hidden_states)
 
             query = torch.cat([query_video, encoder_query], dim=1)
             key = torch.cat([key_video, encoder_key], dim=1)
@@ -941,9 +705,8 @@ class HunyuanVideoAttnProcessor2_0_FlashAttention(KVReuseMixin):
         # 4. Encoder condition QKV projection and normalization
         if attn.add_q_proj is not None and encoder_hidden_states is not None:
             encoder_query = attn.add_q_proj(encoder_hidden_states)
-            encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
-                encoder_hidden_states, attn.add_k_proj, attn.add_v_proj, timestep
-            )
+            encoder_key = attn.add_k_proj(encoder_hidden_states)
+            encoder_value = attn.add_v_proj(encoder_hidden_states)
 
             encoder_query = encoder_query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
             encoder_key = encoder_key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
@@ -1074,7 +837,7 @@ except ImportError:
     logger.info(f"{Color.red}Disable Fast CUDA and Triton Kernels{Color.reset}")
 
 
-class Hunyuan_SVGAttn_Processor2_0(KVReuseMixin):
+class Hunyuan_SVGAttn_Processor2_0(VideoKReuseMixin):
     """
     Supports Sparse VideoGen.
     """
@@ -1095,7 +858,7 @@ class Hunyuan_SVGAttn_Processor2_0(KVReuseMixin):
 
     def __init__(self, layer_idx):
         self.layer_idx = layer_idx
-        self._kv_reuse_init()
+        self._video_k_reuse_init()
         if not hasattr(F, "scaled_dot_product_attention"):
             raise ImportError("Hunyuan_SparseAttn requires PyTorch 2.0, please upgrade PyTorch.")
 
@@ -1110,13 +873,8 @@ class Hunyuan_SVGAttn_Processor2_0(KVReuseMixin):
                 key_video = attn.to_k(hidden_states)
 
             encoder_query = attn.to_q(encoder_hidden_states)
-            if self.kv_reuse_cfg.enabled:
-                encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
-                    encoder_hidden_states, attn.to_k, attn.to_v, timestep
-                )
-            else:
-                encoder_key = attn.to_k(encoder_hidden_states)
-                encoder_value = attn.to_v(encoder_hidden_states)
+            encoder_key = attn.to_k(encoder_hidden_states)
+            encoder_value = attn.to_v(encoder_hidden_states)
 
             query = torch.cat([query_video, encoder_query], dim=1)
             key = torch.cat([key_video, encoder_key], dim=1)
@@ -1161,9 +919,8 @@ class Hunyuan_SVGAttn_Processor2_0(KVReuseMixin):
         # 4. Encoder condition QKV projection and normalization
         if attn.add_q_proj is not None and encoder_hidden_states is not None:
             encoder_query = attn.add_q_proj(encoder_hidden_states)
-            encoder_key, encoder_value = self._kv_reuse_get_encoder_kv(
-                encoder_hidden_states, attn.add_k_proj, attn.add_v_proj, timestep
-            )
+            encoder_key = attn.add_k_proj(encoder_hidden_states)
+            encoder_value = attn.add_v_proj(encoder_hidden_states)
 
             encoder_query = encoder_query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
             encoder_key = encoder_key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
