@@ -127,6 +127,13 @@ if __name__ == "__main__":
         default=None,
         help="Write per-step metrics as JSONL to this path.",
     )
+    parser.add_argument(
+        "--no_video_kv_reuse_v",
+        action="store_false",
+        dest="video_kv_reuse_v",
+        help="Disable joint V reuse (K-only mode). By default V is also reused.",
+    )
+    parser.set_defaults(video_kv_reuse_v=True)
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
@@ -295,6 +302,7 @@ if __name__ == "__main__":
             cache_on_cpu=bool(args.video_k_reuse_cache_on_cpu),
             keep_cache_on_gpu=not args.video_k_reuse_cache_on_cpu,
             layer_indices=layer_indices,
+            reuse_v=bool(args.video_kv_reuse_v),
             metrics_enabled=bool(args.video_k_reuse_metrics),
             metrics_stride=max(1, args.video_k_reuse_metrics_stride),
         )

@@ -55,6 +55,8 @@ class VideoKReuseConfig:
     cache_pin_memory: bool = True
     keep_cache_on_gpu: bool = True
     layer_indices: Optional[Tuple[int, ...]] = None
+    reuse_v: bool = True
+    sig_proj_dim: int = 64
     metrics_enabled: bool = False
     metrics_stride: int = 1
 
@@ -70,10 +72,12 @@ class VideoKReuseMixin:
         self._video_k_reuse_stable_blocks = None
         self._video_k_reuse_critical_blocks = None
         self._video_k_reuse_cache = {}
+        self._video_v_reuse_cache = {}
         self._video_k_reuse_change_ratio = None
         self._video_k_reuse_step_stats = []
         self._video_k_reuse_hits = 0
         self._video_k_reuse_misses = 0
+        self._sig_proj: Optional[torch.Tensor] = None
 
     def reset_video_k_reuse_state(self) -> None:
         self._video_k_reuse_step = -1
@@ -83,16 +87,19 @@ class VideoKReuseMixin:
         self._video_k_reuse_stable_blocks = None
         self._video_k_reuse_critical_blocks = None
         self._video_k_reuse_cache = {}
+        self._video_v_reuse_cache = {}
         self._video_k_reuse_change_ratio = None
         self._video_k_reuse_step_stats = []
         self._video_k_reuse_hits = 0
         self._video_k_reuse_misses = 0
+        self._sig_proj = None
 
     def get_video_k_reuse_stats(self) -> dict:
         return {
             "hits": self._video_k_reuse_hits,
             "misses": self._video_k_reuse_misses,
             "cached_blocks": len(self._video_k_reuse_cache),
+            "v_cached_blocks": len(self._video_v_reuse_cache),
             "stable_blocks": len(self._video_k_reuse_stable_blocks or ()),
             "critical_blocks": len(self._video_k_reuse_critical_blocks or ()),
             "change_ratio": self._video_k_reuse_change_ratio,
@@ -134,9 +141,20 @@ class VideoKReuseMixin:
         return True
 
     def _video_k_reuse_block_signature(self, video_hidden_states: torch.Tensor, block_size: int) -> torch.Tensor:
+        cfg = self.video_k_reuse_cfg
         bsz, seq_len, dim = video_hidden_states.shape
         num_blocks = int(math.ceil(seq_len / block_size))
         padded_len = num_blocks * block_size
+
+        proj_dim = cfg.sig_proj_dim
+        if proj_dim > 0 and proj_dim < dim:
+            if self._sig_proj is None or self._sig_proj.shape[0] != dim:
+                gen = torch.Generator(device='cpu').manual_seed(42)
+                self._sig_proj = torch.randn(dim, proj_dim, generator=gen) / (proj_dim ** 0.5)
+            proj = self._sig_proj.to(device=video_hidden_states.device, dtype=video_hidden_states.dtype)
+            video_hidden_states = video_hidden_states @ proj
+            dim = proj_dim
+
         if padded_len != seq_len:
             pad_len = padded_len - seq_len
             pad = torch.zeros(
@@ -238,18 +256,29 @@ class VideoKReuseMixin:
         self._video_k_reuse_change_ratio = change_ratio
         return change_ratio, change_mask
 
-    def _video_k_reuse_update_cache_block(self, block_id: int, block_k: torch.Tensor) -> None:
+    def _update_kv_cache_block(self, block_id: int, block_k: torch.Tensor, block_v: Optional[torch.Tensor] = None) -> None:
         cfg = self.video_k_reuse_cfg
-        cached = self._video_k_reuse_cache.get(block_id)
         alpha = cfg.ema_alpha
         if alpha < 0.0:
             alpha = 0.0
         elif alpha > 1.0:
             alpha = 1.0
-        if cached is not None and alpha < 1.0:
-            if cached.device == block_k.device and cached.shape == block_k.shape:
-                block_k = cached + alpha * (block_k - cached)
+
+        cached_k = self._video_k_reuse_cache.get(block_id)
+        if cached_k is not None and alpha < 1.0:
+            if cached_k.device == block_k.device and cached_k.shape == block_k.shape:
+                block_k = cached_k + alpha * (block_k - cached_k)
         self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_tensor(block_k)
+
+        if block_v is not None:
+            cached_v = self._video_v_reuse_cache.get(block_id)
+            if cached_v is not None and alpha < 1.0:
+                if cached_v.device == block_v.device and cached_v.shape == block_v.shape:
+                    block_v = cached_v + alpha * (block_v - cached_v)
+            self._video_v_reuse_cache[block_id] = self._video_k_reuse_cache_tensor(block_v)
+
+    def _video_k_reuse_update_cache_block(self, block_id: int, block_k: torch.Tensor) -> None:
+        self._update_kv_cache_block(block_id, block_k)
 
     def _video_k_reuse_cache_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         cfg = self.video_k_reuse_cfg
@@ -264,14 +293,18 @@ class VideoKReuseMixin:
             return tensor.to(device)
         return self._cache_to_device(tensor, device)
 
-    def _video_k_reuse_get_key(self, attn, video_hidden_states: torch.Tensor, timestep: Optional[int]) -> torch.Tensor:
+    def _video_kv_reuse_get_kv(
+        self, attn, video_hidden_states: torch.Tensor, timestep: Optional[int]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         cfg = self.video_k_reuse_cfg
+        reuse_v = cfg.reuse_v
+
         if not self._video_k_reuse_layer_enabled():
-            return attn.to_k(video_hidden_states)
+            return attn.to_k(video_hidden_states), attn.to_v(video_hidden_states)
 
         step_idx = self._video_k_reuse_step_idx(timestep)
         if step_idx is None:
-            return attn.to_k(video_hidden_states)
+            return attn.to_k(video_hidden_states), attn.to_v(video_hidden_states)
 
         block_size = max(1, int(cfg.block_size))
         sig = None
@@ -320,8 +353,24 @@ class VideoKReuseMixin:
                     "total_tokens": seq_len,
                     "reused_tokens": reused_tokens,
                     "computed_tokens": computed_tokens,
+                    "reuse_v": reuse_v,
                 }
             )
+
+        def _compute_full_kv():
+            full_k = attn.to_k(video_hidden_states)
+            full_v = attn.to_v(video_hidden_states)
+            return full_k, full_v
+
+        def _update_cache_from_full(full_k, full_v, block_list):
+            for block_id in block_list:
+                start = block_id * block_size
+                end = min(start + block_size, seq_len)
+                if start >= end:
+                    continue
+                block_k = full_k[:, start:end, :]
+                block_v = full_v[:, start:end, :] if reuse_v else None
+                self._update_kv_cache_block(block_id, block_k, block_v)
 
         if step_idx < cfg.warmup_steps:
             sig = self._video_k_reuse_block_signature(video_hidden_states, block_size)
@@ -340,7 +389,7 @@ class VideoKReuseMixin:
                 change_ratio=self._video_k_reuse_change_ratio,
                 unstable_ratio=None,
             )
-            return attn.to_k(video_hidden_states)
+            return _compute_full_kv()
 
         if self._video_k_reuse_stable_blocks is None:
             if sig is None:
@@ -361,7 +410,7 @@ class VideoKReuseMixin:
                     change_ratio=self._video_k_reuse_change_ratio,
                     unstable_ratio=None,
                 )
-                return attn.to_k(video_hidden_states)
+                return _compute_full_kv()
 
         cache_blocks = [b for b in (self._video_k_reuse_stable_blocks or ()) if b < num_blocks]
         critical_set = set(self._video_k_reuse_critical_blocks or ())
@@ -386,7 +435,7 @@ class VideoKReuseMixin:
                 change_ratio=self._video_k_reuse_change_ratio,
                 unstable_ratio=None,
             )
-            return attn.to_k(video_hidden_states)
+            return _compute_full_kv()
 
         reuse_blocks = list(cache_blocks)
 
@@ -402,14 +451,8 @@ class VideoKReuseMixin:
                 reuse_blocks = [b for b in cache_blocks if b < mask_cpu.numel() and mask_cpu[b]]
             if cfg.change_ratio_threshold > 0 and change_ratio is not None:
                 if change_ratio >= cfg.change_ratio_threshold:
-                    full_k = attn.to_k(video_hidden_states)
-                    for block_id in cache_blocks:
-                        start = block_id * block_size
-                        end = min(start + block_size, seq_len)
-                        if start >= end:
-                            continue
-                        block_k = full_k[:, start:end, :]
-                        self._video_k_reuse_update_cache_block(block_id, block_k)
+                    full_k, full_v = _compute_full_kv()
+                    _update_cache_from_full(full_k, full_v, cache_blocks)
                     self._video_k_reuse_misses += len(cache_blocks)
                     record_stats(
                         mode="change_ratio_full",
@@ -425,7 +468,7 @@ class VideoKReuseMixin:
                         change_ratio=change_ratio,
                         unstable_ratio=None,
                     )
-                    return full_k
+                    return full_k, full_v
         else:
             self._video_k_reuse_change_ratio = None
 
@@ -444,17 +487,11 @@ class VideoKReuseMixin:
                 change_ratio=change_ratio,
                 unstable_ratio=None,
             )
-            return attn.to_k(video_hidden_states)
+            return _compute_full_kv()
 
         if not reuse_blocks:
-            full_k = attn.to_k(video_hidden_states)
-            for block_id in cache_blocks:
-                start = block_id * block_size
-                end = min(start + block_size, seq_len)
-                if start >= end:
-                    continue
-                block_k = full_k[:, start:end, :]
-                self._video_k_reuse_update_cache_block(block_id, block_k)
+            full_k, full_v = _compute_full_kv()
+            _update_cache_from_full(full_k, full_v, cache_blocks)
             self._video_k_reuse_misses += len(cache_blocks)
             record_stats(
                 mode="no_reuse_blocks",
@@ -470,7 +507,7 @@ class VideoKReuseMixin:
                 change_ratio=change_ratio,
                 unstable_ratio=None,
             )
-            return full_k
+            return full_k, full_v
 
         refresh = cfg.interval <= 1 or (step_idx % cfg.interval) == 0
         if refresh and cfg.change_ratio_threshold > 0 and change_ratio is not None:
@@ -478,14 +515,8 @@ class VideoKReuseMixin:
                 refresh = False
 
         if refresh:
-            full_k = attn.to_k(video_hidden_states)
-            for block_id in cache_blocks:
-                start = block_id * block_size
-                end = min(start + block_size, seq_len)
-                if start >= end:
-                    continue
-                block_k = full_k[:, start:end, :]
-                self._video_k_reuse_update_cache_block(block_id, block_k)
+            full_k, full_v = _compute_full_kv()
+            _update_cache_from_full(full_k, full_v, cache_blocks)
             self._video_k_reuse_misses += len(cache_blocks)
             record_stats(
                 mode="refresh_full",
@@ -501,21 +532,15 @@ class VideoKReuseMixin:
                 change_ratio=change_ratio,
                 unstable_ratio=None,
             )
-            return full_k
+            return full_k, full_v
 
         stable_set = set(reuse_blocks)
         unstable_blocks = [b for b in range(num_blocks) if b not in stable_set]
         unstable_ratio = (len(unstable_blocks) / num_blocks) if num_blocks > 0 else 0.0
         max_unstable_ratio = min(1.0, max(0.0, cfg.max_unstable_ratio))
         if max_unstable_ratio < 1.0 and len(unstable_blocks) >= int(math.ceil(max_unstable_ratio * num_blocks)):
-            full_k = attn.to_k(video_hidden_states)
-            for block_id in cache_blocks:
-                start = block_id * block_size
-                end = min(start + block_size, seq_len)
-                if start >= end:
-                    continue
-                block_k = full_k[:, start:end, :]
-                self._video_k_reuse_update_cache_block(block_id, block_k)
+            full_k, full_v = _compute_full_kv()
+            _update_cache_from_full(full_k, full_v, cache_blocks)
             self._video_k_reuse_misses += len(cache_blocks)
             record_stats(
                 mode="unstable_full",
@@ -531,9 +556,10 @@ class VideoKReuseMixin:
                 change_ratio=change_ratio,
                 unstable_ratio=unstable_ratio,
             )
-            return full_k
+            return full_k, full_v
 
         key = torch.empty_like(video_hidden_states)
+        value = torch.empty_like(video_hidden_states) if reuse_v else attn.to_v(video_hidden_states)
 
         step_hits = 0
         step_misses = 0
@@ -545,30 +571,41 @@ class VideoKReuseMixin:
             end = min(start + block_size, seq_len)
             if start >= end:
                 continue
-            cached = self._video_k_reuse_load_tensor(self._video_k_reuse_cache.get(block_id), video_hidden_states.device)
-            if cached is None or cached.shape[1] != (end - start):
-                block_k = attn.to_k(video_hidden_states[:, start:end, :])
-                self._video_k_reuse_update_cache_block(block_id, block_k)
+            cached_k = self._video_k_reuse_load_tensor(self._video_k_reuse_cache.get(block_id), video_hidden_states.device)
+            cached_v = self._video_k_reuse_load_tensor(self._video_v_reuse_cache.get(block_id), video_hidden_states.device) if reuse_v else None
+            if cached_k is None or cached_k.shape[1] != (end - start):
+                hs_block = video_hidden_states[:, start:end, :]
+                block_k = attn.to_k(hs_block)
+                block_v = attn.to_v(hs_block) if reuse_v else None
+                self._update_kv_cache_block(block_id, block_k, block_v)
                 key[:, start:end, :] = block_k
+                if reuse_v:
+                    value[:, start:end, :] = block_v
                 self._video_k_reuse_misses += 1
                 step_misses += 1
                 computed_tokens += block_tokens(block_id)
             else:
-                key[:, start:end, :] = cached
+                key[:, start:end, :] = cached_k
+                if reuse_v and cached_v is not None and cached_v.shape[1] == (end - start):
+                    value[:, start:end, :] = cached_v
+                elif reuse_v:
+                    block_v = attn.to_v(video_hidden_states[:, start:end, :])
+                    value[:, start:end, :] = block_v
                 self._video_k_reuse_hits += 1
                 step_hits += 1
                 reused_tokens += block_tokens(block_id)
 
         if unstable_blocks:
-            indices = []
-            for block_id in unstable_blocks:
-                start = block_id * block_size
-                end = min(start + block_size, seq_len)
-                if start < end:
-                    indices.extend(range(start, end))
-            idx = torch.tensor(indices, device=video_hidden_states.device, dtype=torch.long)
-            k_sel = attn.to_k(video_hidden_states.index_select(1, idx))
+            block_starts = torch.tensor(unstable_blocks, device=video_hidden_states.device) * block_size
+            offsets = torch.arange(block_size, device=video_hidden_states.device)
+            idx = (block_starts.unsqueeze(1) + offsets.unsqueeze(0)).reshape(-1)
+            idx = idx[idx < seq_len]
+            hs_sel = video_hidden_states.index_select(1, idx)
+            k_sel = attn.to_k(hs_sel)
             key.index_copy_(1, idx, k_sel)
+            if reuse_v:
+                v_sel = attn.to_v(hs_sel)
+                value.index_copy_(1, idx, v_sel)
             self._video_k_reuse_misses += len(unstable_blocks)
             step_misses += len(unstable_blocks)
             computed_tokens += sum(block_tokens(block_id) for block_id in unstable_blocks)
@@ -588,6 +625,10 @@ class VideoKReuseMixin:
             unstable_ratio=unstable_ratio,
         )
 
+        return key, value
+
+    def _video_k_reuse_get_key(self, attn, video_hidden_states: torch.Tensor, timestep: Optional[int]) -> torch.Tensor:
+        key, _ = self._video_kv_reuse_get_kv(attn, video_hidden_states, timestep)
         return key
 
     def _video_k_reuse_cache_to_cpu(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
@@ -616,14 +657,14 @@ class VideoKReuseMixin:
         return tensor.to(device, non_blocking=non_blocking)
 
     def offload_video_k_reuse_cache(self) -> None:
-        if not self._video_k_reuse_cache:
-            return
         if self.video_k_reuse_cfg.keep_cache_on_gpu:
             return
         if not self.video_k_reuse_cfg.cache_on_cpu:
             return
         for block_id, block_k in list(self._video_k_reuse_cache.items()):
             self._video_k_reuse_cache[block_id] = self._video_k_reuse_cache_to_cpu(block_k)
+        for block_id, block_v in list(self._video_v_reuse_cache.items()):
+            self._video_v_reuse_cache[block_id] = self._video_k_reuse_cache_to_cpu(block_v)
 
 
 class HunyuanVideoAttnProcessor2_0_FlashAttention(VideoKReuseMixin):
@@ -649,11 +690,11 @@ class HunyuanVideoAttnProcessor2_0_FlashAttention(VideoKReuseMixin):
     ) -> torch.Tensor:
         if attn.add_q_proj is None and encoder_hidden_states is not None:
             query_video = attn.to_q(hidden_states)
-            value_video = attn.to_v(hidden_states)
             if self.video_k_reuse_cfg.enabled and self._video_k_reuse_layer_enabled():
-                key_video = self._video_k_reuse_get_key(attn, hidden_states, timestep)
+                key_video, value_video = self._video_kv_reuse_get_kv(attn, hidden_states, timestep)
             else:
                 key_video = attn.to_k(hidden_states)
+                value_video = attn.to_v(hidden_states)
 
             encoder_query = attn.to_q(encoder_hidden_states)
             encoder_key = attn.to_k(encoder_hidden_states)
@@ -665,11 +706,11 @@ class HunyuanVideoAttnProcessor2_0_FlashAttention(VideoKReuseMixin):
         else:
             # 1. QKV projections
             query = attn.to_q(hidden_states)
-            value = attn.to_v(hidden_states)
             if self.video_k_reuse_cfg.enabled and self._video_k_reuse_layer_enabled():
-                key = self._video_k_reuse_get_key(attn, hidden_states, timestep)
+                key, value = self._video_kv_reuse_get_kv(attn, hidden_states, timestep)
             else:
                 key = attn.to_k(hidden_states)
+                value = attn.to_v(hidden_states)
 
         query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
         key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
@@ -866,11 +907,11 @@ class Hunyuan_SVGAttn_Processor2_0(VideoKReuseMixin):
     def get_qkv(self, attn, hidden_states, encoder_hidden_states=None, timestep=None):
         if encoder_hidden_states is not None:
             query_video = attn.to_q(hidden_states)
-            value_video = attn.to_v(hidden_states)
             if self.video_k_reuse_cfg.enabled and self._video_k_reuse_layer_enabled():
-                key_video = self._video_k_reuse_get_key(attn, hidden_states, timestep)
+                key_video, value_video = self._video_kv_reuse_get_kv(attn, hidden_states, timestep)
             else:
                 key_video = attn.to_k(hidden_states)
+                value_video = attn.to_v(hidden_states)
 
             encoder_query = attn.to_q(encoder_hidden_states)
             encoder_key = attn.to_k(encoder_hidden_states)
@@ -881,11 +922,11 @@ class Hunyuan_SVGAttn_Processor2_0(VideoKReuseMixin):
             value = torch.cat([value_video, encoder_value], dim=1)
         else:
             query = attn.to_q(hidden_states)
-            value = attn.to_v(hidden_states)
             if self.video_k_reuse_cfg.enabled and self._video_k_reuse_layer_enabled():
-                key = self._video_k_reuse_get_key(attn, hidden_states, timestep)
+                key, value = self._video_kv_reuse_get_kv(attn, hidden_states, timestep)
             else:
                 key = attn.to_k(hidden_states)
+                value = attn.to_v(hidden_states)
 
         return query, key, value
 
