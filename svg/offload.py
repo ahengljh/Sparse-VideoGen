@@ -25,6 +25,20 @@ import torch.nn as nn
 from .logger import logger
 from .timer import time_logging_decorator
 
+# Default prompt template for HunyuanVideo LLaMA encoder
+# Imported lazily to avoid hard dependency on diffusers pipeline internals
+_DEFAULT_PROMPT_TEMPLATE = None
+
+def _get_default_prompt_template():
+    global _DEFAULT_PROMPT_TEMPLATE
+    if _DEFAULT_PROMPT_TEMPLATE is None:
+        try:
+            from diffusers.pipelines.hunyuan_video.pipeline_hunyuan_video import DEFAULT_PROMPT_TEMPLATE
+            _DEFAULT_PROMPT_TEMPLATE = DEFAULT_PROMPT_TEMPLATE
+        except ImportError:
+            _DEFAULT_PROMPT_TEMPLATE = {"template": "{}", "crop_start": 0}
+    return _DEFAULT_PROMPT_TEMPLATE
+
 
 @dataclass
 class OffloadConfig:
@@ -647,6 +661,24 @@ class TextEncoderOffloadManager:
         memory_freed = self.get_memory_estimate()
         logger.info(f"Text encoders offloaded to CPU. Freed ~{memory_freed:.1f}GB GPU memory")
 
+    def _move_encoder_to_device(self, name: str, encoder: nn.Module, device, dtype=None):
+        """Move a single encoder to device, optionally casting dtype."""
+        encoder.to(device)
+        if dtype is not None and hasattr(encoder, 'to'):
+            encoder.to(dtype=dtype)
+        if self.verbose:
+            if str(device).startswith("cuda") and torch.cuda.is_available():
+                mem = torch.cuda.memory_allocated() / 1024**3
+                logger.info(f"  {name} -> {device} (GPU: {mem:.2f}GB)")
+            else:
+                logger.info(f"  {name} -> {device}")
+
+    def _free_encoder_from_gpu(self, name: str, encoder: nn.Module):
+        """Move encoder back to CPU and free GPU memory."""
+        encoder.to('cpu')
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
     def pre_encode_prompt(
         self,
         prompt: str,
@@ -657,7 +689,11 @@ class TextEncoderOffloadManager:
         max_sequence_length: int = 256,
     ) -> Dict[str, torch.Tensor]:
         """
-        Pre-encode prompt on GPU (fast) then aggressively free memory.
+        Pre-encode prompt on GPU then aggressively free memory.
+
+        Encodes with each text encoder sequentially, loading only one to GPU
+        at a time.  This keeps peak GPU usage at ~16 GB (LLaMA-8B) instead of
+        ~16.4 GB (LLaMA + CLIP simultaneously), avoiding OOM on 24 GB cards.
 
         Returns dict with prompt_embeds, pooled_prompt_embeds, prompt_attention_mask
         that can be passed directly to the pipeline.
@@ -692,97 +728,100 @@ class TextEncoderOffloadManager:
 
         encode_device = device
         encode_dtype = dtype
-        used_cpu_fallback = False
 
-        # Move text encoders to target device for encoding
-        try:
-            if is_cuda_device(encode_device):
-                logger.info("Moving text encoders to GPU for encoding...")
-            else:
-                logger.info("Moving text encoders to CPU for encoding...")
-            for name, encoder in self._text_encoders.items():
-                encoder.to(encode_device)
-        except Exception as exc:
-            if is_cuda_device(encode_device) and is_cuda_oom(exc):
-                logger.warning(
-                    "OOM while moving text encoders to GPU; falling back to CPU encoding."
-                )
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                encode_device = "cpu"
-                encode_dtype = torch.float32
-                used_cpu_fallback = True
-                for name, encoder in self._text_encoders.items():
-                    encoder.to(encode_device)
-            else:
-                raise
-
-        if is_cuda_device(encode_device):
-            gpu_after_load = torch.cuda.memory_allocated() / 1024**3
-            logger.info(f"GPU memory after loading encoders: {gpu_after_load:.2f}GB")
-            logger.info("Encoding prompt on GPU...")
-        else:
-            logger.info("Encoding prompt on CPU...")
-
-        try:
-            with torch.no_grad():
-                prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.pipe.encode_prompt(
-                    prompt=prompt,
-                    prompt_2=prompt_2,
-                    device=encode_device,
-                    dtype=encode_dtype,
-                    num_videos_per_prompt=num_videos_per_prompt,
-                    max_sequence_length=max_sequence_length,
-                )
-        except Exception as exc:
-            if is_cuda_device(encode_device) and is_cuda_oom(exc) and not used_cpu_fallback:
-                logger.warning("OOM during GPU prompt encoding; falling back to CPU encoding.")
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                encode_device = "cpu"
-                encode_dtype = torch.float32
-                used_cpu_fallback = True
-                for name, encoder in self._text_encoders.items():
-                    encoder.to(encode_device)
+        # ---- Step 1: Encode with LLaMA (text_encoder, ~16GB bf16) ----
+        prompt_embeds = None
+        prompt_attention_mask = None
+        if 'text_encoder' in self._text_encoders:
+            logger.info("Step 1/2: Encoding with LLaMA text_encoder...")
+            enc = self._text_encoders['text_encoder']
+            try:
+                self._move_encoder_to_device('text_encoder', enc, encode_device)
                 with torch.no_grad():
-                    prompt_embeds, pooled_prompt_embeds, prompt_attention_mask = self.pipe.encode_prompt(
-                        prompt=prompt,
-                        prompt_2=prompt_2,
+                    prompt_embeds, prompt_attention_mask = self.pipe._get_llama_prompt_embeds(
+                        prompt,
+                        prompt_template=_get_default_prompt_template(),
+                        num_videos_per_prompt=num_videos_per_prompt,
                         device=encode_device,
                         dtype=encode_dtype,
-                        num_videos_per_prompt=num_videos_per_prompt,
                         max_sequence_length=max_sequence_length,
                     )
-            else:
-                raise
+                # Move embeddings to CPU immediately
+                prompt_embeds = prompt_embeds.cpu()
+                prompt_attention_mask = prompt_attention_mask.cpu()
+            except Exception as exc:
+                if is_cuda_device(encode_device) and is_cuda_oom(exc):
+                    logger.warning("OOM encoding with LLaMA on GPU; falling back to CPU.")
+                    torch.cuda.empty_cache()
+                    enc.to('cpu')
+                    encode_device = "cpu"
+                    encode_dtype = torch.float32
+                    with torch.no_grad():
+                        prompt_embeds, prompt_attention_mask = self.pipe._get_llama_prompt_embeds(
+                            prompt,
+                            prompt_template=_get_default_prompt_template(),
+                            num_videos_per_prompt=num_videos_per_prompt,
+                            device=encode_device,
+                            dtype=encode_dtype,
+                            max_sequence_length=max_sequence_length,
+                        )
+                    prompt_embeds = prompt_embeds.cpu()
+                    prompt_attention_mask = prompt_attention_mask.cpu()
+                else:
+                    raise
+            # Free LLaMA from GPU before loading CLIP
+            self._free_encoder_from_gpu('text_encoder', enc)
+            logger.info("  LLaMA encoding done, freed from GPU.")
 
-        # Clone embeddings to CPU immediately
-        prompt_embeds = prompt_embeds.cpu().clone()
-        pooled_prompt_embeds = pooled_prompt_embeds.cpu().clone()
-        prompt_attention_mask = prompt_attention_mask.cpu().clone()
+        # ---- Step 2: Encode with CLIP (text_encoder_2, ~0.4GB) ----
+        pooled_prompt_embeds = None
+        # Reset device back to GPU for CLIP (it's small, always fits)
+        clip_device = device
+        clip_dtype = dtype
+        if 'text_encoder_2' in self._text_encoders:
+            logger.info("Step 2/2: Encoding with CLIP text_encoder_2...")
+            enc2 = self._text_encoders['text_encoder_2']
+            try:
+                self._move_encoder_to_device('text_encoder_2', enc2, clip_device)
+                with torch.no_grad():
+                    pooled_prompt_embeds = self.pipe._get_clip_prompt_embeds(
+                        prompt_2 if prompt_2 is not None else prompt,
+                        num_videos_per_prompt=num_videos_per_prompt,
+                        device=clip_device,
+                        dtype=clip_dtype,
+                    )
+                pooled_prompt_embeds = pooled_prompt_embeds.cpu()
+            except Exception as exc:
+                if is_cuda_device(clip_device) and is_cuda_oom(exc):
+                    logger.warning("OOM encoding with CLIP on GPU; falling back to CPU.")
+                    torch.cuda.empty_cache()
+                    enc2.to('cpu')
+                    clip_device = "cpu"
+                    clip_dtype = torch.float32
+                    with torch.no_grad():
+                        pooled_prompt_embeds = self.pipe._get_clip_prompt_embeds(
+                            prompt_2 if prompt_2 is not None else prompt,
+                            num_videos_per_prompt=num_videos_per_prompt,
+                            device=clip_device,
+                            dtype=clip_dtype,
+                        )
+                    pooled_prompt_embeds = pooled_prompt_embeds.cpu()
+                else:
+                    raise
+            self._free_encoder_from_gpu('text_encoder_2', enc2)
+            logger.info("  CLIP encoding done, freed from GPU.")
 
-        logger.info("Embeddings saved to CPU. Now freeing GPU memory...")
+        logger.info("Embeddings saved to CPU. Now freeing text encoder memory...")
 
         # AGGRESSIVE MEMORY CLEANUP
-        # Step 1: Move encoders to CPU
-        for name, encoder in self._text_encoders.items():
-            encoder.to('cpu')
-
-        # Step 2: Synchronize CUDA to ensure all operations complete
-        torch.cuda.synchronize()
-
-        # Step 3: Delete encoder references from pipeline to break reference chains
-        # This is key - the pipeline holds references that prevent memory from being freed
+        # Delete encoder references from pipeline to break reference chains
         for name in list(self._text_encoders.keys()):
             if hasattr(self.pipe, name):
-                # Set to None to break reference
                 delattr(self.pipe, name)
                 setattr(self.pipe, name, None)
 
-        # Step 4: Clear our own references
         self._text_encoders.clear()
 
-        # Step 5: Multiple rounds of garbage collection
         gc.collect()
         gc.collect()
         torch.cuda.empty_cache()
