@@ -3,6 +3,7 @@
 # Smoke test: quick sanity check that all configs run without errors.
 # Uses 1 prompt, 1 seed, 480p, 33 frames — should finish in minutes.
 # Run this FIRST before committing to the full experiment suite.
+# All runs use offloading (via config.sh run_inference).
 # ============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -26,39 +27,28 @@ run_smoke() {
     log "[smoke:${name}] Done in ${elapsed}s -> ${OUTPUT_FILE}"
 }
 
-KV_BASE=(
-    --video_k_reuse
-    --video_k_reuse_block_size "$KV_BLOCK_SIZE"
-    --video_k_reuse_max_blocks "$KV_MAX_BLOCKS"
-    --video_k_reuse_warmup_steps "$KV_WARMUP"
-    --video_k_reuse_start_step "$KV_START_STEP"
-    --video_k_reuse_interval "$KV_INTERVAL"
-    --video_k_reuse_layer_stride "$KV_LAYER_STRIDE"
-    --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-    --video_k_reuse_metrics
-)
-
 log "=== Smoke Test ==="
 
 # 1. Dense (ground truth)
 run_smoke "dense" --pattern dense
 
 # 2. K-only reuse
-run_smoke "k_only" --pattern dense "${KV_BASE[@]}" --no_video_kv_reuse_v \
+run_smoke "k_only" --pattern dense \
+    "${KV_REUSE_ARGS[@]}" --no_video_kv_reuse_v \
+    --video_k_reuse_metrics \
     --video_k_reuse_metrics_jsonl "${SMOKE_DIR}/k_only_metrics.jsonl"
 
 # 3. KV reuse
-run_smoke "kv_reuse" --pattern dense "${KV_BASE[@]}" \
+run_smoke "kv_reuse" --pattern dense \
+    "${KV_REUSE_ARGS[@]}" \
+    --video_k_reuse_metrics \
     --video_k_reuse_metrics_jsonl "${SMOKE_DIR}/kv_reuse_metrics.jsonl"
 
 # 4. SVG + KV reuse
 run_smoke "svg_kv" \
-    --pattern SVG \
-    --num_sampled_rows "$SVG_SAMPLED_ROWS" \
-    --sparsity "$SVG_SPARSITY" \
-    --first_times_fp "$FIRST_TIMES_FP" \
-    --first_layers_fp "$FIRST_LAYERS_FP" \
-    "${KV_BASE[@]}" \
+    "${SVG_ARGS[@]}" \
+    "${KV_REUSE_ARGS[@]}" \
+    --video_k_reuse_metrics \
     --video_k_reuse_metrics_jsonl "${SMOKE_DIR}/svg_kv_metrics.jsonl"
 
 # 5. Quality check

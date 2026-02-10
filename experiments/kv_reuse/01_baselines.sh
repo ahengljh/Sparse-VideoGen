@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Experiment 1: Baselines & Main Comparisons
-# Generates videos for Dense, K-only reuse, and KV reuse at 720p/129f
+# Generates videos for Dense, K-only reuse, and KV reuse at 720p/129f.
+# All runs use sliding-window offloading (--enable_offload) for 24GB GPUs.
+#
+# Produces the data for Table: Main Results in the paper.
 # ============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -9,7 +12,8 @@ source "${SCRIPT_DIR}/config.sh"
 
 HEIGHT=720; WIDTH=1280; NUM_FRAMES=129; RESOLUTION="720p"
 
-# ---------- Dense baseline ----------
+# ---------- Dense baseline (reference) ----------
+log "=== Dense Baseline (with offload) ==="
 for seed in $SEEDS; do
 for pid in $PROMPT_IDS; do
     PROMPT_TEXT=$(cat "${PROJECT_ROOT}/examples/${pid}/prompt.txt")
@@ -23,6 +27,7 @@ done
 done
 
 # ---------- K-only reuse ----------
+log "=== K-only Reuse ==="
 for seed in $SEEDS; do
 for pid in $PROMPT_IDS; do
     PROMPT_TEXT=$(cat "${PROJECT_ROOT}/examples/${pid}/prompt.txt")
@@ -34,22 +39,16 @@ for pid in $PROMPT_IDS; do
     run_inference \
         --seed "$seed" \
         --pattern dense \
-        --video_k_reuse \
+        "${KV_REUSE_ARGS[@]}" \
         --no_video_kv_reuse_v \
-        --video_k_reuse_block_size "$KV_BLOCK_SIZE" \
-        --video_k_reuse_max_blocks "$KV_MAX_BLOCKS" \
-        --video_k_reuse_warmup_steps "$KV_WARMUP" \
-        --video_k_reuse_start_step "$KV_START_STEP" \
-        --video_k_reuse_interval "$KV_INTERVAL" \
-        --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
-        --video_k_reuse_max_layers "$KV_MAX_LAYERS" \
         --video_k_reuse_metrics \
         --video_k_reuse_metrics_jsonl "$METRICS_JSONL" \
         --video_k_reuse_verbose
 done
 done
 
-# ---------- KV reuse (full, default) ----------
+# ---------- KV reuse (joint K+V, default) ----------
+log "=== KV Reuse (K+V) ==="
 for seed in $SEEDS; do
 for pid in $PROMPT_IDS; do
     PROMPT_TEXT=$(cat "${PROJECT_ROOT}/examples/${pid}/prompt.txt")
@@ -61,14 +60,7 @@ for pid in $PROMPT_IDS; do
     run_inference \
         --seed "$seed" \
         --pattern dense \
-        --video_k_reuse \
-        --video_k_reuse_block_size "$KV_BLOCK_SIZE" \
-        --video_k_reuse_max_blocks "$KV_MAX_BLOCKS" \
-        --video_k_reuse_warmup_steps "$KV_WARMUP" \
-        --video_k_reuse_start_step "$KV_START_STEP" \
-        --video_k_reuse_interval "$KV_INTERVAL" \
-        --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
-        --video_k_reuse_max_layers "$KV_MAX_LAYERS" \
+        "${KV_REUSE_ARGS[@]}" \
         --video_k_reuse_metrics \
         --video_k_reuse_metrics_jsonl "$METRICS_JSONL" \
         --video_k_reuse_verbose
@@ -76,7 +68,7 @@ done
 done
 
 # ---------- Quality: compare each reuse variant against dense ----------
-log "Computing quality metrics..."
+log "=== Computing quality metrics ==="
 for seed in $SEEDS; do
 for pid in $PROMPT_IDS; do
     ref="${RESULT_ROOT}/dense/720p_129f/${pid}-${seed}.mp4"

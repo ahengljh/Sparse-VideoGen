@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Experiment 3: Scalability Study
-# Dense vs KV reuse across resolutions (480p, 720p) and frame counts (33, 65, 129)
+# Dense vs KV reuse across resolutions and frame counts.
+# All runs use offloading.
+#
+# Produces the data for Figure/Table: Scalability in the paper.
 # ============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -44,14 +47,7 @@ for cfg_line in "${CONFIGS[@]}"; do
         run_inference \
             --seed "$seed" \
             --pattern dense \
-            --video_k_reuse \
-            --video_k_reuse_block_size "$KV_BLOCK_SIZE" \
-            --video_k_reuse_max_blocks "$KV_MAX_BLOCKS" \
-            --video_k_reuse_warmup_steps "$KV_WARMUP" \
-            --video_k_reuse_start_step "$KV_START_STEP" \
-            --video_k_reuse_interval "$KV_INTERVAL" \
-            --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
-            --video_k_reuse_max_layers "$KV_MAX_LAYERS" \
+            "${KV_REUSE_ARGS[@]}" \
             --video_k_reuse_metrics \
             --video_k_reuse_metrics_jsonl "$METRICS_JSONL"
     done
