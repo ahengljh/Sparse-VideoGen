@@ -6,29 +6,35 @@
 #   bash experiments/kv_reuse/run_all.sh              # Run everything
 #   bash experiments/kv_reuse/run_all.sh 1             # Run only experiment 1
 #   bash experiments/kv_reuse/run_all.sh 1 2           # Run experiments 1 & 2
+#   bash experiments/kv_reuse/run_all.sh smoke          # Quick smoke test
 #   bash experiments/kv_reuse/run_all.sh analyze        # Only run analysis
 #
 # Environment overrides:
 #   SEEDS="42"                      # Quick run with 1 seed
 #   PROMPT_IDS="1 7"                # Quick run with 2 prompts
-#   CUDA_VISIBLE_DEVICES=0,1        # Multi-GPU (one job per GPU)
+#   CUDA_VISIBLE_DEVICES=0          # GPU selection
 #
 # Recommended execution order by priority:
-#   Priority 1 (main results):   01_baselines.sh
-#   Priority 2 (ablations):      02_ablations.sh
-#   Priority 3 (scalability):    03_scalability.sh
-#   Priority 4 (composability):  04_composability.sh
-#   Priority 5 (timing):         05_timing.sh
-#   Final:                        analyze_results.py
+#   Priority 0 (sanity):      smoke_test.sh
+#   Priority 1 (main table):  01_baselines.sh
+#   Priority 2 (ablations):   02_ablations.sh
+#   Priority 3 (scaling):     03_scalability.sh
+#   Priority 4 (compose):     04_composability.sh
+#   Priority 5 (memory):      05_memory.sh
+#   Final:                     analyze_results.py
 # ============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-EXPERIMENTS="${@:-1 2 3 4 5 analyze}"
+EXPERIMENTS="${@:-smoke 1 2 3 4 5 analyze}"
 
 for exp in $EXPERIMENTS; do
     case "$exp" in
+        smoke)
+            log "========== SMOKE TEST =========="
+            bash "${SCRIPT_DIR}/smoke_test.sh"
+            ;;
         1)
             log "========== EXPERIMENT 1: BASELINES =========="
             bash "${SCRIPT_DIR}/01_baselines.sh"
@@ -46,8 +52,8 @@ for exp in $EXPERIMENTS; do
             bash "${SCRIPT_DIR}/04_composability.sh"
             ;;
         5)
-            log "========== EXPERIMENT 5: TIMING =========="
-            bash "${SCRIPT_DIR}/05_timing.sh"
+            log "========== EXPERIMENT 5: MEMORY FEASIBILITY =========="
+            bash "${SCRIPT_DIR}/05_memory.sh"
             ;;
         analyze)
             log "========== ANALYSIS =========="
@@ -55,7 +61,7 @@ for exp in $EXPERIMENTS; do
             ;;
         *)
             echo "Unknown experiment: $exp"
-            echo "Valid: 1 2 3 4 5 analyze"
+            echo "Valid: smoke 1 2 3 4 5 analyze"
             exit 1
             ;;
     esac

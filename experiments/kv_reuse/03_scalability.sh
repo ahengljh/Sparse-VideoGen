@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Experiment 3: Scalability Study
-# Dense vs KV reuse across resolutions and frame counts.
-# All runs use offloading.
+# SAP vs SAP+KV reuse across resolutions and frame counts.
+# Shows speedup scales with token count. All runs use offloading.
 #
 # Produces the data for Figure/Table: Scalability in the paper.
+# Wall-clock time and peak GPU memory are in each <video>.run.json.
 # ============================================================================
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -16,9 +17,11 @@ SCALE_SEEDS="${SCALE_SEEDS:-42 123 456}"
 # Resolution configs: "tag height width resolution num_frames"
 CONFIGS=(
     "480p_33f   480  854  480p  33"
+    "480p_49f   480  854  480p  49"
     "480p_65f   480  854  480p  65"
     "480p_129f  480  854  480p  129"
     "720p_33f   720  1280 720p  33"
+    "720p_49f   720  1280 720p  49"
     "720p_65f   720  1280 720p  65"
     "720p_129f  720  1280 720p  129"
 )
@@ -30,35 +33,31 @@ for cfg_line in "${CONFIGS[@]}"; do
     for pid in $SCALE_PROMPTS; do
         PROMPT_TEXT=$(cat "${PROJECT_ROOT}/examples/${pid}/prompt.txt")
 
-        # --- Dense ---
-        tag="scale_dense"
+        # --- SAP baseline ---
+        tag="scale_sap"
         OUTPUT_FILE="${RESULT_ROOT}/${tag}/${cfg_tag}/${pid}-${seed}.mp4"
         log "[${tag}/${cfg_tag}] prompt=$pid seed=$seed"
-        run_inference \
-            --seed "$seed" \
-            --pattern dense
+        run_inference --seed "$seed" "${SAP_ARGS[@]}"
 
-        # --- KV reuse ---
-        tag="scale_kv_reuse"
+        # --- SAP + KV reuse ---
+        tag="scale_sap_kv"
         OUTPUT_FILE="${RESULT_ROOT}/${tag}/${cfg_tag}/${pid}-${seed}.mp4"
         METRICS_JSONL="${METRICS_ROOT}/${tag}/${cfg_tag}/${pid}-${seed}.jsonl"
         mkdir -p "$(dirname "$METRICS_JSONL")"
         log "[${tag}/${cfg_tag}] prompt=$pid seed=$seed"
-        run_inference \
-            --seed "$seed" \
-            --pattern dense \
-            "${KV_REUSE_ARGS[@]}" \
-            --video_k_reuse_metrics \
+        run_inference --seed "$seed" \
+            "${SAP_ARGS[@]}" \
+            "${KV_METRICS_ARGS[@]}" \
             --video_k_reuse_metrics_jsonl "$METRICS_JSONL"
     done
     done
 
-    # --- Quality ---
+    # --- Quality: SAP+KV vs SAP ---
     for seed in $SCALE_SEEDS; do
     for pid in $SCALE_PROMPTS; do
-        ref="${RESULT_ROOT}/scale_dense/${cfg_tag}/${pid}-${seed}.mp4"
-        test="${RESULT_ROOT}/scale_kv_reuse/${cfg_tag}/${pid}-${seed}.mp4"
-        qout="${QUALITY_ROOT}/scale_kv_reuse_vs_dense/${cfg_tag}.jsonl"
+        ref="${RESULT_ROOT}/scale_sap/${cfg_tag}/${pid}-${seed}.mp4"
+        test="${RESULT_ROOT}/scale_sap_kv/${cfg_tag}/${pid}-${seed}.mp4"
+        qout="${QUALITY_ROOT}/scale_sap_kv_vs_sap/${cfg_tag}.jsonl"
         mkdir -p "$(dirname "$qout")"
         compute_quality "$ref" "$test" "$qout" "$pid" "$seed" || true
     done

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Experiment 2: Ablation Studies
-# Isolates each KV reuse design choice at 720p/129f.
-# All runs use offloading. Reference dense baseline from 01_baselines.
+# Isolates each KV reuse design choice on top of SAP at 480p/49f.
+# Reference: SAP baseline from 01_baselines.
 #
 # Produces the data for Table: Ablation Study in the paper.
 # ============================================================================
@@ -10,25 +10,27 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-HEIGHT=720; WIDTH=1280; NUM_FRAMES=129; RESOLUTION="720p"
+HEIGHT=$DEFAULT_HEIGHT; WIDTH=$DEFAULT_WIDTH
+NUM_FRAMES=$DEFAULT_NUM_FRAMES; RESOLUTION=$DEFAULT_RESOLUTION
+CFG_TAG="${RESOLUTION}_${NUM_FRAMES}f"
 
 # Use a subset for ablations to save compute
 ABLATION_PROMPTS="${ABLATION_PROMPTS:-1 3 5 7}"
 ABLATION_SEEDS="${ABLATION_SEEDS:-42 123 456}"
 
 run_ablation() {
-    # Usage: run_ablation <ablation_name> <extra_args...>
+    # Usage: run_ablation <ablation_name> <extra_kv_args...>
     local abl_name="$1"; shift
     for seed in $ABLATION_SEEDS; do
     for pid in $ABLATION_PROMPTS; do
         PROMPT_TEXT=$(cat "${PROJECT_ROOT}/examples/${pid}/prompt.txt")
-        OUTPUT_FILE="${RESULT_ROOT}/ablations/${abl_name}/720p_129f/${pid}-${seed}.mp4"
-        METRICS_JSONL="${METRICS_ROOT}/ablations/${abl_name}/720p_129f/${pid}-${seed}.jsonl"
+        OUTPUT_FILE="${RESULT_ROOT}/ablations/${abl_name}/${CFG_TAG}/${pid}-${seed}.mp4"
+        METRICS_JSONL="${METRICS_ROOT}/ablations/${abl_name}/${CFG_TAG}/${pid}-${seed}.jsonl"
         mkdir -p "$(dirname "$METRICS_JSONL")"
         log "[ablation:${abl_name}] prompt=$pid seed=$seed"
         run_inference \
             --seed "$seed" \
-            --pattern dense \
+            "${SAP_ARGS[@]}" \
             --video_k_reuse \
             --video_k_reuse_metrics \
             --video_k_reuse_metrics_jsonl "$METRICS_JSONL" \
@@ -37,13 +39,13 @@ run_ablation() {
     done
 }
 
-quality_vs_dense() {
+quality_vs_sap() {
     local abl_name="$1"
     for seed in $ABLATION_SEEDS; do
     for pid in $ABLATION_PROMPTS; do
-        ref="${RESULT_ROOT}/dense/720p_129f/${pid}-${seed}.mp4"
-        test="${RESULT_ROOT}/ablations/${abl_name}/720p_129f/${pid}-${seed}.mp4"
-        qout="${QUALITY_ROOT}/ablations/${abl_name}_vs_dense/720p_129f.jsonl"
+        ref="${RESULT_ROOT}/sap/${CFG_TAG}/${pid}-${seed}.mp4"
+        test="${RESULT_ROOT}/ablations/${abl_name}/${CFG_TAG}/${pid}-${seed}.mp4"
+        qout="${QUALITY_ROOT}/ablations/${abl_name}_vs_sap/${CFG_TAG}.jsonl"
         mkdir -p "$(dirname "$qout")"
         compute_quality "$ref" "$test" "$qout" "$pid" "$seed" || true
     done
@@ -62,7 +64,7 @@ run_ablation "kv_joint" \
     --video_k_reuse_interval "$KV_INTERVAL" \
     --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
     --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-quality_vs_dense "kv_joint"
+quality_vs_sap "kv_joint"
 
 run_ablation "k_only" \
     --no_video_kv_reuse_v \
@@ -73,7 +75,7 @@ run_ablation "k_only" \
     --video_k_reuse_interval "$KV_INTERVAL" \
     --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
     --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-quality_vs_dense "k_only"
+quality_vs_sap "k_only"
 
 # ============================================================================
 # B. Block size sweep
@@ -88,7 +90,7 @@ for bs in 32 64 128; do
         --video_k_reuse_interval "$KV_INTERVAL" \
         --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
         --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-    quality_vs_dense "block_size_${bs}"
+    quality_vs_sap "block_size_${bs}"
 done
 
 # ============================================================================
@@ -105,7 +107,7 @@ for ws in 2 4 6 8; do
         --video_k_reuse_interval "$KV_INTERVAL" \
         --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
         --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-    quality_vs_dense "warmup_${ws}"
+    quality_vs_sap "warmup_${ws}"
 done
 
 # ============================================================================
@@ -121,7 +123,7 @@ for iv in 1 2 4 8; do
         --video_k_reuse_interval "$iv" \
         --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
         --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-    quality_vs_dense "interval_${iv}"
+    quality_vs_sap "interval_${iv}"
 done
 
 # ============================================================================
@@ -137,7 +139,7 @@ for mb in 16 32 64 128; do
         --video_k_reuse_interval "$KV_INTERVAL" \
         --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
         --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-    quality_vs_dense "max_blocks_${mb}"
+    quality_vs_sap "max_blocks_${mb}"
 done
 
 # ============================================================================
@@ -154,7 +156,7 @@ for ml in 4 8 16; do
         --video_k_reuse_interval "$KV_INTERVAL" \
         --video_k_reuse_layer_stride "$stride" \
         --video_k_reuse_max_layers "$ml"
-    quality_vs_dense "layer_s${stride}_m${ml}"
+    quality_vs_sap "layer_s${stride}_m${ml}"
 done
 done
 

@@ -2,6 +2,7 @@ import argparse
 import gc
 import json
 import os
+import time
 from glob import glob
 import math
 from copy import deepcopy
@@ -361,6 +362,12 @@ if __name__ == "__main__":
     #########################################################
     # Generate the video
     #########################################################
+    # Reset peak memory tracking and start wall-clock timer
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.synchronize()
+    t_start = time.perf_counter()
+
     if pre_encoded_embeds is not None:
         # Use pre-computed embeddings (offload mode)
         # Note: Embedders will be moved to GPU by the forward pre-hook registered in enable_offloading
@@ -386,6 +393,14 @@ if __name__ == "__main__":
             guidance_scale=6.0,
             num_inference_steps=args.num_inference_steps,
         ).frames[0]
+
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    t_end = time.perf_counter()
+    wall_clock_s = t_end - t_start
+    peak_gpu_mb = torch.cuda.max_memory_allocated() / (1024 ** 2) if torch.cuda.is_available() else 0
+
+    logger.info(f"Inference wall-clock: {wall_clock_s:.2f}s | Peak GPU memory: {peak_gpu_mb:.0f}MB")
 
     # Create parent directory for output file if it doesn't exist
     output_dir = os.path.dirname(args.output_file)
@@ -450,3 +465,43 @@ if __name__ == "__main__":
     # Print offloading statistics if enabled
     if offload_manager is not None:
         offload_manager.print_statistics()
+
+    #########################################################
+    # Write per-run summary JSON (timing, memory, config)
+    # Written alongside the video as <output_file>.run.json
+    #########################################################
+    run_summary = {
+        "output_file": args.output_file,
+        "wall_clock_s": round(wall_clock_s, 2),
+        "peak_gpu_mb": round(peak_gpu_mb, 0),
+        "height": args.height,
+        "width": args.width,
+        "num_frames": args.num_frames,
+        "num_inference_steps": args.num_inference_steps,
+        "pattern": args.pattern,
+        "seed": args.seed,
+        "offload": args.enable_offload,
+        "offload_num_layers": args.offload_num_layers if args.enable_offload else None,
+        "video_k_reuse": args.video_k_reuse,
+        "video_kv_reuse_v": args.video_kv_reuse_v if args.video_k_reuse else None,
+    }
+    if args.video_k_reuse:
+        run_summary.update({
+            "kv_block_size": args.video_k_reuse_block_size,
+            "kv_max_blocks": args.video_k_reuse_max_blocks,
+            "kv_warmup_steps": args.video_k_reuse_warmup_steps,
+            "kv_start_step": args.video_k_reuse_start_step,
+            "kv_interval": args.video_k_reuse_interval,
+            "kv_layer_stride": args.video_k_reuse_layer_stride,
+            "kv_max_layers": args.video_k_reuse_max_layers,
+        })
+    # Add KV reuse summary if metrics were collected
+    if args.video_k_reuse and args.video_k_reuse_metrics and metrics:
+        run_summary["kv_token_reuse_rate"] = round(token_reuse_rate, 2)
+        run_summary["kv_hit_rate"] = round(metric_hit_rate, 2)
+        run_summary["kv_avg_change_ratio"] = round(avg_change_ratio, 6)
+
+    summary_path = args.output_file + ".run.json"
+    with open(summary_path, "w", encoding="utf-8") as f:
+        json.dump(run_summary, f, indent=2)
+    logger.info(f"Run summary written to {summary_path}")

@@ -2,6 +2,12 @@
 # ============================================================================
 # Shared configuration for all KV reuse experiments
 # Source this file from other scripts: source experiments/kv_reuse/config.sh
+#
+# Key design decisions:
+#   - SAP is the primary baseline (prior work), not dense
+#   - Offloading is always on (required for 24GB GPUs, also our contribution)
+#   - Default: 49 frames (~2s video) to keep compute manageable
+#   - Each run automatically produces <video>.run.json with timing + memory
 # ============================================================================
 
 # --- Paths ---
@@ -23,6 +29,12 @@ export SEEDS="${SEEDS:-42 123 456}"
 
 # --- Inference ---
 export INFER_STEPS=50
+
+# --- Default resolution: 480p / 49 frames (~2 seconds) ---
+export DEFAULT_HEIGHT=480
+export DEFAULT_WIDTH=854
+export DEFAULT_NUM_FRAMES=49
+export DEFAULT_RESOLUTION="480p"
 
 # --- Offloading (required for 24GB consumer GPUs) ---
 # All experiments use offloading since the target is RTX 4090 (24GB).
@@ -71,6 +83,12 @@ KV_REUSE_ARGS=(
     --video_k_reuse_max_layers "$KV_MAX_LAYERS"
 )
 
+KV_METRICS_ARGS=(
+    "${KV_REUSE_ARGS[@]}"
+    --video_k_reuse_metrics
+    --video_k_reuse_verbose
+)
+
 SVG_ARGS=(
     --pattern SVG
     --num_sampled_rows "$SVG_SAMPLED_ROWS"
@@ -97,6 +115,7 @@ run_inference() {
     # Usage: run_inference <extra_args...>
     # Expects: $OUTPUT_FILE, $PROMPT_TEXT, $HEIGHT, $WIDTH, $NUM_FRAMES, $RESOLUTION
     # Offloading is ALWAYS enabled for consumer GPU compatibility.
+    # Each run automatically writes <output_file>.run.json with timing + peak memory.
     python "${PROJECT_ROOT}/hyvideo_t2v_inference.py" \
         --model_id "${MODEL_ID}" \
         --prompt "${PROMPT_TEXT}" \
@@ -108,6 +127,21 @@ run_inference() {
         --output_file "${OUTPUT_FILE}" \
         --skip_existing \
         "${OFFLOAD_ARGS[@]}" \
+        "$@"
+}
+
+# run_inference_no_offload: same as run_inference but WITHOUT offloading.
+# Used only for memory feasibility tests (expected to OOM on 24GB GPUs).
+run_inference_no_offload() {
+    python "${PROJECT_ROOT}/hyvideo_t2v_inference.py" \
+        --model_id "${MODEL_ID}" \
+        --prompt "${PROMPT_TEXT}" \
+        --height "${HEIGHT}" \
+        --width "${WIDTH}" \
+        --num_frames "${NUM_FRAMES}" \
+        --num_inference_steps "${INFER_STEPS}" \
+        --resolution "${RESOLUTION}" \
+        --output_file "${OUTPUT_FILE}" \
         "$@"
 }
 
