@@ -151,9 +151,20 @@ if __name__ == "__main__":
     parser.add_argument("--offload_cuda_overhead_gb", type=float, default=0.5, help="Extra VRAM headroom for CUDA workspaces when auto-tuning offload.")
     parser.add_argument("--offload_auto_allow_increase", action="store_true", help="Allow auto-tune to increase num_layers_on_gpu above --offload_num_layers.")
 
+    # GPU memory limit — for reproducing 24GB consumer GPU conditions on larger GPUs
+    parser.add_argument("--max_gpu_memory_gb", type=float, default=None, help="Restrict PyTorch CUDA memory to this many GB (e.g., 24.0). Simulates consumer GPU on larger hardware.")
+
     args = parser.parse_args()
 
     seed_everything(args.seed)
+
+    # Enforce GPU memory limit before any CUDA allocation
+    if args.max_gpu_memory_gb is not None and torch.cuda.is_available():
+        total_bytes = torch.cuda.get_device_properties(0).total_memory
+        total_gb = total_bytes / (1024 ** 3)
+        fraction = min(1.0, args.max_gpu_memory_gb / total_gb)
+        torch.cuda.set_per_process_memory_fraction(fraction)
+        logger.info(f"GPU memory restricted to {args.max_gpu_memory_gb:.1f}GB ({fraction*100:.0f}% of {total_gb:.1f}GB)")
 
     # In some cases it will raise RuntimeError: cusolver error: CUSOLVER_STATUS_INTERNAL_ERROR
     torch.backends.cuda.preferred_linalg_library(backend="magma")

@@ -8,6 +8,10 @@
 #   - Offloading is always on (required for 24GB GPUs, also our contribution)
 #   - Default: 49 frames (~2s video) to keep compute manageable
 #   - Each run automatically produces <video>.run.json with timing + memory
+#
+# Quick mode (early-stage validation):
+#   QUICK_MODE=1 bash experiments/kv_reuse/quick_test.sh
+#   - 1 prompt, 1 seed, 25 frames (~1s video at 24fps), 480p
 # ============================================================================
 
 # --- Paths ---
@@ -19,26 +23,35 @@ export QUALITY_ROOT="${RESULT_ROOT}/quality"
 # --- Model ---
 export MODEL_ID="tencent/HunyuanVideo"
 
-# --- Prompts ---
-# Use the 7 built-in example prompts for main experiments.
-# Override PROMPT_IDS to use a subset (e.g., for quick smoke tests).
-export PROMPT_IDS="${PROMPT_IDS:-1 2 3 4 5 6 7}"
+# --- Quick mode: minimal runs for early-stage validation ---
+# Set QUICK_MODE=1 to use 1 prompt, 1 seed, 25 frames (~1s at 24fps)
+export QUICK_MODE="${QUICK_MODE:-0}"
 
-# --- Seeds (3 seeds for statistical significance) ---
-export SEEDS="${SEEDS:-42 123 456}"
+if [[ "$QUICK_MODE" == "1" ]]; then
+    export PROMPT_IDS="${PROMPT_IDS:-7}"
+    export SEEDS="${SEEDS:-42}"
+    export DEFAULT_NUM_FRAMES="${DEFAULT_NUM_FRAMES:-25}"
+    log_quick_note="[QUICK MODE] 1 prompt, 1 seed, ${DEFAULT_NUM_FRAMES} frames"
+else
+    export PROMPT_IDS="${PROMPT_IDS:-1 2 3 4 5 6 7}"
+    export SEEDS="${SEEDS:-42 123 456}"
+    export DEFAULT_NUM_FRAMES="${DEFAULT_NUM_FRAMES:-49}"
+    log_quick_note=""
+fi
 
 # --- Inference ---
-export INFER_STEPS=50
+export INFER_STEPS="${INFER_STEPS:-50}"
 
-# --- Default resolution: 480p / 49 frames (~2 seconds) ---
+# --- Default resolution: 480p ---
 export DEFAULT_HEIGHT=480
 export DEFAULT_WIDTH=854
-export DEFAULT_NUM_FRAMES=49
 export DEFAULT_RESOLUTION="480p"
 
 # --- Offloading (required for 24GB consumer GPUs) ---
 # All experiments use offloading since the target is RTX 4090 (24GB).
+# GPU_MEMORY_LIMIT_GB restricts CUDA memory to simulate consumer GPU on larger hardware.
 export OFFLOAD_NUM_LAYERS="${OFFLOAD_NUM_LAYERS:-6}"
+export GPU_MEMORY_LIMIT_GB="${GPU_MEMORY_LIMIT_GB:-24}"
 
 # --- Sparse attention defaults (SVG / SAP) ---
 export FIRST_TIMES_FP=0.1
@@ -70,6 +83,7 @@ OFFLOAD_ARGS=(
     --offload_num_layers "$OFFLOAD_NUM_LAYERS"
     --offload_pinned_memory
     --offload_prefetch
+    --max_gpu_memory_gb "$GPU_MEMORY_LIMIT_GB"
 )
 
 KV_REUSE_ARGS=(

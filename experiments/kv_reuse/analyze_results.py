@@ -8,11 +8,13 @@ Usage:
 Produces:
     - Console tables for each experiment group
     - CSV files in result/kv_reuse_paper/summary/ for LaTeX import
+    - Timing/memory summary with speedup ratios
 """
 import argparse
 import csv
 import json
 import os
+import re
 import sys
 from collections import defaultdict
 from glob import glob
@@ -255,6 +257,211 @@ def export_per_step_trajectory(metrics_root, summary_dir):
 
 
 # =========================================================================
+# 4. Timing and memory (from .run.json files)
+# =========================================================================
+def _parse_run_json_tag(result_root, run_json_path):
+    """Extract experiment tag from a .run.json path.
+
+    Convention: result_root/<tag>/<cfg_tag>/<pid>-<seed>.mp4.run.json
+    Returns (tag, cfg_tag, pid, seed) or None if unparseable.
+    """
+    rel = os.path.relpath(run_json_path, result_root)
+    # Strip the .mp4.run.json suffix to get <tag>/<cfg_tag>/<pid>-<seed>
+    base = rel
+    for suffix in (".run.json", ".mp4"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+    parts = base.split("/")
+    if len(parts) < 2:
+        return None
+    tag = parts[0]
+    cfg_tag = parts[1] if len(parts) >= 3 else ""
+    filename = parts[-1]
+    # Parse <pid>-<seed> from filename
+    m = re.match(r"^(\d+)-(\d+)$", filename)
+    if m:
+        pid, seed = m.group(1), m.group(2)
+    else:
+        pid, seed = filename, ""
+    return tag, cfg_tag, pid, seed
+
+
+def summarize_timing_memory(result_root, summary_dir):
+    """Aggregate .run.json files into timing/memory summary tables."""
+    print("\n" + "=" * 72)
+    print("TIMING & MEMORY (from .run.json)")
+    print("=" * 72)
+
+    run_files = sorted(glob(os.path.join(result_root, "**", "*.run.json"), recursive=True))
+    if not run_files:
+        print("  No .run.json files found.")
+        return
+
+    # Group by (tag, cfg_tag)
+    groups = defaultdict(list)
+    for rj in run_files:
+        parsed = _parse_run_json_tag(result_root, rj)
+        if parsed is None:
+            continue
+        tag, cfg_tag, pid, seed = parsed
+        try:
+            with open(rj, "r") as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, IOError):
+            continue
+        data["_pid"] = pid
+        data["_seed"] = seed
+        groups[(tag, cfg_tag)].append(data)
+
+    if not groups:
+        print("  No parseable .run.json files found.")
+        return
+
+    # --- Per-group summary ---
+    header = (
+        f"{'Tag':<25} {'Config':<15} {'N':>3} "
+        f"{'Time(s)':>12} {'PeakGPU(MB)':>14} "
+        f"{'Pattern':<7} {'KVReuse':>7}"
+    )
+    print(header)
+    print("-" * len(header))
+
+    csv_rows = []
+    for (tag, cfg_tag) in sorted(groups):
+        entries = groups[(tag, cfg_tag)]
+        times = [e["wall_clock_s"] for e in entries if "wall_clock_s" in e]
+        gpus = [e["peak_gpu_mb"] for e in entries if "peak_gpu_mb" in e]
+        patterns = set(e.get("pattern", "?") for e in entries)
+        kv = any(e.get("video_k_reuse", False) for e in entries)
+
+        t_mean, t_std = mean(times), std(times)
+        g_mean, g_std = mean(gpus), std(gpus)
+        pat = "/".join(sorted(patterns))
+
+        print(
+            f"{tag:<25} {cfg_tag:<15} {len(entries):>3} "
+            f"{fmt(t_mean, 1)}±{fmt(t_std, 1):>5}s "
+            f"{fmt(g_mean, 0)}±{fmt(g_std, 0):>5}MB "
+            f"{pat:<7} {'yes' if kv else 'no':>7}"
+        )
+
+        csv_rows.append({
+            "tag": tag,
+            "cfg_tag": cfg_tag,
+            "n": len(entries),
+            "time_mean_s": round(t_mean, 2),
+            "time_std_s": round(t_std, 2),
+            "peak_gpu_mean_mb": round(g_mean, 0),
+            "peak_gpu_std_mb": round(g_std, 0),
+            "pattern": pat,
+            "kv_reuse": kv,
+        })
+
+    csv_path = os.path.join(summary_dir, "timing_memory_summary.csv")
+    if csv_rows:
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(csv_rows)
+        print(f"\n  Saved to {csv_path}")
+
+    # --- Speedup table: pair baseline vs +KV variant by (pid, seed, cfg_tag) ---
+    _compute_speedups(groups, summary_dir)
+
+
+def _compute_speedups(groups, summary_dir):
+    """Compute pairwise speedup ratios between baseline and +KV variants."""
+    # Define pairs: (baseline_tag, kv_tag, label)
+    pairs = [
+        ("sap", "sap_kv_reuse", "SAP+KV vs SAP"),
+        ("sap", "sap_k_only", "SAP+Konly vs SAP"),
+        ("svg", "svg_kv_reuse", "SVG+KV vs SVG"),
+        ("dense", "dense_kv_reuse", "Dense+KV vs Dense"),
+        ("sap_only", "sap_kv_reuse", "SAP+KV vs SAP (comp)"),
+        ("svg_only", "svg_kv_reuse", "SVG+KV vs SVG (comp)"),
+        ("scale_sap", "scale_sap_kv", "ScaleSAP+KV vs ScaleSAP"),
+    ]
+
+    print("\n" + "-" * 72)
+    print("SPEEDUP RATIOS (baseline / variant)")
+    print("-" * 72)
+
+    csv_rows = []
+    found_any = False
+
+    for base_tag, kv_tag, label in pairs:
+        # Collect all cfg_tags where both tags exist
+        base_cfgs = {cfg for (t, cfg) in groups if t == base_tag}
+        kv_cfgs = {cfg for (t, cfg) in groups if t == kv_tag}
+        common_cfgs = sorted(base_cfgs & kv_cfgs)
+        if not common_cfgs:
+            continue
+
+        found_any = True
+        for cfg_tag in common_cfgs:
+            base_entries = groups[(base_tag, cfg_tag)]
+            kv_entries = groups[(kv_tag, cfg_tag)]
+
+            # Index by (pid, seed) for pairing
+            base_by_key = {(e["_pid"], e["_seed"]): e for e in base_entries}
+            kv_by_key = {(e["_pid"], e["_seed"]): e for e in kv_entries}
+
+            speedups = []
+            mem_deltas = []
+            for key in sorted(set(base_by_key) & set(kv_by_key)):
+                b = base_by_key[key]
+                k = kv_by_key[key]
+                bt = b.get("wall_clock_s", 0)
+                kt = k.get("wall_clock_s", 0)
+                if kt > 0 and bt > 0:
+                    speedups.append(bt / kt)
+                bg = b.get("peak_gpu_mb", 0)
+                kg = k.get("peak_gpu_mb", 0)
+                if bg > 0:
+                    mem_deltas.append(kg - bg)
+
+            if not speedups:
+                continue
+
+            sp_mean, sp_std = mean(speedups), std(speedups)
+            md_mean = mean(mem_deltas) if mem_deltas else 0
+
+            # Also compute absolute time savings
+            base_times = [base_by_key[k]["wall_clock_s"] for k in sorted(set(base_by_key) & set(kv_by_key))]
+            kv_times = [kv_by_key[k]["wall_clock_s"] for k in sorted(set(base_by_key) & set(kv_by_key))]
+
+            print(
+                f"  {label:<30} [{cfg_tag}]  "
+                f"speedup={fmt(sp_mean, 2)}x±{fmt(sp_std, 2)}  "
+                f"base={fmt(mean(base_times), 1)}s  variant={fmt(mean(kv_times), 1)}s  "
+                f"mem_delta={md_mean:+.0f}MB  n={len(speedups)}"
+            )
+
+            csv_rows.append({
+                "label": label,
+                "cfg_tag": cfg_tag,
+                "n_pairs": len(speedups),
+                "speedup_mean": round(sp_mean, 4),
+                "speedup_std": round(sp_std, 4),
+                "base_time_mean_s": round(mean(base_times), 2),
+                "variant_time_mean_s": round(mean(kv_times), 2),
+                "mem_delta_mean_mb": round(md_mean, 0),
+            })
+
+    if not found_any:
+        print("  No matching baseline/variant pairs found for speedup calculation.")
+        return
+
+    csv_path = os.path.join(summary_dir, "speedup_summary.csv")
+    if csv_rows:
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=csv_rows[0].keys())
+            writer.writeheader()
+            writer.writerows(csv_rows)
+        print(f"\n  Saved to {csv_path}")
+
+
+# =========================================================================
 # Main
 # =========================================================================
 def main():
@@ -273,6 +480,7 @@ def main():
     print(f"Metrics dir: {metrics_root}")
     print(f"Summary dir: {summary_dir}")
 
+    summarize_timing_memory(result_root, summary_dir)
     summarize_quality(quality_root, summary_dir)
     summarize_kv_metrics(metrics_root, summary_dir)
     export_per_step_trajectory(metrics_root, summary_dir)

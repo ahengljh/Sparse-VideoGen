@@ -76,6 +76,23 @@ for pid in $PROMPT_IDS; do
 done
 done
 
+# ---------- Dense + KV reuse (shows KV reuse works without sparse attention) ----------
+log "=== Dense + KV Reuse ==="
+for seed in $SEEDS; do
+for pid in $PROMPT_IDS; do
+    PROMPT_TEXT=$(cat "${PROJECT_ROOT}/examples/${pid}/prompt.txt")
+    tag="dense_kv_reuse"
+    OUTPUT_FILE="${RESULT_ROOT}/${tag}/${CFG_TAG}/${pid}-${seed}.mp4"
+    METRICS_JSONL="${METRICS_ROOT}/${tag}/${CFG_TAG}/${pid}-${seed}.jsonl"
+    mkdir -p "$(dirname "$METRICS_JSONL")"
+    log "[$tag] prompt=$pid seed=$seed"
+    run_inference --seed "$seed" \
+        --pattern dense \
+        "${KV_METRICS_ARGS[@]}" \
+        --video_k_reuse_metrics_jsonl "$METRICS_JSONL"
+done
+done
+
 # ---------- SVG ----------
 log "=== SVG ==="
 for seed in $SEEDS; do
@@ -110,7 +127,7 @@ log "=== Computing quality metrics (vs SAP baseline) ==="
 for seed in $SEEDS; do
 for pid in $PROMPT_IDS; do
     ref="${RESULT_ROOT}/sap/${CFG_TAG}/${pid}-${seed}.mp4"
-    for tag in sap_k_only sap_kv_reuse svg svg_kv_reuse; do
+    for tag in sap_k_only sap_kv_reuse dense_kv_reuse svg svg_kv_reuse; do
         test="${RESULT_ROOT}/${tag}/${CFG_TAG}/${pid}-${seed}.mp4"
         qout="${QUALITY_ROOT}/${tag}_vs_sap/${CFG_TAG}.jsonl"
         mkdir -p "$(dirname "$qout")"
@@ -123,7 +140,7 @@ done
 log "=== Computing quality metrics (vs Dense oracle) ==="
 for pid in $PROMPT_IDS; do
     ref="${RESULT_ROOT}/dense/${CFG_TAG}/${pid}-${DENSE_SEED}.mp4"
-    for tag in sap sap_kv_reuse svg svg_kv_reuse; do
+    for tag in sap sap_kv_reuse dense_kv_reuse svg svg_kv_reuse; do
         test="${RESULT_ROOT}/${tag}/${CFG_TAG}/${pid}-${DENSE_SEED}.mp4"
         qout="${QUALITY_ROOT}/${tag}_vs_dense/${CFG_TAG}.jsonl"
         mkdir -p "$(dirname "$qout")"
