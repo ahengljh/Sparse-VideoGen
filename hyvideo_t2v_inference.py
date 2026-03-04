@@ -373,6 +373,24 @@ if __name__ == "__main__":
     #########################################################
     # Generate the video
     #########################################################
+    # Per-step GPU memory tracking
+    gpu_memory_trajectory = []
+
+    def _gpu_memory_callback(pipe_self, step, timestep, callback_kwargs):
+        if torch.cuda.is_available():
+            allocated_mb = torch.cuda.memory_allocated() / (1024 ** 2)
+            reserved_mb = torch.cuda.memory_reserved() / (1024 ** 2)
+            peak_mb = torch.cuda.max_memory_allocated() / (1024 ** 2)
+            elapsed = time.perf_counter() - t_start
+            gpu_memory_trajectory.append({
+                "step": step,
+                "elapsed_s": round(elapsed, 2),
+                "allocated_mb": round(allocated_mb, 1),
+                "reserved_mb": round(reserved_mb, 1),
+                "peak_mb": round(peak_mb, 1),
+            })
+        return callback_kwargs
+
     # Reset peak memory tracking and start wall-clock timer
     if torch.cuda.is_available():
         torch.cuda.reset_peak_memory_stats()
@@ -392,6 +410,7 @@ if __name__ == "__main__":
             num_frames=args.num_frames,
             guidance_scale=6.0,
             num_inference_steps=args.num_inference_steps,
+            callback_on_step_end=_gpu_memory_callback,
         ).frames[0]
     else:
         # Standard mode - encode prompt on-the-fly
@@ -403,6 +422,7 @@ if __name__ == "__main__":
             num_frames=args.num_frames,
             guidance_scale=6.0,
             num_inference_steps=args.num_inference_steps,
+            callback_on_step_end=_gpu_memory_callback,
         ).frames[0]
 
     if torch.cuda.is_available():
@@ -512,7 +532,21 @@ if __name__ == "__main__":
         run_summary["kv_hit_rate"] = round(metric_hit_rate, 2)
         run_summary["kv_avg_change_ratio"] = round(avg_change_ratio, 6)
 
+    # Add GPU memory trajectory to run summary
+    if gpu_memory_trajectory:
+        run_summary["gpu_memory_trajectory"] = gpu_memory_trajectory
+
     summary_path = args.output_file + ".run.json"
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(run_summary, f, indent=2)
     logger.info(f"Run summary written to {summary_path}")
+
+    # Also save GPU memory trajectory as a separate CSV for easy plotting
+    if gpu_memory_trajectory:
+        gpu_csv_path = args.output_file + ".gpu_memory.csv"
+        import csv as csv_mod
+        with open(gpu_csv_path, "w", newline="") as f:
+            writer = csv_mod.DictWriter(f, fieldnames=["step", "elapsed_s", "allocated_mb", "reserved_mb", "peak_mb"])
+            writer.writeheader()
+            writer.writerows(gpu_memory_trajectory)
+        logger.info(f"GPU memory trajectory written to {gpu_csv_path}")

@@ -4,14 +4,11 @@
 # Source this file from other scripts: source experiments/kv_reuse/config.sh
 #
 # Key design decisions:
-#   - SAP is the primary baseline (prior work), not dense
-#   - Offloading is always on (required for 24GB GPUs, also our contribution)
-#   - Default: 49 frames (~2s video) to keep compute manageable
+#   - Baselines: Dense (quality oracle), SAP, SVG (existing methods)
+#   - Our contributions: KV reuse + dynamic layer offloading
+#   - Offloading only for Exp 5 (Memory Feasibility); other exps use full GPU
+#   - Default: 720p, 49 frames (~2s video)
 #   - Each run automatically produces <video>.run.json with timing + memory
-#
-# Quick mode (early-stage validation):
-#   QUICK_MODE=1 bash experiments/kv_reuse/quick_test.sh
-#   - 1 prompt, 1 seed, 25 frames (~1s video at 24fps), 480p
 # ============================================================================
 
 # --- Paths ---
@@ -33,8 +30,8 @@ if [[ "$QUICK_MODE" == "1" ]]; then
     export DEFAULT_NUM_FRAMES="${DEFAULT_NUM_FRAMES:-25}"
     log_quick_note="[QUICK MODE] 1 prompt, 1 seed, ${DEFAULT_NUM_FRAMES} frames"
 else
-    export PROMPT_IDS="${PROMPT_IDS:-1 2 3 4 5 6 7}"
-    export SEEDS="${SEEDS:-42 123 456}"
+    export PROMPT_IDS="${PROMPT_IDS:-1 7}"
+    export SEEDS="${SEEDS:-42}"
     export DEFAULT_NUM_FRAMES="${DEFAULT_NUM_FRAMES:-49}"
     log_quick_note=""
 fi
@@ -42,14 +39,14 @@ fi
 # --- Inference ---
 export INFER_STEPS="${INFER_STEPS:-50}"
 
-# --- Default resolution: 480p ---
-export DEFAULT_HEIGHT=480
-export DEFAULT_WIDTH=854
-export DEFAULT_RESOLUTION="480p"
+# --- Default resolution: 720p ---
+export DEFAULT_HEIGHT=720
+export DEFAULT_WIDTH=1280
+export DEFAULT_RESOLUTION="720p"
 
-# --- Offloading (required for 24GB consumer GPUs) ---
-# All experiments use offloading since the target is RTX 4090 (24GB).
-# GPU_MEMORY_LIMIT_GB restricts CUDA memory to simulate consumer GPU on larger hardware.
+# --- Offloading (only for Exp 5: Memory Feasibility) ---
+# On H200 (141GB), offloading is NOT needed for normal runs.
+# Only enable for memory feasibility experiments that simulate 24GB consumer GPUs.
 export OFFLOAD_NUM_LAYERS="${OFFLOAD_NUM_LAYERS:-6}"
 export GPU_MEMORY_LIMIT_GB="${GPU_MEMORY_LIMIT_GB:-24}"
 
@@ -100,7 +97,6 @@ KV_REUSE_ARGS=(
 KV_METRICS_ARGS=(
     "${KV_REUSE_ARGS[@]}"
     --video_k_reuse_metrics
-    --video_k_reuse_verbose
 )
 
 SVG_ARGS=(
@@ -128,8 +124,23 @@ SAP_ARGS=(
 run_inference() {
     # Usage: run_inference <extra_args...>
     # Expects: $OUTPUT_FILE, $PROMPT_TEXT, $HEIGHT, $WIDTH, $NUM_FRAMES, $RESOLUTION
-    # Offloading is ALWAYS enabled for consumer GPU compatibility.
-    # Each run automatically writes <output_file>.run.json with timing + peak memory.
+    # No offloading — uses full GPU memory (H200 141GB). Much faster.
+    python "${PROJECT_ROOT}/hyvideo_t2v_inference.py" \
+        --model_id "${MODEL_ID}" \
+        --prompt "${PROMPT_TEXT}" \
+        --height "${HEIGHT}" \
+        --width "${WIDTH}" \
+        --num_frames "${NUM_FRAMES}" \
+        --num_inference_steps "${INFER_STEPS}" \
+        --resolution "${RESOLUTION}" \
+        --output_file "${OUTPUT_FILE}" \
+        --skip_existing \
+        "$@"
+}
+
+# run_inference_offload: WITH offloading + 24GB limit.
+# Used only for Exp 5 (Memory Feasibility) to simulate consumer GPU.
+run_inference_offload() {
     python "${PROJECT_ROOT}/hyvideo_t2v_inference.py" \
         --model_id "${MODEL_ID}" \
         --prompt "${PROMPT_TEXT}" \
@@ -144,8 +155,8 @@ run_inference() {
         "$@"
 }
 
-# run_inference_no_offload: same as run_inference but WITHOUT offloading.
-# Used only for memory feasibility tests (expected to OOM on 24GB GPUs).
+# run_inference_no_offload: NO offloading, NO memory limit.
+# Used for memory feasibility tests (expected to OOM on 24GB GPUs).
 run_inference_no_offload() {
     python "${PROJECT_ROOT}/hyvideo_t2v_inference.py" \
         --model_id "${MODEL_ID}" \

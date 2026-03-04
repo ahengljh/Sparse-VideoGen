@@ -11,15 +11,11 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-SCALE_PROMPTS="${SCALE_PROMPTS:-1 3 5 7}"
-SCALE_SEEDS="${SCALE_SEEDS:-42 123 456}"
+SCALE_PROMPTS="${SCALE_PROMPTS:-1 7}"
+SCALE_SEEDS="${SCALE_SEEDS:-42}"
 
 # Resolution configs: "tag height width resolution num_frames"
 CONFIGS=(
-    "480p_33f   480  854  480p  33"
-    "480p_49f   480  854  480p  49"
-    "480p_65f   480  854  480p  65"
-    "480p_129f  480  854  480p  129"
     "720p_33f   720  1280 720p  33"
     "720p_49f   720  1280 720p  49"
     "720p_65f   720  1280 720p  65"

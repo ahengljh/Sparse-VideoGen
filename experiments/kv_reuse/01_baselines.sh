@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Experiment 1: Main Results
-# SAP is the primary baseline (prior work). Shows KV reuse speedup on top.
-# Dense is included as quality oracle (1 seed only to save compute).
-# All runs use offloading. 480p / 49 frames (~2s video).
+# Baselines: Dense (quality oracle), SAP, SVG (existing methods).
+# Our method: +KV reuse variants on top of each baseline.
+# 720p / 49 frames (~2s video).
 #
 # Produces the data for Table: Main Results in the paper.
 # Each run auto-generates <video>.run.json with wall-clock time + peak GPU MB.

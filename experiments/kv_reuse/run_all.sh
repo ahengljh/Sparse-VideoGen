@@ -30,7 +30,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-EXPERIMENTS="${@:-quick smoke 1 2 3 4 5 analyze}"
+EXPERIMENTS="${@:-1 2 3 5 6 analyze}"
 
 for exp in $EXPERIMENTS; do
     case "$exp" in
@@ -54,13 +54,13 @@ for exp in $EXPERIMENTS; do
             log "========== EXPERIMENT 3: SCALABILITY =========="
             bash "${SCRIPT_DIR}/03_scalability.sh"
             ;;
-        4)
-            log "========== EXPERIMENT 4: COMPOSABILITY =========="
-            bash "${SCRIPT_DIR}/04_composability.sh"
-            ;;
         5)
             log "========== EXPERIMENT 5: MEMORY FEASIBILITY =========="
             bash "${SCRIPT_DIR}/05_memory.sh"
+            ;;
+        6)
+            log "========== EXPERIMENT 6: SPEED-QUALITY TRADE-OFF =========="
+            bash "${SCRIPT_DIR}/06_tradeoff.sh"
             ;;
         analyze)
             log "========== ANALYSIS =========="
@@ -68,7 +68,7 @@ for exp in $EXPERIMENTS; do
             ;;
         *)
             echo "Unknown experiment: $exp"
-            echo "Valid: quick smoke 1 2 3 4 5 analyze"
+            echo "Valid: quick smoke 1 2 3 4 5 6 analyze"
             exit 1
             ;;
     esac

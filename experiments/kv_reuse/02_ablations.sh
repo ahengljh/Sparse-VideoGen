@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Experiment 2: Ablation Studies
-# Isolates each KV reuse design choice on top of SAP at 480p/49f.
+# Isolates each KV reuse design choice on top of SAP at 720p/49f.
 # Reference: SAP baseline from 01_baselines.
 #
 # Produces the data for Table: Ablation Study in the paper.
@@ -15,8 +15,8 @@ NUM_FRAMES=$DEFAULT_NUM_FRAMES; RESOLUTION=$DEFAULT_RESOLUTION
 CFG_TAG="${RESOLUTION}_${NUM_FRAMES}f"
 
 # Use a subset for ablations to save compute
-ABLATION_PROMPTS="${ABLATION_PROMPTS:-1 3 5 7}"
-ABLATION_SEEDS="${ABLATION_SEEDS:-42 123 456}"
+ABLATION_PROMPTS="${ABLATION_PROMPTS:-1 7}"
+ABLATION_SEEDS="${ABLATION_SEEDS:-42}"
 
 run_ablation() {
     # Usage: run_ablation <ablation_name> <extra_kv_args...>

@@ -21,7 +21,6 @@ mkdir -p "$MEM_DIR"
 
 # Configs to test: "tag height width resolution num_frames"
 MEM_CONFIGS=(
-    "480p_49f   480  854  480p  49"
     "720p_49f   720  1280 720p  49"
     "720p_129f  720  1280 720p  129"
 )
@@ -47,7 +46,7 @@ for cfg_line in "${MEM_CONFIGS[@]}"; do
     tag="offload_dense"
     OUTPUT_FILE="${MEM_DIR}/${tag}_${cfg_tag}.mp4"
     log "[${tag}/${cfg_tag}] With offloading, dense attention..." | tee -a "$MEM_LOG"
-    if run_inference --seed "$MEM_SEED" --pattern dense 2>&1 | tee -a "$MEM_LOG"; then
+    if run_inference_offload --seed "$MEM_SEED" --pattern dense 2>&1 | tee -a "$MEM_LOG"; then
         log "[${tag}/${cfg_tag}] SUCCESS" | tee -a "$MEM_LOG"
     else
         log "[${tag}/${cfg_tag}] FAILED" | tee -a "$MEM_LOG"
@@ -57,7 +56,7 @@ for cfg_line in "${MEM_CONFIGS[@]}"; do
     tag="offload_sap"
     OUTPUT_FILE="${MEM_DIR}/${tag}_${cfg_tag}.mp4"
     log "[${tag}/${cfg_tag}] With offloading + SAP..." | tee -a "$MEM_LOG"
-    if run_inference --seed "$MEM_SEED" "${SAP_ARGS[@]}" 2>&1 | tee -a "$MEM_LOG"; then
+    if run_inference_offload --seed "$MEM_SEED" "${SAP_ARGS[@]}" 2>&1 | tee -a "$MEM_LOG"; then
         log "[${tag}/${cfg_tag}] SUCCESS" | tee -a "$MEM_LOG"
     else
         log "[${tag}/${cfg_tag}] FAILED" | tee -a "$MEM_LOG"
@@ -67,7 +66,7 @@ for cfg_line in "${MEM_CONFIGS[@]}"; do
     tag="offload_sap_kv"
     OUTPUT_FILE="${MEM_DIR}/${tag}_${cfg_tag}.mp4"
     log "[${tag}/${cfg_tag}] With offloading + SAP + KV reuse..." | tee -a "$MEM_LOG"
-    if run_inference --seed "$MEM_SEED" \
+    if run_inference_offload --seed "$MEM_SEED" \
         "${SAP_ARGS[@]}" "${KV_REUSE_ARGS[@]}" 2>&1 | tee -a "$MEM_LOG"; then
         log "[${tag}/${cfg_tag}] SUCCESS" | tee -a "$MEM_LOG"
     else

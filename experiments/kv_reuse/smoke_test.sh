@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Smoke test: quick sanity check that all configs run without errors.
-# Uses 1 prompt, 1 seed, 480p, 33 frames — should finish in minutes.
+# Uses 1 prompt, 1 seed, 720p, 33 frames — should finish in minutes.
 # Run this FIRST before committing to the full experiment suite.
 # All runs use offloading (via config.sh run_inference).
 # ============================================================================
@@ -9,7 +9,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "${SCRIPT_DIR}/config.sh"
 
-HEIGHT=480; WIDTH=854; NUM_FRAMES=33; RESOLUTION="480p"
+HEIGHT=720; WIDTH=1280; NUM_FRAMES=33; RESOLUTION="720p"
 SMOKE_SEED=42
 SMOKE_PID=7
 PROMPT_TEXT=$(cat "${PROJECT_ROOT}/examples/${SMOKE_PID}/prompt.txt")

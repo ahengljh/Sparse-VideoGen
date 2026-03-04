@@ -277,9 +277,6 @@ class VideoKReuseMixin:
                     block_v = cached_v + alpha * (block_v - cached_v)
             self._video_v_reuse_cache[block_id] = self._video_k_reuse_cache_tensor(block_v)
 
-    def _video_k_reuse_update_cache_block(self, block_id: int, block_k: torch.Tensor) -> None:
-        self._update_kv_cache_block(block_id, block_k)
-
     def _video_k_reuse_cache_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
         cfg = self.video_k_reuse_cfg
         if not cfg.cache_on_cpu:
@@ -626,10 +623,6 @@ class VideoKReuseMixin:
         )
 
         return key, value
-
-    def _video_k_reuse_get_key(self, attn, video_hidden_states: torch.Tensor, timestep: Optional[int]) -> torch.Tensor:
-        key, _ = self._video_kv_reuse_get_kv(attn, video_hidden_states, timestep)
-        return key
 
     def _video_k_reuse_cache_to_cpu(self, tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
         if tensor is None:
