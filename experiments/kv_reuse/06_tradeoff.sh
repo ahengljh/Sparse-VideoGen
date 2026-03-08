@@ -83,8 +83,6 @@ quality_vs_dense() {
 # Shared KV reuse base args (no interval/max_layers — those vary per level)
 KV_BASE=(
     --video_k_reuse
-    --video_k_reuse_block_size "$KV_BLOCK_SIZE"
-    --video_k_reuse_max_blocks "$KV_MAX_BLOCKS"
     --video_k_reuse_warmup_steps "$KV_WARMUP"
     --video_k_reuse_start_step "$KV_START_STEP"
     --video_k_reuse_layer_stride "$KV_LAYER_STRIDE"

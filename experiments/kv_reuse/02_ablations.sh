@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 # Experiment 2: Ablation Studies
-# Isolates each KV reuse design choice on top of SAP at 720p/49f.
+# Isolates each attention output caching design choice on top of SAP at 720p/49f.
 # Reference: SAP baseline from 01_baselines.
 #
 # Produces the data for Table: Ablation Study in the paper.
@@ -53,71 +53,11 @@ quality_vs_sap() {
 }
 
 # ============================================================================
-# A. K-only vs KV reuse
+# A. Refresh interval sweep (controls reuse frequency)
 # ============================================================================
-log "=== Ablation A: K-only vs KV ==="
-run_ablation "kv_joint" \
-    --video_k_reuse_block_size "$KV_BLOCK_SIZE" \
-    --video_k_reuse_max_blocks "$KV_MAX_BLOCKS" \
-    --video_k_reuse_warmup_steps "$KV_WARMUP" \
-    --video_k_reuse_start_step "$KV_START_STEP" \
-    --video_k_reuse_interval "$KV_INTERVAL" \
-    --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
-    --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-quality_vs_sap "kv_joint"
-
-run_ablation "k_only" \
-    --no_video_kv_reuse_v \
-    --video_k_reuse_block_size "$KV_BLOCK_SIZE" \
-    --video_k_reuse_max_blocks "$KV_MAX_BLOCKS" \
-    --video_k_reuse_warmup_steps "$KV_WARMUP" \
-    --video_k_reuse_start_step "$KV_START_STEP" \
-    --video_k_reuse_interval "$KV_INTERVAL" \
-    --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
-    --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-quality_vs_sap "k_only"
-
-# ============================================================================
-# B. Block size sweep
-# ============================================================================
-log "=== Ablation B: Block Size ==="
-for bs in 32 64 128; do
-    run_ablation "block_size_${bs}" \
-        --video_k_reuse_block_size "$bs" \
-        --video_k_reuse_max_blocks "$KV_MAX_BLOCKS" \
-        --video_k_reuse_warmup_steps "$KV_WARMUP" \
-        --video_k_reuse_start_step "$KV_START_STEP" \
-        --video_k_reuse_interval "$KV_INTERVAL" \
-        --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
-        --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-    quality_vs_sap "block_size_${bs}"
-done
-
-# ============================================================================
-# C. Warmup steps sweep
-# ============================================================================
-log "=== Ablation C: Warmup Steps ==="
-for ws in 2 4 6 8; do
-    ss=$((ws + 2))  # start_step = warmup + 2
-    run_ablation "warmup_${ws}" \
-        --video_k_reuse_block_size "$KV_BLOCK_SIZE" \
-        --video_k_reuse_max_blocks "$KV_MAX_BLOCKS" \
-        --video_k_reuse_warmup_steps "$ws" \
-        --video_k_reuse_start_step "$ss" \
-        --video_k_reuse_interval "$KV_INTERVAL" \
-        --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
-        --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-    quality_vs_sap "warmup_${ws}"
-done
-
-# ============================================================================
-# D. Refresh interval sweep
-# ============================================================================
-log "=== Ablation D: Refresh Interval ==="
-for iv in 1 2 4 8; do
+log "=== Ablation A: Refresh Interval ==="
+for iv in 1 2 3 4; do
     run_ablation "interval_${iv}" \
-        --video_k_reuse_block_size "$KV_BLOCK_SIZE" \
-        --video_k_reuse_max_blocks "$KV_MAX_BLOCKS" \
         --video_k_reuse_warmup_steps "$KV_WARMUP" \
         --video_k_reuse_start_step "$KV_START_STEP" \
         --video_k_reuse_interval "$iv" \
@@ -127,37 +67,46 @@ for iv in 1 2 4 8; do
 done
 
 # ============================================================================
-# E. Max cached blocks sweep
+# B. Layer stride sweep (controls which layers cache)
 # ============================================================================
-log "=== Ablation E: Max Cached Blocks ==="
-for mb in 16 32 64 128; do
-    run_ablation "max_blocks_${mb}" \
-        --video_k_reuse_block_size "$KV_BLOCK_SIZE" \
-        --video_k_reuse_max_blocks "$mb" \
-        --video_k_reuse_warmup_steps "$KV_WARMUP" \
-        --video_k_reuse_start_step "$KV_START_STEP" \
-        --video_k_reuse_interval "$KV_INTERVAL" \
-        --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
-        --video_k_reuse_max_layers "$KV_MAX_LAYERS"
-    quality_vs_sap "max_blocks_${mb}"
-done
-
-# ============================================================================
-# F. Layer stride / max layers sweep
-# ============================================================================
-log "=== Ablation F: Layer Selection ==="
-for stride in 4 8 16; do
-for ml in 4 8 16; do
-    run_ablation "layer_s${stride}_m${ml}" \
-        --video_k_reuse_block_size "$KV_BLOCK_SIZE" \
-        --video_k_reuse_max_blocks "$KV_MAX_BLOCKS" \
+log "=== Ablation B: Layer Stride ==="
+for stride in 1 2 4 8; do
+    run_ablation "layer_stride_${stride}" \
         --video_k_reuse_warmup_steps "$KV_WARMUP" \
         --video_k_reuse_start_step "$KV_START_STEP" \
         --video_k_reuse_interval "$KV_INTERVAL" \
         --video_k_reuse_layer_stride "$stride" \
-        --video_k_reuse_max_layers "$ml"
-    quality_vs_sap "layer_s${stride}_m${ml}"
+        --video_k_reuse_max_layers "$KV_MAX_LAYERS"
+    quality_vs_sap "layer_stride_${stride}"
 done
+
+# ============================================================================
+# C. Start step sweep (controls when caching begins)
+# ============================================================================
+log "=== Ablation C: Start Step ==="
+for ss in 2 4 6 10; do
+    ws=$((ss > 2 ? ss - 2 : 2))  # warmup = start_step - 2 (minimum 2)
+    run_ablation "start_step_${ss}" \
+        --video_k_reuse_warmup_steps "$ws" \
+        --video_k_reuse_start_step "$ss" \
+        --video_k_reuse_interval "$KV_INTERVAL" \
+        --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
+        --video_k_reuse_max_layers "$KV_MAX_LAYERS"
+    quality_vs_sap "start_step_${ss}"
+done
+
+# ============================================================================
+# D. Max layers sweep (controls how many layers cache)
+# ============================================================================
+log "=== Ablation D: Max Layers ==="
+for ml in 10 20 30 60; do
+    run_ablation "max_layers_${ml}" \
+        --video_k_reuse_warmup_steps "$KV_WARMUP" \
+        --video_k_reuse_start_step "$KV_START_STEP" \
+        --video_k_reuse_interval "$KV_INTERVAL" \
+        --video_k_reuse_layer_stride "$KV_LAYER_STRIDE" \
+        --video_k_reuse_max_layers "$ml"
+    quality_vs_sap "max_layers_${ml}"
 done
 
 log "02_ablations.sh complete."

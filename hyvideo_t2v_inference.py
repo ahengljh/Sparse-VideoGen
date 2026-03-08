@@ -18,8 +18,6 @@ from svg.timer import print_operator_log_data
 from svg.utils.seed import seed_everything
 from svg.models.hyvideo.attention import VideoKReuseConfig
 from svg.models.hyvideo.inference import (
-    collect_video_k_reuse_stats,
-    collect_video_k_reuse_metrics,
     replace_hyvideo_flashattention,
     replace_hyvideo_attention,
 )
@@ -66,75 +64,21 @@ if __name__ == "__main__":
     parser.add_argument("--kmeans_iter_step", type=int, default=0, help="Number of KMeans iterations for other diffusion steps in SAP.")
     parser.add_argument("--zero_step_kmeans_init", action="store_true", help="Initialize the centroids for the first step in SAP, not after warmup.")
 
-    # Video K reuse (stable regions) across diffusion steps
-    parser.add_argument("--video_k_reuse", action="store_true", help="Reuse video K for stable regions across steps.")
-    parser.add_argument("--video_k_reuse_block_size", type=int, default=64, help="Token block size for stability scoring.")
-    parser.add_argument("--video_k_reuse_max_blocks", type=int, default=64, help="Maximum number of stable blocks to cache.")
-    parser.add_argument("--video_k_reuse_warmup_steps", type=int, default=4, help="Warmup steps to estimate stable blocks.")
-    parser.add_argument("--video_k_reuse_start_step", type=int, default=6, help="Start reusing cached video K after this step.")
-    parser.add_argument("--video_k_reuse_interval", type=int, default=2, help="Refresh cached video K every N steps.")
-    parser.add_argument("--video_k_reuse_delta_threshold", type=float, default=0.0, help="Stability threshold; 0 uses top-K blocks.")
-    parser.add_argument(
-        "--video_k_reuse_change_ratio",
-        type=float,
-        default=0.0,
-        help="Skip reuse when block signature change ratio exceeds this threshold (0 disables).",
-    )
-    parser.add_argument(
-        "--video_k_reuse_change_delta",
-        type=float,
-        default=0.0,
-        help="Per-block signature delta threshold for change detection (0 uses relative change).",
-    )
-    parser.add_argument(
-        "--video_k_reuse_max_unstable_ratio",
-        type=float,
-        default=0.98,
-        help="Fallback to full K when unstable blocks exceed this ratio (1 disables).",
-    )
-    parser.add_argument(
-        "--video_k_reuse_critical_blocks",
-        type=int,
-        default=0,
-        help="Always recompute this many most-unstable blocks (0 disables).",
-    )
-    parser.add_argument(
-        "--video_k_reuse_critical_ratio",
-        type=float,
-        default=0.0,
-        help="Fraction of most-unstable blocks to always recompute (used when critical_blocks=0).",
-    )
-    parser.add_argument(
-        "--video_k_reuse_ema_alpha",
-        type=float,
-        default=1.0,
-        help="EMA alpha for cached K updates; 1 disables smoothing.",
-    )
-    parser.add_argument("--video_k_reuse_layer_stride", type=int, default=8, help="Apply reuse every N layers.")
-    parser.add_argument("--video_k_reuse_max_layers", type=int, default=8, help="Cap number of layers that use video K reuse.")
-    parser.add_argument("--video_k_reuse_layers", type=str, default=None, help="Comma-separated list of layer indices to reuse.")
-    parser.add_argument("--video_k_reuse_cache_on_cpu", action="store_true", help="Store cached video K on CPU (slower, lower VRAM).")
-    parser.add_argument("--video_k_reuse_verbose", action="store_true", help="Print per-layer video K reuse hit/miss counts.")
-    parser.add_argument("--video_k_reuse_metrics", action="store_true", help="Collect per-step video K reuse metrics.")
-    parser.add_argument(
-        "--video_k_reuse_metrics_stride",
-        type=int,
-        default=1,
-        help="Collect metrics every N steps (1 = all steps).",
-    )
+    # Attention output caching across diffusion steps
+    parser.add_argument("--video_k_reuse", action="store_true", help="Cache attention output for reuse across steps.")
+    parser.add_argument("--video_k_reuse_warmup_steps", type=int, default=2, help="Warmup steps before caching begins.")
+    parser.add_argument("--video_k_reuse_start_step", type=int, default=4, help="Start reusing cached output after this step.")
+    parser.add_argument("--video_k_reuse_interval", type=int, default=2, help="Refresh cache every N steps.")
+    parser.add_argument("--video_k_reuse_layer_stride", type=int, default=1, help="Apply caching every N layers.")
+    parser.add_argument("--video_k_reuse_max_layers", type=int, default=60, help="Cap number of layers that cache.")
+    parser.add_argument("--video_k_reuse_layers", type=str, default=None, help="Comma-separated list of layer indices to cache.")
+    parser.add_argument("--video_k_reuse_metrics", action="store_true", help="Collect per-step reuse metrics.")
     parser.add_argument(
         "--video_k_reuse_metrics_jsonl",
         type=str,
         default=None,
         help="Write per-step metrics as JSONL to this path.",
     )
-    parser.add_argument(
-        "--no_video_kv_reuse_v",
-        action="store_false",
-        dest="video_kv_reuse_v",
-        help="Disable joint V reuse (K-only mode). By default V is also reused.",
-    )
-    parser.set_defaults(video_kv_reuse_v=True)
 
     # Dynamic Offloading - enables running on smaller GPUs (e.g., 4090 24GB)
     parser.add_argument("--enable_offload", action="store_true", help="Enable dynamic layer offloading to run on smaller GPUs.")
@@ -297,31 +241,20 @@ if __name__ == "__main__":
         start_step = max(warmup_steps, args.video_k_reuse_start_step)
         video_k_reuse_config = VideoKReuseConfig(
             enabled=True,
-            block_size=max(1, args.video_k_reuse_block_size),
-            max_cached_blocks=max(1, args.video_k_reuse_max_blocks),
             warmup_steps=warmup_steps,
             start_step=start_step,
             interval=max(1, args.video_k_reuse_interval),
-            delta_threshold=max(0.0, args.video_k_reuse_delta_threshold),
-            change_ratio_threshold=max(0.0, args.video_k_reuse_change_ratio),
-            change_delta_threshold=max(0.0, args.video_k_reuse_change_delta),
-            max_unstable_ratio=min(1.0, max(0.0, args.video_k_reuse_max_unstable_ratio)),
-            critical_blocks=max(0, args.video_k_reuse_critical_blocks),
-            critical_ratio=max(0.0, args.video_k_reuse_critical_ratio),
-            ema_alpha=min(1.0, max(0.0, args.video_k_reuse_ema_alpha)),
             layer_stride=max(1, args.video_k_reuse_layer_stride),
             max_layers=max(1, args.video_k_reuse_max_layers),
-            cache_on_cpu=bool(args.video_k_reuse_cache_on_cpu),
-            keep_cache_on_gpu=not args.video_k_reuse_cache_on_cpu,
             layer_indices=layer_indices,
-            reuse_v=bool(args.video_kv_reuse_v),
             metrics_enabled=bool(args.video_k_reuse_metrics),
-            metrics_stride=max(1, args.video_k_reuse_metrics_stride),
         )
 
+    # Note: video_k_reuse_config is NOT passed to attention processors anymore.
+    # Block-level caching is handled in the transformer forward loop instead,
+    # which enables skipping weight loading entirely for cached blocks.
     replace_hyvideo_flashattention(
         pipe,
-        video_k_reuse_config=video_k_reuse_config,
     )
 
     if args.pattern == "SVG":
@@ -334,7 +267,6 @@ if __name__ == "__main__":
             first_layers_fp=args.first_layers_fp,
             first_times_fp=args.first_times_fp,
             pattern=args.pattern,
-            video_k_reuse_config=video_k_reuse_config,
             # SVG specific
             num_sampled_rows=args.num_sampled_rows,
             sample_mse_max_row=args.sample_mse_max_row,
@@ -350,7 +282,6 @@ if __name__ == "__main__":
             first_layers_fp=args.first_layers_fp,
             first_times_fp=args.first_times_fp,
             pattern=args.pattern,
-            video_k_reuse_config=video_k_reuse_config,
             # SAP specific
             num_q_centroids=args.num_q_centroids,
             num_k_centroids=args.num_k_centroids,
@@ -363,7 +294,17 @@ if __name__ == "__main__":
         )
     else:
         assert args.pattern == "dense", f"Invalid pattern: {args.pattern}"
-        
+        # For dense pattern, still need sparse forward replacement for block-level caching
+        if video_k_reuse_config is not None:
+            from svg.models.hyvideo.custom_models import replace_sparse_forward
+            replace_sparse_forward()
+
+    # Set up block-level output caching on the transformer
+    if video_k_reuse_config is not None:
+        pipe.transformer._block_cache_cfg = video_k_reuse_config
+        pipe.transformer.reset_block_cache()
+        logger.info(f"Block-level output caching enabled: {video_k_reuse_config}")
+
     # Print time logger
     for layer_idx, block in enumerate(pipe.transformer.transformer_blocks):
         block.register_forward_hook(print_operator_log_data)
@@ -440,58 +381,25 @@ if __name__ == "__main__":
 
     export_to_video(output, args.output_file, fps=24)
 
-    # Print video K reuse statistics if enabled
+    # Print block-level output caching statistics
     if args.video_k_reuse:
-        totals, per_layer = collect_video_k_reuse_stats(pipe)
-        total_ops = totals["hits"] + totals["misses"]
-        hit_rate = (totals["hits"] / total_ops) * 100 if total_ops > 0 else 0.0
+        block_stats = pipe.transformer.get_block_cache_stats()
+        total_ops = block_stats["hits"] + block_stats["misses"]
+        hit_rate = (block_stats["hits"] / total_ops) * 100 if total_ops > 0 else 0.0
         logger.info(
-            f"Video K reuse stats: hits={totals['hits']} misses={totals['misses']} "
-            f"hit_rate={hit_rate:.1f}% layers={totals['layers']} cached_blocks={totals['cached_blocks']} "
-            f"stable_blocks={totals['stable_blocks']} critical_blocks={totals['critical_blocks']}"
+            f"Block cache stats: hits={block_stats['hits']} misses={block_stats['misses']} "
+            f"hit_rate={hit_rate:.1f}%"
         )
-        if args.video_k_reuse_verbose:
-            for layer in per_layer:
-                logger.info(
-                    f"Video K reuse layer {layer['layer']}: hits={layer['hits']} misses={layer['misses']} "
-                    f"cached_blocks={layer['cached_blocks']} stable_blocks={layer['stable_blocks']} "
-                    f"critical_blocks={layer['critical_blocks']}"
-                )
 
     if args.video_k_reuse and args.video_k_reuse_metrics:
-        metrics = collect_video_k_reuse_metrics(pipe)
-        if metrics:
-            total_tokens = sum(int(m.get("total_tokens", 0)) for m in metrics)
-            reused_tokens = sum(int(m.get("reused_tokens", 0)) for m in metrics)
-            computed_tokens = sum(int(m.get("computed_tokens", 0)) for m in metrics)
-            metric_hits = sum(int(m.get("hits", 0)) for m in metrics)
-            metric_misses = sum(int(m.get("misses", 0)) for m in metrics)
-            total_metric_ops = metric_hits + metric_misses
-            token_reuse_rate = (reused_tokens / total_tokens) * 100 if total_tokens > 0 else 0.0
-            metric_hit_rate = (metric_hits / total_metric_ops) * 100 if total_metric_ops > 0 else 0.0
-            full_k_count = sum(1 for m in metrics if m.get("full_k"))
-            full_k_rate = (full_k_count / len(metrics)) * 100 if metrics else 0.0
-            change_ratios = [m["change_ratio"] for m in metrics if m.get("change_ratio") is not None]
-            avg_change_ratio = (sum(change_ratios) / len(change_ratios)) if change_ratios else 0.0
-            mode_counts = {}
-            for m in metrics:
-                mode = m.get("mode", "unknown")
-                mode_counts[mode] = mode_counts.get(mode, 0) + 1
-            logger.info(
-                "Video K reuse metrics: entries={} token_reuse_rate={:.1f}% hit_rate={:.1f}% "
-                "full_k_rate={:.1f}% avg_change_ratio={:.4f}".format(
-                    len(metrics), token_reuse_rate, metric_hit_rate, full_k_rate, avg_change_ratio
-                )
-            )
-            logger.info(f"Video K reuse modes: {json.dumps(mode_counts, sort_keys=True)}")
-
-        if args.video_k_reuse_metrics_jsonl:
-            metrics_dir = os.path.dirname(args.video_k_reuse_metrics_jsonl)
-            if metrics_dir:
-                os.makedirs(metrics_dir, exist_ok=True)
-            with open(args.video_k_reuse_metrics_jsonl, "w", encoding="utf-8") as handle:
-                for entry in metrics:
+        # Write block-level timing
+        block_timing = pipe.transformer.get_block_cache_timing()
+        if block_timing:
+            timing_path = args.output_file + ".block_timing.jsonl"
+            with open(timing_path, "w", encoding="utf-8") as handle:
+                for entry in block_timing:
                     handle.write(json.dumps(entry, sort_keys=True) + "\n")
+            logger.info(f"Block cache timing: {len(block_timing)} entries -> {timing_path}")
 
     # Print offloading statistics if enabled
     if offload_manager is not None:
@@ -514,23 +422,18 @@ if __name__ == "__main__":
         "offload": args.enable_offload,
         "offload_num_layers": args.offload_num_layers if args.enable_offload else None,
         "video_k_reuse": args.video_k_reuse,
-        "video_kv_reuse_v": args.video_kv_reuse_v if args.video_k_reuse else None,
     }
     if args.video_k_reuse:
+        block_stats = pipe.transformer.get_block_cache_stats()
         run_summary.update({
-            "kv_block_size": args.video_k_reuse_block_size,
-            "kv_max_blocks": args.video_k_reuse_max_blocks,
             "kv_warmup_steps": args.video_k_reuse_warmup_steps,
             "kv_start_step": args.video_k_reuse_start_step,
             "kv_interval": args.video_k_reuse_interval,
             "kv_layer_stride": args.video_k_reuse_layer_stride,
             "kv_max_layers": args.video_k_reuse_max_layers,
+            "block_cache_hits": block_stats["hits"],
+            "block_cache_misses": block_stats["misses"],
         })
-    # Add KV reuse summary if metrics were collected
-    if args.video_k_reuse and args.video_k_reuse_metrics and metrics:
-        run_summary["kv_token_reuse_rate"] = round(token_reuse_rate, 2)
-        run_summary["kv_hit_rate"] = round(metric_hit_rate, 2)
-        run_summary["kv_avg_change_ratio"] = round(avg_change_ratio, 6)
 
     # Add GPU memory trajectory to run summary
     if gpu_memory_trajectory:

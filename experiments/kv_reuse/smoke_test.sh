@@ -34,33 +34,33 @@ log "=== Smoke Test ==="
 # 1. SAP (baseline)
 run_smoke "sap" "${SAP_ARGS[@]}"
 
-# 2. SAP + K-only reuse
-run_smoke "sap_k_only" \
-    "${SAP_ARGS[@]}" \
-    "${KV_REUSE_ARGS[@]}" --no_video_kv_reuse_v \
-    --video_k_reuse_metrics \
-    --video_k_reuse_metrics_jsonl "${SMOKE_DIR}/sap_k_only_metrics.jsonl"
-
-# 3. SAP + KV reuse (full method)
-run_smoke "sap_kv_reuse" \
+# 2. SAP + attn output caching (our method)
+run_smoke "sap_attn_cache" \
     "${SAP_ARGS[@]}" \
     "${KV_REUSE_ARGS[@]}" \
     --video_k_reuse_metrics \
-    --video_k_reuse_metrics_jsonl "${SMOKE_DIR}/sap_kv_reuse_metrics.jsonl"
+    --video_k_reuse_metrics_jsonl "${SMOKE_DIR}/sap_attn_cache_metrics.jsonl"
 
-# 4. SVG + KV reuse
-run_smoke "svg_kv" \
+# 3. SVG + attn output caching
+run_smoke "svg_attn_cache" \
     "${SVG_ARGS[@]}" \
     "${KV_REUSE_ARGS[@]}" \
     --video_k_reuse_metrics \
-    --video_k_reuse_metrics_jsonl "${SMOKE_DIR}/svg_kv_metrics.jsonl"
+    --video_k_reuse_metrics_jsonl "${SMOKE_DIR}/svg_attn_cache_metrics.jsonl"
+
+# 4. Dense + attn output caching
+run_smoke "dense_attn_cache" \
+    --pattern dense \
+    "${KV_REUSE_ARGS[@]}" \
+    --video_k_reuse_metrics \
+    --video_k_reuse_metrics_jsonl "${SMOKE_DIR}/dense_attn_cache_metrics.jsonl"
 
 # 5. Quality check
-log "Quality: sap_kv_reuse vs sap..."
+log "Quality: sap_attn_cache vs sap..."
 compute_quality \
     "${SMOKE_DIR}/sap.mp4" \
-    "${SMOKE_DIR}/sap_kv_reuse.mp4" \
-    "${SMOKE_DIR}/quality_kv_vs_sap.jsonl" \
+    "${SMOKE_DIR}/sap_attn_cache.mp4" \
+    "${SMOKE_DIR}/quality_attn_cache_vs_sap.jsonl" \
     "$SMOKE_PID" "$SMOKE_SEED" || true
 
 # Print summary

@@ -193,12 +193,6 @@ class LayerOffloadManager:
             except Exception:
                 pass
 
-        # Offload video K reuse caches to CPU
-        if hasattr(layer, "attn") and hasattr(layer.attn, "processor"):
-            proc = layer.attn.processor
-            if hasattr(proc, "offload_video_k_reuse_cache"):
-                proc.offload_video_k_reuse_cache()
-
         if self.config.use_pinned_memory:
             for param in layer.parameters():
                 if param.device.type != 'cpu':
@@ -577,7 +571,12 @@ def install_offload_hooks(
     pipe,
     offload_manager: LayerOffloadManager,
 ) -> List[torch.utils.hooks.RemovableHandle]:
-    """Install forward pre/post hooks on transformer blocks for automatic offloading."""
+    """Install forward pre/post hooks on transformer blocks for automatic offloading.
+
+    When block-level caching is active, the transformer forward loop skips
+    cached blocks entirely (they never call block.forward()), so hooks on
+    cached blocks simply never fire — no special logic needed here.
+    """
     handles = []
 
     for idx, block in enumerate(pipe.transformer.transformer_blocks):

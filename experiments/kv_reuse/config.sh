@@ -62,14 +62,12 @@ export SAP_MIN_KC_RATIO=0.10
 export SAP_KMEANS_INIT=50
 export SAP_KMEANS_STEP=2
 
-# --- KV reuse defaults ---
-export KV_BLOCK_SIZE=64
-export KV_MAX_BLOCKS=64
-export KV_WARMUP=4
-export KV_START_STEP=6
+# --- Attention output caching defaults ---
+export KV_WARMUP=2
+export KV_START_STEP=4
 export KV_INTERVAL=2
-export KV_LAYER_STRIDE=8
-export KV_MAX_LAYERS=8
+export KV_LAYER_STRIDE=1
+export KV_MAX_LAYERS=60
 
 # --- GPU ---
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -85,8 +83,6 @@ OFFLOAD_ARGS=(
 
 KV_REUSE_ARGS=(
     --video_k_reuse
-    --video_k_reuse_block_size "$KV_BLOCK_SIZE"
-    --video_k_reuse_max_blocks "$KV_MAX_BLOCKS"
     --video_k_reuse_warmup_steps "$KV_WARMUP"
     --video_k_reuse_start_step "$KV_START_STEP"
     --video_k_reuse_interval "$KV_INTERVAL"

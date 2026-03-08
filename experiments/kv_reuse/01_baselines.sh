@@ -41,26 +41,8 @@ for pid in $PROMPT_IDS; do
 done
 done
 
-# ---------- SAP + K-only reuse ----------
-log "=== SAP + K-only Reuse ==="
-for seed in $SEEDS; do
-for pid in $PROMPT_IDS; do
-    PROMPT_TEXT=$(cat "${PROJECT_ROOT}/examples/${pid}/prompt.txt")
-    tag="sap_k_only"
-    OUTPUT_FILE="${RESULT_ROOT}/${tag}/${CFG_TAG}/${pid}-${seed}.mp4"
-    METRICS_JSONL="${METRICS_ROOT}/${tag}/${CFG_TAG}/${pid}-${seed}.jsonl"
-    mkdir -p "$(dirname "$METRICS_JSONL")"
-    log "[$tag] prompt=$pid seed=$seed"
-    run_inference --seed "$seed" \
-        "${SAP_ARGS[@]}" \
-        "${KV_METRICS_ARGS[@]}" \
-        --no_video_kv_reuse_v \
-        --video_k_reuse_metrics_jsonl "$METRICS_JSONL"
-done
-done
-
-# ---------- SAP + KV reuse (full, our method) ----------
-log "=== SAP + KV Reuse ==="
+# ---------- SAP + Attn Output Caching (our method) ----------
+log "=== SAP + Attn Output Caching ==="
 for seed in $SEEDS; do
 for pid in $PROMPT_IDS; do
     PROMPT_TEXT=$(cat "${PROJECT_ROOT}/examples/${pid}/prompt.txt")
@@ -127,7 +109,7 @@ log "=== Computing quality metrics (vs SAP baseline) ==="
 for seed in $SEEDS; do
 for pid in $PROMPT_IDS; do
     ref="${RESULT_ROOT}/sap/${CFG_TAG}/${pid}-${seed}.mp4"
-    for tag in sap_k_only sap_kv_reuse dense_kv_reuse svg svg_kv_reuse; do
+    for tag in sap_kv_reuse dense_kv_reuse svg svg_kv_reuse; do
         test="${RESULT_ROOT}/${tag}/${CFG_TAG}/${pid}-${seed}.mp4"
         qout="${QUALITY_ROOT}/${tag}_vs_sap/${CFG_TAG}.jsonl"
         mkdir -p "$(dirname "$qout")"

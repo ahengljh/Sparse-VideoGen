@@ -1,4 +1,5 @@
-from typing import Any, Dict, Optional, Tuple, Union
+import time
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
@@ -131,6 +132,59 @@ class HunyuanVideoTransformerBlock_Sparse(HunyuanVideoTransformerBlock):
 class HunyuanVideoTransformer3DModel_Sparse(HunyuanVideoTransformer3DModel):
     """Hunyuan Video Transformer 3D Model"""
 
+    # Block-level output caching config (set externally via VideoKReuseConfig)
+    _block_cache_cfg = None  # VideoKReuseConfig or None
+    _block_cache: Dict[int, Tuple[torch.Tensor, torch.Tensor]] = {}
+    _block_cache_step: int = -1
+    _block_cache_last_timestep = None
+    _block_cache_hits: int = 0
+    _block_cache_misses: int = 0
+    _block_cache_timing: List[Dict] = []
+
+    def _block_cache_step_idx(self, timestep) -> int:
+        """Track diffusion step from timestep changes."""
+        if timestep is None:
+            return self._block_cache_step
+        if isinstance(timestep, torch.Tensor):
+            t_val = int(timestep[0].item()) if timestep.numel() > 0 else int(timestep.item())
+        else:
+            t_val = int(timestep)
+        if self._block_cache_last_timestep is None or t_val != self._block_cache_last_timestep:
+            self._block_cache_step += 1
+            self._block_cache_last_timestep = t_val
+        return self._block_cache_step
+
+    def _is_reuse_step(self, step_idx: int) -> bool:
+        """Check if this step should reuse cached outputs (vs compute fresh)."""
+        cfg = self._block_cache_cfg
+        if cfg is None or not cfg.enabled:
+            return False
+        if step_idx < cfg.start_step or cfg.interval <= 1:
+            return False
+        return (step_idx % cfg.interval) != 0
+
+    def _is_store_step(self, step_idx: int) -> bool:
+        """Check if this step should store outputs to cache."""
+        cfg = self._block_cache_cfg
+        if cfg is None or not cfg.enabled:
+            return False
+        return step_idx >= cfg.warmup_steps
+
+    def reset_block_cache(self):
+        """Reset block cache state between inference runs."""
+        self._block_cache = {}
+        self._block_cache_step = -1
+        self._block_cache_last_timestep = None
+        self._block_cache_hits = 0
+        self._block_cache_misses = 0
+        self._block_cache_timing = []
+
+    def get_block_cache_stats(self) -> dict:
+        return {"hits": self._block_cache_hits, "misses": self._block_cache_misses}
+
+    def get_block_cache_timing(self) -> list:
+        return list(self._block_cache_timing)
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -250,29 +304,51 @@ class HunyuanVideoTransformer3DModel_Sparse(HunyuanVideoTransformer3DModel):
                 )
 
         else:
-            for block in self.transformer_blocks:
-                hidden_states, encoder_hidden_states = block(
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    attention_mask,
-                    image_rotary_emb,
-                    timestep,
-                    token_replace_emb,
-                    first_frame_num_tokens,
-                )
+            all_blocks = list(self.transformer_blocks) + list(self.single_transformer_blocks)
+            num_blocks = len(all_blocks)
+            cfg = self._block_cache_cfg
+            step_idx = self._block_cache_step_idx(timestep) if cfg is not None and cfg.enabled else -1
+            reuse = self._is_reuse_step(step_idx)
+            store = self._is_store_step(step_idx)
 
-            for block in self.single_transformer_blocks:
-                hidden_states, encoder_hidden_states = block(
-                    hidden_states,
-                    encoder_hidden_states,
-                    temb,
-                    attention_mask,
-                    image_rotary_emb,
-                    timestep,
-                    token_replace_emb,
-                    first_frame_num_tokens,
-                )
+            # Guard: only reuse if cache is populated (prevents crash on
+            # edge-case configs where first reuse step has no prior store).
+            if reuse and self._block_cache:
+                # Reuse step: return the last cached block's output directly.
+                # Only the final block's output feeds into norm_out/proj_out,
+                # so we just need that one transfer from CPU→GPU.
+                _t0 = time.perf_counter()
+                last_cached = max(self._block_cache.keys())
+                cached_hs, cached_enc = self._block_cache[last_cached]
+                hidden_states = cached_hs.to(hidden_states.device)
+                encoder_hidden_states = cached_enc.to(hidden_states.device)
+                self._block_cache_hits += num_blocks
+                if cfg.metrics_enabled:
+                    torch.cuda.synchronize()
+                    self._block_cache_timing.append({
+                        "step": step_idx, "layer": -1, "action": "reuse_all",
+                        "time_ms": (time.perf_counter() - _t0) * 1000,
+                    })
+            else:
+                # Compute step: run all blocks, cache the last block's output.
+                for layer_idx, block in enumerate(all_blocks):
+                    hidden_states, encoder_hidden_states = block(
+                        hidden_states,
+                        encoder_hidden_states,
+                        temb,
+                        attention_mask,
+                        image_rotary_emb,
+                        timestep,
+                        token_replace_emb,
+                        first_frame_num_tokens,
+                    )
+                    if store and layer_idx == num_blocks - 1:
+                        # Only cache the last block — it's the only one used on reuse.
+                        self._block_cache[layer_idx] = (
+                            hidden_states.detach().cpu(),
+                            encoder_hidden_states.detach().cpu(),
+                        )
+                self._block_cache_misses += num_blocks
 
         # 5. Output projection
         hidden_states = self.norm_out(hidden_states, temb)
@@ -299,3 +375,14 @@ def replace_sparse_forward():
     HunyuanVideoTransformerBlock.forward = HunyuanVideoTransformerBlock_Sparse.forward
 
     HunyuanVideoTransformer3DModel.forward = HunyuanVideoTransformer3DModel_Sparse.forward
+
+    # Patch block-level caching methods and attributes onto the base class
+    for attr in [
+        '_block_cache_cfg', '_block_cache', '_block_cache_step',
+        '_block_cache_last_timestep', '_block_cache_hits', '_block_cache_misses',
+        '_block_cache_timing',
+        '_block_cache_step_idx', '_is_reuse_step',
+        '_is_store_step', 'reset_block_cache', 'get_block_cache_stats',
+        'get_block_cache_timing',
+    ]:
+        setattr(HunyuanVideoTransformer3DModel, attr, getattr(HunyuanVideoTransformer3DModel_Sparse, attr))
